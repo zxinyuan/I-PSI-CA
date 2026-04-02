@@ -1,0 +1,1028 @@
+//! Sigma-Bullet "glue" proof for encrypted polynomial evaluation.
+//!
+//! Statement proved:
+//!   C* = sum_{i=0}^d e_i * C_i + Enc_pk(0; r)
+//! with hidden witnesses (alpha, r, e_0..e_d) such that:
+//!   e_0 = r,  e_{i+1} = e_i * alpha,  r != 0.
+//!
+//! The proof has two layers:
+//! 1) Bulletproof R1CS (`chain_proof`) over commitments to [e_d..e_0], proving
+//!    the geometric chain and non-zero seed.
+//! 2) Schnorr-style glue proof (`glue`) showing the same committed e_i values
+//!    satisfy the ciphertext relation above.
+
+use bulletproofs::{
+    r1cs::{LinearCombination, Prover, R1CSError, Variable},
+    BulletproofGens, PedersenGens,
+};
+use curve25519_dalek_ng::{
+    constants::{RISTRETTO_BASEPOINT_POINT as G, RISTRETTO_BASEPOINT_TABLE},
+    ristretto::{CompressedRistretto, RistrettoPoint},
+    scalar::Scalar,
+    traits::{Identity, MultiscalarMul, VartimeMultiscalarMul},
+};
+use merlin::Transcript;
+use rand::{thread_rng, CryptoRng, RngCore};
+
+use crate::crypto::bulletproof as bp;
+use crate::crypto::elgamal::{Ciphertext, PublicKey};
+use crate::crypto::sigma::{self, PolyDivProof};
+
+/// Schnorr glue proof binding committed `e_i` values to the ciphertext relation.
+#[derive(Clone, Debug)]
+pub struct GlueProof {
+    /// Public tag binding the hidden alpha across proofs: `alpha_tag = alpha * G`.
+    pub alpha_tag: CompressedRistretto,
+    /// Single batched Sigma-Bullet nonce commitment.
+    pub a_t: CompressedRistretto,
+    /// Responses for e_i witnesses.
+    pub z_e: Vec<Scalar>,
+    /// Response for alpha witness: `z_alpha = k_alpha + c * alpha`.
+    pub z_alpha: Scalar,
+    /// Response for y-commitment blinding: `z_y_blind = k_y + c * blind_y`.
+    pub z_y_blind: Scalar,
+}
+
+/// Hybrid proof output: arithmetic Bulletproof + Sigma glue.
+pub struct SigmaBulletProof {
+    pub chain_proof: bp::EvalChainProof,
+    pub glue: GlueProof,
+}
+
+/// Full round proof: arithmetic Bulletproof layer plus all Schnorr relations
+/// sharing one Fiat-Shamir challenge.
+pub struct CombinedSigmaProof {
+    pub chain_proof: bp::EvalChainProof,
+    pub alpha_tag: CompressedRistretto,
+    pub glue_a_t: CompressedRistretto,
+    pub glue_z_e: Vec<Scalar>,
+    pub glue_z_alpha: Scalar,
+    pub glue_z_y_blind: Scalar,
+    pub partial_a: CompressedRistretto,
+    pub partial_z1: Scalar,
+    pub partial_z2: Scalar,
+    pub poly_a1: CompressedRistretto,
+    pub poly_a2: CompressedRistretto,
+    pub poly_a_m: CompressedRistretto,
+    pub poly_s_y: Scalar,
+    pub poly_s_delta: Scalar,
+}
+
+fn append_point(t: &mut Transcript, label: &'static [u8], p: &RistrettoPoint) {
+    t.append_message(label, p.compress().as_bytes());
+}
+
+fn append_compressed(t: &mut Transcript, label: &'static [u8], p: &CompressedRistretto) {
+    t.append_message(label, p.as_bytes());
+}
+
+#[inline]
+fn mul_g(s: &Scalar) -> RistrettoPoint {
+    s * &RISTRETTO_BASEPOINT_TABLE
+}
+
+fn challenge_scalar(t: &mut Transcript) -> Scalar {
+    let mut buf = [0u8; 64];
+    t.challenge_bytes(b"challenge", &mut buf);
+    Scalar::from_bytes_mod_order_wide(&buf)
+}
+
+fn batch_scalar(t: &mut Transcript, label: &'static [u8]) -> Scalar {
+    let mut buf = [0u8; 64];
+    t.challenge_bytes(label, &mut buf);
+    Scalar::from_bytes_mod_order_wide(&buf)
+}
+
+fn glue_transcript(
+    chain_proof: &bp::EvalChainProof,
+    pk: &PublicKey,
+    coeff_cts: &[Ciphertext],
+    c_star: &Ciphertext,
+) -> Transcript {
+    let mut t = Transcript::new(b"I-PSI-CA::sigma_bullet_glue_v1");
+    append_point(&mut t, b"pk", &pk.0);
+
+    for c in coeff_cts {
+        append_point(&mut t, b"coef_c1", &c.c1);
+        append_point(&mut t, b"coef_c2", &c.c2);
+    }
+    append_point(&mut t, b"cstar_c1", &c_star.c1);
+    append_point(&mut t, b"cstar_c2", &c_star.c2);
+
+    for c in &chain_proof.e_comms {
+        append_compressed(&mut t, b"e_comm", c);
+    }
+    append_compressed(&mut t, b"y_comm", &chain_proof.y_comm);
+    append_compressed(&mut t, b"inv_comm", &chain_proof.inv_en_comm);
+    t.append_message(b"r1cs", &chain_proof.proof.to_bytes());
+
+    t
+}
+
+fn append_glue_section(
+    t: &mut Transcript,
+    chain_proof: &bp::EvalChainProof,
+    pk: &PublicKey,
+    coeff_cts: &[Ciphertext],
+    c_star: &Ciphertext,
+    beta_y: Scalar,
+    beta_c1: Scalar,
+    beta_c2: Scalar,
+    alpha_tag: &CompressedRistretto,
+    glue_a_t: &CompressedRistretto,
+) {
+    t.append_message(b"section", b"sigma_bullet_glue");
+    append_point(t, b"pk", &pk.0);
+    for c in coeff_cts {
+        append_point(t, b"coef_c1", &c.c1);
+        append_point(t, b"coef_c2", &c.c2);
+    }
+    append_point(t, b"cstar_c1", &c_star.c1);
+    append_point(t, b"cstar_c2", &c_star.c2);
+    for c in &chain_proof.e_comms {
+        append_compressed(t, b"e_comm", c);
+    }
+    append_compressed(t, b"y_comm", &chain_proof.y_comm);
+    append_compressed(t, b"inv_comm", &chain_proof.inv_en_comm);
+    t.append_message(b"r1cs", &chain_proof.proof.to_bytes());
+    t.append_message(b"beta_y", &beta_y.to_bytes());
+    t.append_message(b"beta_c1", &beta_c1.to_bytes());
+    t.append_message(b"beta_c2", &beta_c2.to_bytes());
+    append_compressed(t, b"alpha_tag", alpha_tag);
+    append_compressed(t, b"A_t", glue_a_t);
+}
+
+fn append_partial_decrypt_section(
+    t: &mut Transcript,
+    pk2: &crate::crypto::elgamal::PublicKeyShare,
+    pk1: &crate::crypto::elgamal::PublicKeyShare,
+    partial_in_ct: &Ciphertext,
+    partial_out_ct: &Ciphertext,
+    beta_pd: Scalar,
+    gamma_pd: Scalar,
+    partial_a: &CompressedRistretto,
+) {
+    t.append_message(b"section", b"partial_decrypt");
+    append_point(t, b"pk2", &pk2.0);
+    append_point(t, b"pk1", &pk1.0);
+    append_point(t, b"c1_in", &partial_in_ct.c1);
+    append_point(t, b"c2_in", &partial_in_ct.c2);
+    append_point(t, b"c1_out", &partial_out_ct.c1);
+    append_point(t, b"c2_out", &partial_out_ct.c2);
+    t.append_message(b"beta", &beta_pd.to_bytes());
+    t.append_message(b"gamma", &gamma_pd.to_bytes());
+    append_compressed(t, b"A", partial_a);
+}
+
+fn append_poly_div_section(
+    t: &mut Transcript,
+    poly_in: &crate::crypto::elgamal::EncryptedPoly,
+    poly_out: &crate::crypto::elgamal::EncryptedPoly,
+    alpha_tag: &CompressedRistretto,
+    beta_poly: Scalar,
+    gamma_poly: Scalar,
+    poly_a1: &CompressedRistretto,
+    poly_a2: &CompressedRistretto,
+    poly_a_m: &CompressedRistretto,
+) {
+    t.append_message(b"section", b"poly_div");
+    append_compressed(t, b"alpha_tag", alpha_tag);
+    for ct in &poly_in.0 {
+        append_point(t, b"in_c1", &ct.c1);
+        append_point(t, b"in_c2", &ct.c2);
+    }
+    for ct in &poly_out.0 {
+        append_point(t, b"out_c1", &ct.c1);
+        append_point(t, b"out_c2", &ct.c2);
+    }
+    append_compressed(t, b"A1", poly_a1);
+    append_compressed(t, b"A2", poly_a2);
+    append_compressed(t, b"A_m", poly_a_m);
+    t.append_message(b"beta", &beta_poly.to_bytes());
+    t.append_message(b"gamma", &gamma_poly.to_bytes());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn combined_transcript(
+    pk: &PublicKey,
+    coeff_cts: &[Ciphertext],
+    c_star: &Ciphertext,
+    chain_proof: &bp::EvalChainProof,
+    alpha_tag: &CompressedRistretto,
+    glue_a_t: &CompressedRistretto,
+    beta_y: Scalar,
+    beta_c1: Scalar,
+    beta_c2: Scalar,
+    pk2: &crate::crypto::elgamal::PublicKeyShare,
+    pk1: &crate::crypto::elgamal::PublicKeyShare,
+    partial_in_ct: &Ciphertext,
+    partial_out_ct: &Ciphertext,
+    beta_pd: Scalar,
+    gamma_pd: Scalar,
+    partial_a: &CompressedRistretto,
+    poly_in: &crate::crypto::elgamal::EncryptedPoly,
+    poly_out: &crate::crypto::elgamal::EncryptedPoly,
+    beta_poly: Scalar,
+    gamma_poly: Scalar,
+    poly_a1: &CompressedRistretto,
+    poly_a2: &CompressedRistretto,
+    poly_a_m: &CompressedRistretto,
+) -> Transcript {
+    let mut t = Transcript::new(b"I-PSI-CA::combined_sigma_round_v1");
+    append_glue_section(
+        &mut t,
+        chain_proof,
+        pk,
+        coeff_cts,
+        c_star,
+        beta_y,
+        beta_c1,
+        beta_c2,
+        alpha_tag,
+        glue_a_t,
+    );
+    append_partial_decrypt_section(
+        &mut t,
+        pk2,
+        pk1,
+        partial_in_ct,
+        partial_out_ct,
+        beta_pd,
+        gamma_pd,
+        partial_a,
+    );
+    append_poly_div_section(
+        &mut t,
+        poly_in,
+        poly_out,
+        alpha_tag,
+        beta_poly,
+        gamma_poly,
+        poly_a1,
+        poly_a2,
+        poly_a_m,
+    );
+    t
+}
+
+#[allow(clippy::too_many_arguments)]
+fn combined_prover_challenge(
+    pk: &PublicKey,
+    coeff_cts: &[Ciphertext],
+    c_star: &Ciphertext,
+    chain_proof: &bp::EvalChainProof,
+    alpha_tag: &CompressedRistretto,
+    glue_a_t: &CompressedRistretto,
+    beta_y: Scalar,
+    beta_c1: Scalar,
+    beta_c2: Scalar,
+    pk2: &crate::crypto::elgamal::PublicKeyShare,
+    pk1: &crate::crypto::elgamal::PublicKeyShare,
+    partial_in_ct: &Ciphertext,
+    partial_out_ct: &Ciphertext,
+    beta_pd: Scalar,
+    gamma_pd: Scalar,
+    partial_a: &CompressedRistretto,
+    poly_in: &crate::crypto::elgamal::EncryptedPoly,
+    poly_out: &crate::crypto::elgamal::EncryptedPoly,
+    beta_poly: Scalar,
+    gamma_poly: Scalar,
+    poly_a1: &CompressedRistretto,
+    poly_a2: &CompressedRistretto,
+    poly_a_m: &CompressedRistretto,
+) -> Scalar {
+    let mut t = combined_transcript(
+        pk,
+        coeff_cts,
+        c_star,
+        chain_proof,
+        alpha_tag,
+        glue_a_t,
+        beta_y,
+        beta_c1,
+        beta_c2,
+        pk2,
+        pk1,
+        partial_in_ct,
+        partial_out_ct,
+        beta_pd,
+        gamma_pd,
+        partial_a,
+        poly_in,
+        poly_out,
+        beta_poly,
+        gamma_poly,
+        poly_a1,
+        poly_a2,
+        poly_a_m,
+    );
+    challenge_scalar(&mut t)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn combined_challenge(
+    pk: &PublicKey,
+    coeff_cts: &[Ciphertext],
+    c_star: &Ciphertext,
+    chain_proof: &bp::EvalChainProof,
+    alpha_tag: &CompressedRistretto,
+    glue_a_t: &CompressedRistretto,
+    beta_y: Scalar,
+    beta_c1: Scalar,
+    beta_c2: Scalar,
+    pk2: &crate::crypto::elgamal::PublicKeyShare,
+    pk1: &crate::crypto::elgamal::PublicKeyShare,
+    partial_in_ct: &Ciphertext,
+    partial_out_ct: &Ciphertext,
+    beta_pd: Scalar,
+    gamma_pd: Scalar,
+    partial_a: &CompressedRistretto,
+    poly_in: &crate::crypto::elgamal::EncryptedPoly,
+    poly_out: &crate::crypto::elgamal::EncryptedPoly,
+    beta_poly: Scalar,
+    gamma_poly: Scalar,
+    poly_a1: &CompressedRistretto,
+    poly_a2: &CompressedRistretto,
+    poly_a_m: &CompressedRistretto,
+) -> (Scalar, Scalar, Scalar, Scalar) {
+    let mut t = combined_transcript(
+        pk,
+        coeff_cts,
+        c_star,
+        chain_proof,
+        alpha_tag,
+        glue_a_t,
+        beta_y,
+        beta_c1,
+        beta_c2,
+        pk2,
+        pk1,
+        partial_in_ct,
+        partial_out_ct,
+        beta_pd,
+        gamma_pd,
+        partial_a,
+        poly_in,
+        poly_out,
+        beta_poly,
+        gamma_poly,
+        poly_a1,
+        poly_a2,
+        poly_a_m,
+    );
+    let challenge = challenge_scalar(&mut t);
+    let rho_glue = batch_scalar(&mut t, b"rho_glue");
+    let rho_partial = batch_scalar(&mut t, b"rho_partial");
+    let rho_poly = batch_scalar(&mut t, b"rho_poly");
+    (challenge, rho_glue, rho_partial, rho_poly)
+}
+
+fn relation_scalars(
+    chain_proof: &bp::EvalChainProof,
+    pk: &PublicKey,
+    coeff_cts: &[Ciphertext],
+    c_star: &Ciphertext,
+) -> (Scalar, Scalar, Scalar) {
+    let mut t = glue_transcript(chain_proof, pk, coeff_cts, c_star);
+    let beta_y = batch_scalar(&mut t, b"batch_y");
+    let beta_c1 = batch_scalar(&mut t, b"batch_c1");
+    let beta_c2 = batch_scalar(&mut t, b"batch_c2");
+    (beta_y, beta_c1, beta_c2)
+}
+
+/// Build Bulletproof chain proof while retaining e-commitment blindings for glue.
+fn prove_chain_with_openings<R: CryptoRng + RngCore>(
+    rng: &mut R,
+    pc_gens: &PedersenGens,
+    bp_gens: &BulletproofGens,
+    e_rev: &[Scalar],
+    alpha: Scalar,
+) -> Result<(bp::EvalChainProof, Scalar), R1CSError> {
+    let n = e_rev.len() - 1;
+
+    let mut transcript = Transcript::new(b"I-PSI-CA::eval_chain");
+    let mut prover = Prover::new(pc_gens, &mut transcript);
+
+    let mut e_comms = Vec::with_capacity(e_rev.len());
+    let mut e_vars: Vec<Variable> = Vec::with_capacity(e_rev.len());
+    for &ei in e_rev {
+        let blind = Scalar::random(rng);
+        let (comm, var) = prover.commit(ei, blind);
+        e_comms.push(comm);
+        e_vars.push(var);
+    }
+
+    let y_blind = Scalar::random(rng);
+    let (y_comm, y_var) = prover.commit(alpha, y_blind);
+
+    let inv_en = e_rev[n].invert();
+    let (inv_en_comm, inv_en_var) = prover.commit(inv_en, Scalar::random(rng));
+
+    let e_lcs: Vec<LinearCombination> = e_vars.into_iter().map(Into::into).collect();
+    let y_lc: LinearCombination = y_var.into();
+    bp::eval_chain_gadget(&mut prover, e_lcs, y_lc, inv_en_var)?;
+
+    let proof = prover.prove(bp_gens)?;
+    Ok((
+        bp::EvalChainProof {
+            proof,
+            e_comms,
+            y_comm,
+            inv_en_comm,
+        },
+        y_blind,
+    ))
+}
+
+/// Prove the Sigma-Bullet glue statement for ciphertext relation consistency.
+pub fn prove(
+    pc_gens: &PedersenGens,
+    bp_gens: &BulletproofGens,
+    pk: &PublicKey,
+    coeff_cts: &[Ciphertext],
+    c_star: &Ciphertext,
+    alpha: Scalar,
+    r: Scalar,
+) -> Result<SigmaBulletProof, R1CSError> {
+    assert!(!coeff_cts.is_empty(), "coeff_cts must not be empty");
+
+    // Build e_i chain in ascending order: e_0=r, e_{i+1}=e_i*alpha.
+    let mut e_asc = Vec::with_capacity(coeff_cts.len());
+    e_asc.push(r);
+    for i in 1..coeff_cts.len() {
+        e_asc.push(e_asc[i - 1] * alpha);
+    }
+
+    // Bulletproof gadget expects [e_d..e_0] so its non-zero check is on e_0=r.
+    let e_rev: Vec<Scalar> = e_asc.iter().cloned().rev().collect();
+
+    let mut rng = thread_rng();
+    let (chain_proof, y_blind) =
+        prove_chain_with_openings(&mut rng, pc_gens, bp_gens, &e_rev, alpha)?;
+
+    let mut t = glue_transcript(&chain_proof, pk, coeff_cts, c_star);
+    let (beta_y, beta_c1, beta_c2) = relation_scalars(&chain_proof, pk, coeff_cts, c_star);
+
+    // One nonce per witness e_i.
+    let mut k_e = Vec::with_capacity(e_asc.len());
+    for _ in 0..e_asc.len() {
+        let ke = Scalar::random(&mut rng);
+        k_e.push(ke);
+    }
+
+    let alpha_tag = mul_g(&alpha).compress();
+    let k_alpha = Scalar::random(&mut rng);
+    let k_y_blind = Scalar::random(&mut rng);
+    let mut scalars = Vec::with_capacity(3 + k_e.len());
+    let mut points = Vec::with_capacity(3 + k_e.len());
+    scalars.push(k_alpha);
+    points.push(G);
+    scalars.push(beta_y * k_alpha);
+    points.push(pc_gens.B);
+    scalars.push(beta_y * k_y_blind);
+    points.push(pc_gens.B_blinding);
+    for (idx, (ke, ct)) in k_e.iter().zip(coeff_cts.iter()).enumerate() {
+        let mut basis = beta_c1 * ct.c1 + beta_c2 * ct.c2;
+        if idx == 0 {
+            basis = basis + beta_c1 * G + beta_c2 * pk.0;
+        }
+        scalars.push(*ke);
+        points.push(basis);
+    }
+    let a_t = RistrettoPoint::multiscalar_mul(scalars.iter().copied(), points.iter().copied());
+
+    t.append_message(b"beta_y", &beta_y.to_bytes());
+    t.append_message(b"beta_c1", &beta_c1.to_bytes());
+    t.append_message(b"beta_c2", &beta_c2.to_bytes());
+    append_compressed(&mut t, b"alpha_tag", &alpha_tag);
+    append_point(&mut t, b"A_t", &a_t);
+    let chal = challenge_scalar(&mut t);
+
+    let z_e: Vec<Scalar> = k_e
+        .iter()
+        .zip(e_asc.iter())
+        .map(|(k, x)| k + chal * x)
+        .collect();
+    Ok(SigmaBulletProof {
+        chain_proof,
+        glue: GlueProof {
+            alpha_tag,
+            a_t: a_t.compress(),
+            z_e,
+            z_alpha: k_alpha + chal * alpha,
+            z_y_blind: k_y_blind + chal * y_blind,
+        },
+    })
+}
+
+/// Prove the full monitor round with one shared Fiat-Shamir challenge across
+/// Sigma-Bullet glue, partial decryption, and polynomial division.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_round<R: CryptoRng + RngCore>(
+    rng: &mut R,
+    pc_gens: &PedersenGens,
+    bp_gens: &BulletproofGens,
+    pk: &PublicKey,
+    pk1: &crate::crypto::elgamal::PublicKeyShare,
+    pk2: &crate::crypto::elgamal::PublicKeyShare,
+    coeff_cts: &[Ciphertext],
+    c_star: &Ciphertext,
+    partial_out_ct: &Ciphertext,
+    poly_in: &crate::crypto::elgamal::EncryptedPoly,
+    poly_out: &crate::crypto::elgamal::EncryptedPoly,
+    alpha: Scalar,
+    r: Scalar,
+    r_prime: Scalar,
+    sk2: &Scalar,
+    delta_vec: &[Scalar],
+) -> Result<CombinedSigmaProof, R1CSError> {
+    assert!(!coeff_cts.is_empty(), "coeff_cts must not be empty");
+
+    let mut e_asc = Vec::with_capacity(coeff_cts.len());
+    e_asc.push(r);
+    for i in 1..coeff_cts.len() {
+        e_asc.push(e_asc[i - 1] * alpha);
+    }
+    let e_rev: Vec<Scalar> = e_asc.iter().cloned().rev().collect();
+    let (chain_proof, y_blind) =
+        prove_chain_with_openings(rng, pc_gens, bp_gens, &e_rev, alpha)?;
+
+    let (beta_y, beta_c1, beta_c2) = relation_scalars(&chain_proof, pk, coeff_cts, c_star);
+    let mut k_e = Vec::with_capacity(e_asc.len());
+    for _ in 0..e_asc.len() {
+        k_e.push(Scalar::random(rng));
+    }
+
+    let alpha_tag_pt = mul_g(&alpha);
+    let alpha_tag = alpha_tag_pt.compress();
+    let k_alpha = Scalar::random(rng);
+    let k_y_blind = Scalar::random(rng);
+    let mut scalars = Vec::with_capacity(3 + k_e.len());
+    let mut points = Vec::with_capacity(3 + k_e.len());
+    scalars.push(k_alpha);
+    points.push(G);
+    scalars.push(beta_y * k_alpha);
+    points.push(pc_gens.B);
+    scalars.push(beta_y * k_y_blind);
+    points.push(pc_gens.B_blinding);
+    for (idx, (ke, ct)) in k_e.iter().zip(coeff_cts.iter()).enumerate() {
+        let mut basis = beta_c1 * ct.c1 + beta_c2 * ct.c2;
+        if idx == 0 {
+            basis = basis + beta_c1 * G + beta_c2 * pk.0;
+        }
+        scalars.push(*ke);
+        points.push(basis);
+    }
+    let glue_a_t = RistrettoPoint::multiscalar_mul(scalars.iter().copied(), points.iter().copied())
+        .compress();
+
+    let (beta_pd, gamma_pd) =
+        sigma::partial_decrypt_relation_scalars(pk2, pk1, c_star, partial_out_ct);
+    let k_sk2 = Scalar::random(rng);
+    let k_r_prime = Scalar::random(rng);
+    let beta_g = mul_g(&beta_pd);
+    let partial_a = (
+        mul_g(&k_sk2)
+        - k_sk2 * (gamma_pd * c_star.c1)
+        + k_r_prime * (gamma_pd * (pk1.0 + beta_g))
+    )
+    .compress();
+
+    let (x_c1, x_c2, _y_c1, _y_c2, alphas) =
+        sigma::poly_div_relation_points(poly_in, poly_out, &alpha_tag_pt);
+    let delta_star: Scalar = alphas
+        .iter()
+        .zip(delta_vec.iter())
+        .map(|(alpha_i, delta)| alpha_i * delta)
+        .sum();
+    let k_poly_y = Scalar::random(rng);
+    let k_poly_delta = Scalar::random(rng);
+    let poly_a1 = (k_poly_y * x_c1 + mul_g(&k_poly_delta)).compress();
+    let poly_a2 = (k_poly_y * x_c2 + k_poly_delta * pk.0).compress();
+    let poly_a_m = mul_g(&k_poly_y).compress();
+    let poly_temp = PolyDivProof {
+        a1: poly_a1,
+        a2: poly_a2,
+        alpha_tag,
+        a_m: poly_a_m,
+        s_y: Scalar::zero(),
+        s_delta: Scalar::zero(),
+    };
+    let (beta_poly, gamma_poly) =
+        sigma::poly_div_batch_scalars(&poly_temp, poly_in, poly_out, &alpha_tag_pt)
+            .map_err(|_| R1CSError::FormatError)?;
+
+    let shared_chal = combined_prover_challenge(
+        pk,
+        coeff_cts,
+        c_star,
+        &chain_proof,
+        &alpha_tag,
+        &glue_a_t,
+        beta_y,
+        beta_c1,
+        beta_c2,
+        pk2,
+        pk1,
+        c_star,
+        partial_out_ct,
+        beta_pd,
+        gamma_pd,
+        &partial_a,
+        poly_in,
+        poly_out,
+        beta_poly,
+        gamma_poly,
+        &poly_a1,
+        &poly_a2,
+        &poly_a_m,
+    );
+
+    Ok(CombinedSigmaProof {
+        chain_proof,
+        alpha_tag,
+        glue_a_t,
+        glue_z_e: k_e
+            .iter()
+            .zip(e_asc.iter())
+            .map(|(k, x)| k + shared_chal * x)
+            .collect(),
+        glue_z_alpha: k_alpha + shared_chal * alpha,
+        glue_z_y_blind: k_y_blind + shared_chal * y_blind,
+        partial_a,
+        partial_z1: k_sk2 + shared_chal * sk2,
+        partial_z2: k_r_prime + shared_chal * r_prime,
+        poly_a1,
+        poly_a2,
+        poly_a_m,
+        poly_s_y: k_poly_y + shared_chal * alpha,
+        poly_s_delta: k_poly_delta + shared_chal * delta_star,
+    })
+}
+
+/// Verify Sigma-Bullet glue proof.
+pub fn verify(
+    pc_gens: &PedersenGens,
+    bp_gens: &BulletproofGens,
+    pk: &PublicKey,
+    coeff_cts: &[Ciphertext],
+    c_star: &Ciphertext,
+    proof: &SigmaBulletProof,
+) -> Result<(), String> {
+    if coeff_cts.is_empty() {
+        return Err("coeff_cts must not be empty".to_string());
+    }
+
+    // 1) Verify arithmetic chain/non-zero Bulletproof layer.
+    bp::verify(pc_gens, bp_gens, &proof.chain_proof)
+        .map_err(|e| format!("chain Bulletproof invalid: {e:?}"))?;
+
+    if proof.chain_proof.e_comms.len() != coeff_cts.len() {
+        return Err("e commitment length mismatch".to_string());
+    }
+    if proof.glue.z_e.len() != coeff_cts.len() {
+        return Err("glue vector length mismatch".to_string());
+    }
+
+    let mut t = glue_transcript(&proof.chain_proof, pk, coeff_cts, c_star);
+    let (beta_y, beta_c1, beta_c2) = relation_scalars(&proof.chain_proof, pk, coeff_cts, c_star);
+    let alpha_tag = proof
+        .glue
+        .alpha_tag
+        .decompress()
+        .ok_or_else(|| "invalid glue alpha_tag point".to_string())?;
+    let a_t = proof
+        .glue
+        .a_t
+        .decompress()
+        .ok_or_else(|| "invalid glue A_t point".to_string())?;
+
+    t.append_message(b"beta_y", &beta_y.to_bytes());
+    t.append_message(b"beta_c1", &beta_c1.to_bytes());
+    t.append_message(b"beta_c2", &beta_c2.to_bytes());
+    append_compressed(&mut t, b"alpha_tag", &proof.glue.alpha_tag);
+    append_point(&mut t, b"A_t", &a_t);
+
+    let chal = challenge_scalar(&mut t);
+
+    let y_comm_pt = proof
+        .chain_proof
+        .y_comm
+        .decompress()
+        .ok_or_else(|| "invalid y commitment point".to_string())?;
+    let mut lhs_scalars = Vec::with_capacity(3 + proof.glue.z_e.len());
+    let mut lhs_points = Vec::with_capacity(3 + proof.glue.z_e.len());
+    lhs_scalars.push(proof.glue.z_alpha);
+    lhs_points.push(G);
+    lhs_scalars.push(beta_y * proof.glue.z_alpha);
+    lhs_points.push(pc_gens.B);
+    lhs_scalars.push(beta_y * proof.glue.z_y_blind);
+    lhs_points.push(pc_gens.B_blinding);
+    for (idx, (z, ct)) in proof.glue.z_e.iter().zip(coeff_cts.iter()).enumerate() {
+        let mut basis = beta_c1 * ct.c1 + beta_c2 * ct.c2;
+        if idx == 0 {
+            basis = basis + beta_c1 * G + beta_c2 * pk.0;
+        }
+        lhs_scalars.push(*z);
+        lhs_points.push(basis);
+    }
+    let lhs = RistrettoPoint::vartime_multiscalar_mul(
+        lhs_scalars.iter().copied(),
+        lhs_points.iter().copied(),
+    );
+    let rhs = a_t + chal * (alpha_tag + beta_y * y_comm_pt + beta_c1 * c_star.c1 + beta_c2 * c_star.c2);
+    if lhs != rhs {
+        return Err("glue batched relation failed".to_string());
+    }
+
+    Ok(())
+}
+
+/// Verify the full monitor round proof under one shared Fiat-Shamir challenge.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_round(
+    pc_gens: &PedersenGens,
+    bp_gens: &BulletproofGens,
+    pk: &PublicKey,
+    pk1: &crate::crypto::elgamal::PublicKeyShare,
+    pk2: &crate::crypto::elgamal::PublicKeyShare,
+    coeff_cts: &[Ciphertext],
+    c_star: &Ciphertext,
+    partial_out_ct: &Ciphertext,
+    poly_in: &crate::crypto::elgamal::EncryptedPoly,
+    poly_out: &crate::crypto::elgamal::EncryptedPoly,
+    proof: &CombinedSigmaProof,
+) -> Result<(), String> {
+    if proof.chain_proof.e_comms.len() != coeff_cts.len() {
+        return Err("e commitment length mismatch".to_string());
+    }
+    if proof.glue_z_e.len() != coeff_cts.len() {
+        return Err("glue vector length mismatch".to_string());
+    }
+
+    bp::verify(pc_gens, bp_gens, &proof.chain_proof)
+        .map_err(|e| format!("chain Bulletproof invalid: {e:?}"))?;
+
+    let alpha_tag = proof
+        .alpha_tag
+        .decompress()
+        .ok_or_else(|| "invalid alpha_tag point".to_string())?;
+    let glue_a_t = proof
+        .glue_a_t
+        .decompress()
+        .ok_or_else(|| "invalid glue A_t point".to_string())?;
+    let partial_a = proof
+        .partial_a
+        .decompress()
+        .ok_or_else(|| "invalid partial A point".to_string())?;
+    let poly_a1 = proof
+        .poly_a1
+        .decompress()
+        .ok_or_else(|| "invalid poly A1 point".to_string())?;
+    let poly_a2 = proof
+        .poly_a2
+        .decompress()
+        .ok_or_else(|| "invalid poly A2 point".to_string())?;
+    let poly_a_m = proof
+        .poly_a_m
+        .decompress()
+        .ok_or_else(|| "invalid poly A_m point".to_string())?;
+
+    let (beta_y, beta_c1, beta_c2) = relation_scalars(&proof.chain_proof, pk, coeff_cts, c_star);
+    let y_comm_pt = proof
+        .chain_proof
+        .y_comm
+        .decompress()
+        .ok_or_else(|| "invalid y commitment point".to_string())?;
+    let (beta_pd, gamma_pd) =
+        sigma::partial_decrypt_relation_scalars(pk2, pk1, c_star, partial_out_ct);
+    let delta_c1 = partial_out_ct.c1 - c_star.c1;
+    let delta_c2 = partial_out_ct.c2 - c_star.c2;
+    let (x_c1, x_c2, y_c1, y_c2, _) =
+        sigma::poly_div_relation_points(poly_in, poly_out, &alpha_tag);
+    let poly_temp = PolyDivProof {
+        a1: proof.poly_a1,
+        a2: proof.poly_a2,
+        alpha_tag: proof.alpha_tag,
+        a_m: proof.poly_a_m,
+        s_y: proof.poly_s_y,
+        s_delta: proof.poly_s_delta,
+    };
+    let (beta_poly, gamma_poly) =
+        sigma::poly_div_batch_scalars(&poly_temp, poly_in, poly_out, &alpha_tag)
+            .map_err(str::to_string)?;
+    let (chal, rho_glue, rho_partial, rho_poly) = combined_challenge(
+        pk,
+        coeff_cts,
+        c_star,
+        &proof.chain_proof,
+        &proof.alpha_tag,
+        &proof.glue_a_t,
+        beta_y,
+        beta_c1,
+        beta_c2,
+        pk2,
+        pk1,
+        c_star,
+        partial_out_ct,
+        beta_pd,
+        gamma_pd,
+        &proof.partial_a,
+        poly_in,
+        poly_out,
+        beta_poly,
+        gamma_poly,
+        &proof.poly_a1,
+        &proof.poly_a2,
+        &proof.poly_a_m,
+    );
+
+    let mut scalars = Vec::new();
+    let mut points = Vec::new();
+
+    scalars.push(rho_glue * proof.glue_z_alpha);
+    points.push(G);
+    scalars.push(rho_glue * beta_y * proof.glue_z_alpha);
+    points.push(pc_gens.B);
+    scalars.push(rho_glue * beta_y * proof.glue_z_y_blind);
+    points.push(pc_gens.B_blinding);
+    for (idx, (z, ct)) in proof.glue_z_e.iter().zip(coeff_cts.iter()).enumerate() {
+        let mut basis = beta_c1 * ct.c1 + beta_c2 * ct.c2;
+        if idx == 0 {
+            basis = basis + beta_c1 * G + beta_c2 * pk.0;
+        }
+        scalars.push(rho_glue * *z);
+        points.push(basis);
+    }
+    scalars.push(-rho_glue);
+    points.push(glue_a_t);
+    scalars.push(-rho_glue * chal);
+    points.push(alpha_tag);
+    scalars.push(-rho_glue * chal * beta_y);
+    points.push(y_comm_pt);
+    scalars.push(-rho_glue * chal * beta_c1);
+    points.push(c_star.c1);
+    scalars.push(-rho_glue * chal * beta_c2);
+    points.push(c_star.c2);
+
+    scalars.push(rho_partial * (proof.partial_z1 + proof.partial_z2 * gamma_pd * beta_pd));
+    points.push(G);
+    scalars.push(rho_partial * proof.partial_z2 * gamma_pd);
+    points.push(pk1.0);
+    scalars.push(-rho_partial * proof.partial_z1 * gamma_pd);
+    points.push(c_star.c1);
+    scalars.push(-rho_partial);
+    points.push(partial_a);
+    scalars.push(-rho_partial * chal);
+    points.push(pk2.0);
+    scalars.push(-rho_partial * chal * gamma_pd);
+    points.push(delta_c2);
+    scalars.push(-rho_partial * chal * gamma_pd * beta_pd);
+    points.push(delta_c1);
+
+    scalars.push(rho_poly * proof.poly_s_y);
+    points.push(x_c1);
+    scalars.push(rho_poly * beta_poly * proof.poly_s_y);
+    points.push(x_c2);
+    scalars.push(rho_poly * (gamma_poly * proof.poly_s_y + proof.poly_s_delta));
+    points.push(G);
+    scalars.push(rho_poly * beta_poly * proof.poly_s_delta);
+    points.push(pk.0);
+    scalars.push(-rho_poly);
+    points.push(poly_a1);
+    scalars.push(-rho_poly * beta_poly);
+    points.push(poly_a2);
+    scalars.push(-rho_poly * gamma_poly);
+    points.push(poly_a_m);
+    scalars.push(-rho_poly * chal);
+    points.push(y_c1);
+    scalars.push(-rho_poly * chal * beta_poly);
+    points.push(y_c2);
+    scalars.push(-rho_poly * chal * gamma_poly);
+    points.push(alpha_tag);
+
+    let check = RistrettoPoint::vartime_multiscalar_mul(
+        scalars.iter().copied(),
+        points.iter().copied(),
+    );
+    if check != RistrettoPoint::identity() {
+        return Err("combined sigma batch check failed".to_string());
+    }
+
+    Ok(())
+}
+
+/// Helper for tests: deterministic Enc_pk(0; r).
+#[cfg(test)]
+fn enc_zero_with_r(pk: &PublicKey, r: Scalar) -> Ciphertext {
+    Ciphertext {
+        c1: mul_g(&r),
+        c2: r * pk.0,
+    }
+}
+
+/// Helper for tests/examples: homomorphic sum_i (e_i * C_i).
+#[cfg(test)]
+fn weighted_sum(coeff_cts: &[Ciphertext], e_asc: &[Scalar]) -> Ciphertext {
+    let mut c1 = RistrettoPoint::identity();
+    let mut c2 = RistrettoPoint::identity();
+    for (e, ct) in e_asc.iter().zip(coeff_cts.iter()) {
+        c1 = c1 + e * ct.c1;
+        c2 = c2 + e * ct.c2;
+    }
+    Ciphertext { c1, c2 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::elgamal::{combine_public_keys, encrypt_poly, generate_key_share};
+    use rand::rngs::OsRng;
+
+    fn make_bp_gens(n_mul: usize) -> BulletproofGens {
+        let cap = (n_mul.max(1)).next_power_of_two();
+        BulletproofGens::new(cap, 1)
+    }
+
+    #[test]
+    fn sigma_bullet_glue_valid() {
+        let mut rng = OsRng;
+        let (_sk1, pk1) = generate_key_share(&mut rng);
+        let (_sk2, pk2) = generate_key_share(&mut rng);
+        let pk = combine_public_keys(&pk1, &pk2);
+
+        let coeffs = [
+            Scalar::from(3u64),
+            Scalar::from(5u64),
+            Scalar::from(7u64),
+            Scalar::from(11u64),
+        ];
+        let poly = encrypt_poly(&mut rng, &pk, &coeffs);
+
+        let alpha = Scalar::from(9u64);
+        let r = Scalar::from(13u64);
+
+        let mut e_asc = Vec::with_capacity(poly.0.len());
+        e_asc.push(r);
+        for i in 1..poly.0.len() {
+            e_asc.push(e_asc[i - 1] * alpha);
+        }
+
+        let sum = weighted_sum(&poly.0, &e_asc);
+        let ez = enc_zero_with_r(&pk, r);
+        let c_star = Ciphertext {
+            c1: sum.c1 + ez.c1,
+            c2: sum.c2 + ez.c2,
+        };
+
+        let pc_gens = PedersenGens::default();
+        let bp_gens = make_bp_gens(2 * poly.0.len());
+        let proof = prove(&pc_gens, &bp_gens, &pk, &poly.0, &c_star, alpha, r)
+            .expect("prove must succeed");
+
+        verify(&pc_gens, &bp_gens, &pk, &poly.0, &c_star, &proof)
+            .expect("verify must succeed");
+    }
+
+    #[test]
+    fn sigma_bullet_glue_rejects_tampered_cstar() {
+        let mut rng = OsRng;
+        let (_sk1, pk1) = generate_key_share(&mut rng);
+        let (_sk2, pk2) = generate_key_share(&mut rng);
+        let pk = combine_public_keys(&pk1, &pk2);
+
+        let coeffs = [Scalar::from(1u64), Scalar::from(2u64), Scalar::from(3u64)];
+        let poly = encrypt_poly(&mut rng, &pk, &coeffs);
+
+        let alpha = Scalar::from(4u64);
+        let r = Scalar::from(6u64);
+
+        let mut e_asc = Vec::with_capacity(poly.0.len());
+        e_asc.push(r);
+        for i in 1..poly.0.len() {
+            e_asc.push(e_asc[i - 1] * alpha);
+        }
+
+        let sum = weighted_sum(&poly.0, &e_asc);
+        let ez = enc_zero_with_r(&pk, r);
+        let c_star = Ciphertext {
+            c1: sum.c1 + ez.c1,
+            c2: sum.c2 + ez.c2,
+        };
+
+        let pc_gens = PedersenGens::default();
+        let bp_gens = make_bp_gens(2 * poly.0.len());
+        let proof = prove(&pc_gens, &bp_gens, &pk, &poly.0, &c_star, alpha, r)
+            .expect("prove must succeed");
+
+        let tampered = Ciphertext {
+            c1: c_star.c1 + G,
+            c2: c_star.c2,
+        };
+
+        assert!(
+            verify(&pc_gens, &bp_gens, &pk, &poly.0, &tampered, &proof).is_err(),
+            "tampered c_star must fail",
+        );
+    }
+}

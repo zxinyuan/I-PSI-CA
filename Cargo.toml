@@ -1,0 +1,14 @@
+[package]
+name = "i-psi-ca"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde      = { version = "1", features = ["derive"] }
+bincode    = "1"
+bulletproofs       = { version = "4", features = ["yoloproofs"] }
+curve25519-dalek-ng = { version = "4" }
+rand       = "0.8"
+merlin     = "3"
+zeroize    = { version = "1", features = ["derive"] }
+
