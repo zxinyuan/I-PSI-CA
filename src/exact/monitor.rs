@@ -8,10 +8,10 @@
 //!          `eval_ct = THEval[pk](TPolyCtext, MElmt)`
 //!   M.2  Scale and partially decrypt:
 //!          `MPolyCtext = THDec[sk2](mask · eval_ct)`
-//!   M.3  Compute the quotient polynomial:
-//!          `nextTPoly = TPolyCtext THDiv[pk] (X − MElmt)`
-//!   M.4  Build a ZKPoK (`MEzkp`) proving M.1–M.3 are consistent,
-//!        then send `(nextTPoly, MPolyCtext, MEzkp)` to the target.
+//!   M.3  Update the accumulated polynomial:
+//!          `nextAccum = MElmt · Accum`
+//!   M.4  Build a ZKPoK (`MEzkp`) proving the evaluation, partial decryptions,
+//!        and `nextAccum` update are consistent, then send the result to the target.
 //!
 //! # ZK proof structure
 //! Uses the Sigma-Bullet hybrid proof (`crypto/sigma-bullet.rs`) to bind:
@@ -34,7 +34,7 @@ use curve25519_dalek_ng::{
 use rand::rngs::OsRng;
 
 use crate::crypto::elgamal::{
-    combine_public_keys, ct_add, ct_scalar_mul, div_poly_linear, eval_poly,
+    combine_public_keys, ct_add, ct_scalar_mul, eval_poly, poly_scalar_mul,
     partial_decrypt_with_witness, PublicKey, PublicKeyShare, SecretKeyShare,
 };
 use crate::crypto::sigma_bullet;
@@ -98,31 +98,31 @@ impl Monitor {
         &self,
         rng: &mut OsRng,
         t_poly_ct: &WireEncryptedPoly,
+        accum_ct: &WireEncryptedPoly,
     ) -> Result<MonitorToTarget, String> {
         let poly = t_poly_ct.to_native()?;
+        let accum = accum_ct.to_native()?;
 
         // M.1  THEval[pk]{TPolyCtext}{MElmt} — evaluate the encrypted polynomial.
         let eval_ct = eval_poly(&poly, &self.m_elmt);
+        let accum_eval = eval_poly(&accum, &self.m_elmt);
 
-        // M.2  Choose mask ←$ 𝔽* (non-zero).
-        //      Scale the evaluation ciphertext and add Enc(0; mask), then
-        //      partially decrypt with sk2.
-        //      Result: MPolyCtext ∈ THCtextSpace[pk1][mask·P(MElmt)].
-        let mask   = non_zero_scalar(rng);
-        let scaled_no_blind = ct_scalar_mul(&eval_ct, &mask);
-        let enc_zero_mask = crate::crypto::elgamal::Ciphertext {
-            c1: &mask * &RISTRETTO_BASEPOINT_TABLE,
-            c2: mask * self.pk.0,
-        };
-        let scaled = ct_add(&scaled_no_blind, &enc_zero_mask);
-        // Use the witness-returning variant so we can generate the sigma proof.
+        // M.2  Choose mask ←$ 𝔽* (non-zero), scale, blind with Enc(0; mask),
+        //      then partially decrypt with sk2.
+        let mask = non_zero_scalar(rng);
+        let scaled = self.mask_eval(eval_ct, mask);
         let (m_poly_ct, r_prime) = partial_decrypt_with_witness(rng, &self.sk2, &self.pk1, &scaled);
 
-        // M.3  TPolyCtext THDiv[pk] (X − MElmt) — homomorphic polynomial division.
-        let next_t_poly = div_poly_linear(&poly, &self.m_elmt);
+        // Apply the same masking-and-partial-decryption flow to the accumulated
+        // polynomial evaluation before sending it back to the target.
+        let accum_mask = non_zero_scalar(rng);
+        let accum_scaled = self.mask_eval(accum_eval, accum_mask);
+        let (accum_m_poly_ct, accum_r_prime) =
+            partial_decrypt_with_witness(rng, &self.sk2, &self.pk1, &accum_scaled);
 
-        // M.4  Build the Sigma-Bullet glue proof.
-        let delta_vec = vec![Scalar::zero(); next_t_poly.0.len()];
+        let next_accum = poly_scalar_mul(&accum, &self.m_elmt);
+
+        // M.3  Build the combined proof for the evaluation and accum update.
         let round_proof = sigma_bullet::prove_round(
             rng,
             &self.pc_gens,
@@ -133,18 +133,22 @@ impl Monitor {
             &poly.0,
             &scaled,
             &m_poly_ct,
-            &poly,
-            &next_t_poly,
+            &accum_scaled,
+            &accum_m_poly_ct,
+            &accum,
+            &next_accum,
             self.m_elmt,
             mask,
             r_prime,
+            accum_r_prime,
             self.sk2.as_scalar(),
-            &delta_vec,
         )
         .map_err(|e| format!("round prove: {e:?}"))?;
 
         Ok(MonitorToTarget {
-            next_t_poly:  WireEncryptedPoly::from_native(&next_t_poly),
+            next_accum:   WireEncryptedPoly::from_native(&next_accum),
+            accum_scaled_eval: WireCiphertext::from_native(&accum_scaled),
+            accum_m_poly_ctext: WireCiphertext::from_native(&accum_m_poly_ct),
             scaled_eval:  WireCiphertext::from_native(&scaled),
             m_poly_ctext: WireCiphertext::from_native(&m_poly_ct),
             round_proof: WireCombinedSigmaProof::from_proof(&round_proof),
@@ -164,8 +168,8 @@ impl Monitor {
         let first: TargetToMonitor = recv_msg(&mut stream)?;
         let outsource_bytes = bincode::serialized_size(&first)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? + 4;
-        let mut current_poly_ct = match first {
-            TargetToMonitor::Outsource { t_poly_ct } => t_poly_ct,
+        let (current_poly_ct, mut current_accum_ct) = match first {
+            TargetToMonitor::Outsource { t_poly_ct, accum } => (t_poly_ct, accum),
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -186,7 +190,7 @@ impl Monitor {
 
             // Compute this round's message.
             let msg = self
-                .compute_round(&mut rng, &current_poly_ct)
+                .compute_round(&mut rng, &current_poly_ct, &current_accum_ct)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             let compute_ms = t_received_current.elapsed().as_secs_f64() * 1000.0;
 
@@ -218,9 +222,9 @@ impl Monitor {
             );
 
             match reply {
-                TargetToMonitor::NextRound { t_poly_ct_alt } => {
+                TargetToMonitor::NextRound { accum } => {
                     eprintln!("[Monitor] Round {round}: accepted");
-                    current_poly_ct = t_poly_ct_alt;
+                    current_accum_ct = accum;
                 }
                 TargetToMonitor::Reject { reason } => {
                     eprintln!("[Monitor] Round {round}: proof rejected — {reason}");
@@ -236,12 +240,28 @@ impl Monitor {
         }
 
         // Graceful close: just drop the stream.
+        let _ = current_accum_ct;
         eprintln!("[Monitor] Done after {rounds} round(s).");
         Ok(())
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+impl Monitor {
+    fn mask_eval(
+        &self,
+        eval_ct: crate::crypto::elgamal::Ciphertext,
+        mask: Scalar,
+    ) -> crate::crypto::elgamal::Ciphertext {
+        let scaled_no_blind = ct_scalar_mul(&eval_ct, &mask);
+        let enc_zero_mask = crate::crypto::elgamal::Ciphertext {
+            c1: &mask * &RISTRETTO_BASEPOINT_TABLE,
+            c2: mask * self.pk.0,
+        };
+        ct_add(&scaled_no_blind, &enc_zero_mask)
+    }
+}
 
 /// Sample a uniformly random non-zero scalar (mask ∈ 𝔽*).
 fn non_zero_scalar(rng: &mut OsRng) -> Scalar {
@@ -258,7 +278,7 @@ fn non_zero_scalar(rng: &mut OsRng) -> Scalar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::elgamal::{generate_key_share, test_zero};
+    use crate::crypto::elgamal::{encrypt_one, encrypt_poly, encrypt_zero, generate_key_share, test_zero, EncryptedPoly};
     use crate::exact::target::{poly_from_roots, Target, WireEncryptedPoly};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -277,14 +297,18 @@ mod tests {
         let pk = combine_public_keys(&pk1, &pk2);
         let monitor = Monitor::new(m, sk2, pk1.clone(), pk2.clone(), t_set.len());
 
-        // Build the encrypted polynomial directly.
-        use crate::crypto::elgamal::encrypt_poly;
         let coeffs = poly_from_roots(&t_set);
         let poly_ct = encrypt_poly(&mut rng, &pk, &coeffs);
+        let accum_ct = EncryptedPoly(vec![
+            encrypt_one(&mut rng, &pk),
+            encrypt_zero(&mut rng, &pk),
+            encrypt_zero(&mut rng, &pk),
+        ]);
         let wire_poly = WireEncryptedPoly::from_native(&poly_ct);
+        let wire_accum = WireEncryptedPoly::from_native(&accum_ct);
 
         // Run the monitor's computation.
-        let msg = monitor.compute_round(&mut rng, &wire_poly).unwrap();
+        let msg = monitor.compute_round(&mut rng, &wire_poly, &wire_accum).unwrap();
 
         // Verify the MPolyCtext decrypts to zero under sk1.
         let m_poly_ct = msg.m_poly_ctext.to_native().unwrap();
@@ -306,12 +330,17 @@ mod tests {
         let pk = combine_public_keys(&pk1, &pk2);
         let monitor = Monitor::new(m, sk2, pk1.clone(), pk2.clone(), t_set.len());
 
-        use crate::crypto::elgamal::encrypt_poly;
         let coeffs = poly_from_roots(&t_set);
         let poly_ct = encrypt_poly(&mut rng, &pk, &coeffs);
+        let accum_ct = EncryptedPoly(vec![
+            encrypt_one(&mut rng, &pk),
+            encrypt_zero(&mut rng, &pk),
+            encrypt_zero(&mut rng, &pk),
+        ]);
         let wire_poly = WireEncryptedPoly::from_native(&poly_ct);
+        let wire_accum = WireEncryptedPoly::from_native(&accum_ct);
 
-        let msg = monitor.compute_round(&mut rng, &wire_poly).unwrap();
+        let msg = monitor.compute_round(&mut rng, &wire_poly, &wire_accum).unwrap();
         let m_poly_ct = msg.m_poly_ctext.to_native().unwrap();
 
         assert!(
@@ -330,19 +359,24 @@ mod tests {
         let (sk2, pk2) = generate_key_share(&mut rng);
         let pk = combine_public_keys(&pk1, &pk2);
 
-        let mut target  = Target::new(t_set.clone(), sk1, pk1.clone(), pk2.clone());
+        let mut target  = Target::new(t_set.clone(), 5, sk1, pk1.clone(), pk2.clone());
         let monitor_hit = Monitor::new(Scalar::from(7u64),  sk2, pk1.clone(), pk2.clone(), t_set.len());
 
-        use crate::crypto::elgamal::encrypt_poly;
         let coeffs = poly_from_roots(&t_set);
         let poly_ct = encrypt_poly(&mut rng, &pk, &coeffs);
+        let accum_ct = EncryptedPoly(vec![
+            encrypt_one(&mut rng, &pk),
+            encrypt_zero(&mut rng, &pk),
+            encrypt_zero(&mut rng, &pk),
+        ]);
         let wire_poly = WireEncryptedPoly::from_native(&poly_ct);
+        let wire_accum = WireEncryptedPoly::from_native(&accum_ct);
 
         // Round 1: hit
-        let msg  = monitor_hit.compute_round(&mut rng, &wire_poly).unwrap();
-        let (next_poly, matched) = target.process_round(&mut rng, &poly_ct, &msg).unwrap();
+        let msg  = monitor_hit.compute_round(&mut rng, &wire_poly, &wire_accum).unwrap();
+        let (next_accum, matched) = target.process_round(&mut rng, &poly_ct, &accum_ct, &msg).unwrap();
         assert!(matched);
         assert_eq!(target.state, 1);
-        let _ = next_poly; // target sends this back in the real protocol
+        let _ = next_accum;
     }
 }

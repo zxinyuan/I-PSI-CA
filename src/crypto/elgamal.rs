@@ -328,16 +328,18 @@ pub fn div_poly_linear(poly: &EncryptedPoly, x: &Scalar) -> EncryptedPoly {
     let n = poly.0.len().checked_sub(1).expect("polynomial must have degree >= 1");
     assert!(n >= 1, "can only divide a polynomial of degree >= 1");
 
-    let mut quotient = vec![poly.0[0].clone(); n]; // pre-allocate n slots
-
-    // b[n-1] = a[n]  (leading coefficient of the quotient)
-    quotient[n - 1] = poly.0[n].clone();
-
-    // b[d] = a[d+1] + x · b[d+1]  for d = n-2 down to 0
+    // Build the quotient by pushing in reverse order (high to low coefficient),
+    // then reversing once.  This avoids the n wasteful placeholder clones of the
+    // original `vec![poly.0[0].clone(); n]` initialisation.
+    //
+    // Recurrence:  b[n-1] = a[n],  b[d] = a[d+1] + x · b[d+1]  for d = n-2..0
+    let mut quotient = Vec::with_capacity(n);
+    quotient.push(poly.0[n].clone()); // b[n-1] = a[n]
     for d in (0..n - 1).rev() {
-        let scaled = ct_scalar_mul(&quotient[d + 1], x);
-        quotient[d] = ct_add(&poly.0[d + 1], &scaled);
+        let scaled = ct_scalar_mul(quotient.last().unwrap(), x);
+        quotient.push(ct_add(&poly.0[d + 1], &scaled)); // b[d] = a[d+1] + x·b[d+1]
     }
+    quotient.reverse(); // restore ascending-degree order
 
     EncryptedPoly(quotient)
 }

@@ -26,7 +26,7 @@ use rand::{thread_rng, CryptoRng, RngCore};
 
 use crate::crypto::bulletproof as bp;
 use crate::crypto::elgamal::{Ciphertext, PublicKey};
-use crate::crypto::sigma::{self, PolyDivProof};
+use crate::crypto::sigma::{self, PolyScalarMulProof};
 
 /// Schnorr glue proof binding committed `e_i` values to the ciphertext relation.
 #[derive(Clone, Debug)]
@@ -49,8 +49,13 @@ pub struct SigmaBulletProof {
     pub glue: GlueProof,
 }
 
-/// Full round proof: arithmetic Bulletproof layer plus all Schnorr relations
-/// sharing one Fiat-Shamir challenge.
+/// Full round proof: arithmetic Bulletproof layer plus batched Schnorr
+/// relations for:
+/// 1. `t_poly_ct` evaluation glue,
+/// 2. partial decryption of the masked `t_poly_ct` evaluation,
+/// 3. partial decryption of the masked `accum` evaluation,
+/// 4. `next_accum = y · accum`,
+/// all sharing one Fiat-Shamir challenge and one `alpha_tag = y·G`.
 pub struct CombinedSigmaProof {
     pub chain_proof: bp::EvalChainProof,
     pub alpha_tag: CompressedRistretto,
@@ -61,11 +66,13 @@ pub struct CombinedSigmaProof {
     pub partial_a: CompressedRistretto,
     pub partial_z1: Scalar,
     pub partial_z2: Scalar,
-    pub poly_a1: CompressedRistretto,
-    pub poly_a2: CompressedRistretto,
-    pub poly_a_m: CompressedRistretto,
-    pub poly_s_y: Scalar,
-    pub poly_s_delta: Scalar,
+    pub accum_partial_a: CompressedRistretto,
+    pub accum_partial_z1: Scalar,
+    pub accum_partial_z2: Scalar,
+    pub accum_mul_a1: CompressedRistretto,
+    pub accum_mul_a2: CompressedRistretto,
+    pub accum_mul_a_m: CompressedRistretto,
+    pub accum_mul_s_y: Scalar,
 }
 
 fn append_point(t: &mut Transcript, label: &'static [u8], p: &RistrettoPoint) {
@@ -174,7 +181,7 @@ fn append_partial_decrypt_section(
     append_compressed(t, b"A", partial_a);
 }
 
-fn append_poly_div_section(
+fn append_poly_scalar_mul_section(
     t: &mut Transcript,
     poly_in: &crate::crypto::elgamal::EncryptedPoly,
     poly_out: &crate::crypto::elgamal::EncryptedPoly,
@@ -185,7 +192,7 @@ fn append_poly_div_section(
     poly_a2: &CompressedRistretto,
     poly_a_m: &CompressedRistretto,
 ) {
-    t.append_message(b"section", b"poly_div");
+    t.append_message(b"section", b"poly_scalar_mul");
     append_compressed(t, b"alpha_tag", alpha_tag);
     for ct in &poly_in.0 {
         append_point(t, b"in_c1", &ct.c1);
@@ -220,13 +227,18 @@ fn combined_transcript(
     beta_pd: Scalar,
     gamma_pd: Scalar,
     partial_a: &CompressedRistretto,
-    poly_in: &crate::crypto::elgamal::EncryptedPoly,
-    poly_out: &crate::crypto::elgamal::EncryptedPoly,
-    beta_poly: Scalar,
-    gamma_poly: Scalar,
-    poly_a1: &CompressedRistretto,
-    poly_a2: &CompressedRistretto,
-    poly_a_m: &CompressedRistretto,
+    accum_partial_in_ct: &Ciphertext,
+    accum_partial_out_ct: &Ciphertext,
+    beta_accum_pd: Scalar,
+    gamma_accum_pd: Scalar,
+    accum_partial_a: &CompressedRistretto,
+    accum_in: &crate::crypto::elgamal::EncryptedPoly,
+    accum_out: &crate::crypto::elgamal::EncryptedPoly,
+    beta_accum_mul: Scalar,
+    gamma_accum_mul: Scalar,
+    accum_mul_a1: &CompressedRistretto,
+    accum_mul_a2: &CompressedRistretto,
+    accum_mul_a_m: &CompressedRistretto,
 ) -> Transcript {
     let mut t = Transcript::new(b"I-PSI-CA::combined_sigma_round_v1");
     append_glue_section(
@@ -251,16 +263,26 @@ fn combined_transcript(
         gamma_pd,
         partial_a,
     );
-    append_poly_div_section(
+    append_partial_decrypt_section(
         &mut t,
-        poly_in,
-        poly_out,
+        pk2,
+        pk1,
+        accum_partial_in_ct,
+        accum_partial_out_ct,
+        beta_accum_pd,
+        gamma_accum_pd,
+        accum_partial_a,
+    );
+    append_poly_scalar_mul_section(
+        &mut t,
+        accum_in,
+        accum_out,
         alpha_tag,
-        beta_poly,
-        gamma_poly,
-        poly_a1,
-        poly_a2,
-        poly_a_m,
+        beta_accum_mul,
+        gamma_accum_mul,
+        accum_mul_a1,
+        accum_mul_a2,
+        accum_mul_a_m,
     );
     t
 }
@@ -283,13 +305,18 @@ fn combined_prover_challenge(
     beta_pd: Scalar,
     gamma_pd: Scalar,
     partial_a: &CompressedRistretto,
-    poly_in: &crate::crypto::elgamal::EncryptedPoly,
-    poly_out: &crate::crypto::elgamal::EncryptedPoly,
-    beta_poly: Scalar,
-    gamma_poly: Scalar,
-    poly_a1: &CompressedRistretto,
-    poly_a2: &CompressedRistretto,
-    poly_a_m: &CompressedRistretto,
+    accum_partial_in_ct: &Ciphertext,
+    accum_partial_out_ct: &Ciphertext,
+    beta_accum_pd: Scalar,
+    gamma_accum_pd: Scalar,
+    accum_partial_a: &CompressedRistretto,
+    accum_in: &crate::crypto::elgamal::EncryptedPoly,
+    accum_out: &crate::crypto::elgamal::EncryptedPoly,
+    beta_accum_mul: Scalar,
+    gamma_accum_mul: Scalar,
+    accum_mul_a1: &CompressedRistretto,
+    accum_mul_a2: &CompressedRistretto,
+    accum_mul_a_m: &CompressedRistretto,
 ) -> Scalar {
     let mut t = combined_transcript(
         pk,
@@ -308,13 +335,18 @@ fn combined_prover_challenge(
         beta_pd,
         gamma_pd,
         partial_a,
-        poly_in,
-        poly_out,
-        beta_poly,
-        gamma_poly,
-        poly_a1,
-        poly_a2,
-        poly_a_m,
+        accum_partial_in_ct,
+        accum_partial_out_ct,
+        beta_accum_pd,
+        gamma_accum_pd,
+        accum_partial_a,
+        accum_in,
+        accum_out,
+        beta_accum_mul,
+        gamma_accum_mul,
+        accum_mul_a1,
+        accum_mul_a2,
+        accum_mul_a_m,
     );
     challenge_scalar(&mut t)
 }
@@ -337,14 +369,19 @@ fn combined_challenge(
     beta_pd: Scalar,
     gamma_pd: Scalar,
     partial_a: &CompressedRistretto,
-    poly_in: &crate::crypto::elgamal::EncryptedPoly,
-    poly_out: &crate::crypto::elgamal::EncryptedPoly,
-    beta_poly: Scalar,
-    gamma_poly: Scalar,
-    poly_a1: &CompressedRistretto,
-    poly_a2: &CompressedRistretto,
-    poly_a_m: &CompressedRistretto,
-) -> (Scalar, Scalar, Scalar, Scalar) {
+    accum_partial_in_ct: &Ciphertext,
+    accum_partial_out_ct: &Ciphertext,
+    beta_accum_pd: Scalar,
+    gamma_accum_pd: Scalar,
+    accum_partial_a: &CompressedRistretto,
+    accum_in: &crate::crypto::elgamal::EncryptedPoly,
+    accum_out: &crate::crypto::elgamal::EncryptedPoly,
+    beta_accum_mul: Scalar,
+    gamma_accum_mul: Scalar,
+    accum_mul_a1: &CompressedRistretto,
+    accum_mul_a2: &CompressedRistretto,
+    accum_mul_a_m: &CompressedRistretto,
+) -> (Scalar, Scalar, Scalar, Scalar, Scalar) {
     let mut t = combined_transcript(
         pk,
         coeff_cts,
@@ -362,19 +399,25 @@ fn combined_challenge(
         beta_pd,
         gamma_pd,
         partial_a,
-        poly_in,
-        poly_out,
-        beta_poly,
-        gamma_poly,
-        poly_a1,
-        poly_a2,
-        poly_a_m,
+        accum_partial_in_ct,
+        accum_partial_out_ct,
+        beta_accum_pd,
+        gamma_accum_pd,
+        accum_partial_a,
+        accum_in,
+        accum_out,
+        beta_accum_mul,
+        gamma_accum_mul,
+        accum_mul_a1,
+        accum_mul_a2,
+        accum_mul_a_m,
     );
     let challenge = challenge_scalar(&mut t);
     let rho_glue = batch_scalar(&mut t, b"rho_glue");
     let rho_partial = batch_scalar(&mut t, b"rho_partial");
-    let rho_poly = batch_scalar(&mut t, b"rho_poly");
-    (challenge, rho_glue, rho_partial, rho_poly)
+    let rho_accum_partial = batch_scalar(&mut t, b"rho_accum_partial");
+    let rho_accum_mul = batch_scalar(&mut t, b"rho_accum_mul");
+    (challenge, rho_glue, rho_partial, rho_accum_partial, rho_accum_mul)
 }
 
 fn relation_scalars(
@@ -516,7 +559,7 @@ pub fn prove(
 }
 
 /// Prove the full monitor round with one shared Fiat-Shamir challenge across
-/// Sigma-Bullet glue, partial decryption, and polynomial division.
+/// Sigma-Bullet glue, two partial-decrypt relations, and `accum` scalar multiplication.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_round<R: CryptoRng + RngCore>(
     rng: &mut R,
@@ -528,13 +571,15 @@ pub fn prove_round<R: CryptoRng + RngCore>(
     coeff_cts: &[Ciphertext],
     c_star: &Ciphertext,
     partial_out_ct: &Ciphertext,
-    poly_in: &crate::crypto::elgamal::EncryptedPoly,
-    poly_out: &crate::crypto::elgamal::EncryptedPoly,
+    accum_c_star: &Ciphertext,
+    accum_partial_out_ct: &Ciphertext,
+    accum_in: &crate::crypto::elgamal::EncryptedPoly,
+    accum_out: &crate::crypto::elgamal::EncryptedPoly,
     alpha: Scalar,
     r: Scalar,
     r_prime: Scalar,
+    accum_r_prime: Scalar,
     sk2: &Scalar,
-    delta_vec: &[Scalar],
 ) -> Result<CombinedSigmaProof, R1CSError> {
     assert!(!coeff_cts.is_empty(), "coeff_cts must not be empty");
 
@@ -588,29 +633,38 @@ pub fn prove_round<R: CryptoRng + RngCore>(
     )
     .compress();
 
-    let (x_c1, x_c2, _y_c1, _y_c2, alphas) =
-        sigma::poly_div_relation_points(poly_in, poly_out, &alpha_tag_pt);
-    let delta_star: Scalar = alphas
-        .iter()
-        .zip(delta_vec.iter())
-        .map(|(alpha_i, delta)| alpha_i * delta)
-        .sum();
-    let k_poly_y = Scalar::random(rng);
-    let k_poly_delta = Scalar::random(rng);
-    let poly_a1 = (k_poly_y * x_c1 + mul_g(&k_poly_delta)).compress();
-    let poly_a2 = (k_poly_y * x_c2 + k_poly_delta * pk.0).compress();
-    let poly_a_m = mul_g(&k_poly_y).compress();
-    let poly_temp = PolyDivProof {
-        a1: poly_a1,
-        a2: poly_a2,
+    let (beta_accum_pd, gamma_accum_pd) =
+        sigma::partial_decrypt_relation_scalars(pk2, pk1, accum_c_star, accum_partial_out_ct);
+    let k_accum_sk2 = Scalar::random(rng);
+    let k_accum_r_prime = Scalar::random(rng);
+    let accum_beta_g = mul_g(&beta_accum_pd);
+    let accum_partial_a = (
+        mul_g(&k_accum_sk2)
+        - k_accum_sk2 * (gamma_accum_pd * accum_c_star.c1)
+        + k_accum_r_prime * (gamma_accum_pd * (pk1.0 + accum_beta_g))
+    )
+    .compress();
+
+    let (accum_x_c1, accum_x_c2, _accum_y_c1, _accum_y_c2, _) =
+        sigma::poly_scalar_mul_relation_points(accum_in, accum_out, &alpha_tag_pt);
+    let k_accum_mul_y = Scalar::random(rng);
+    let accum_mul_a1 = (k_accum_mul_y * accum_x_c1).compress();
+    let accum_mul_a2 = (k_accum_mul_y * accum_x_c2).compress();
+    let accum_mul_a_m = mul_g(&k_accum_mul_y).compress();
+    let accum_mul_temp = PolyScalarMulProof {
+        a1: accum_mul_a1,
+        a2: accum_mul_a2,
         alpha_tag,
-        a_m: poly_a_m,
+        a_m: accum_mul_a_m,
         s_y: Scalar::zero(),
-        s_delta: Scalar::zero(),
     };
-    let (beta_poly, gamma_poly) =
-        sigma::poly_div_batch_scalars(&poly_temp, poly_in, poly_out, &alpha_tag_pt)
-            .map_err(|_| R1CSError::FormatError)?;
+    let (beta_accum_mul, gamma_accum_mul) = sigma::poly_scalar_mul_batch_scalars(
+        &accum_mul_temp,
+        accum_in,
+        accum_out,
+        &alpha_tag_pt,
+    )
+    .map_err(|_| R1CSError::FormatError)?;
 
     let shared_chal = combined_prover_challenge(
         pk,
@@ -629,13 +683,18 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         beta_pd,
         gamma_pd,
         &partial_a,
-        poly_in,
-        poly_out,
-        beta_poly,
-        gamma_poly,
-        &poly_a1,
-        &poly_a2,
-        &poly_a_m,
+        accum_c_star,
+        accum_partial_out_ct,
+        beta_accum_pd,
+        gamma_accum_pd,
+        &accum_partial_a,
+        accum_in,
+        accum_out,
+        beta_accum_mul,
+        gamma_accum_mul,
+        &accum_mul_a1,
+        &accum_mul_a2,
+        &accum_mul_a_m,
     );
 
     Ok(CombinedSigmaProof {
@@ -652,11 +711,13 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         partial_a,
         partial_z1: k_sk2 + shared_chal * sk2,
         partial_z2: k_r_prime + shared_chal * r_prime,
-        poly_a1,
-        poly_a2,
-        poly_a_m,
-        poly_s_y: k_poly_y + shared_chal * alpha,
-        poly_s_delta: k_poly_delta + shared_chal * delta_star,
+        accum_partial_a,
+        accum_partial_z1: k_accum_sk2 + shared_chal * sk2,
+        accum_partial_z2: k_accum_r_prime + shared_chal * accum_r_prime,
+        accum_mul_a1,
+        accum_mul_a2,
+        accum_mul_a_m,
+        accum_mul_s_y: k_accum_mul_y + shared_chal * alpha,
     })
 }
 
@@ -749,8 +810,10 @@ pub fn verify_round(
     coeff_cts: &[Ciphertext],
     c_star: &Ciphertext,
     partial_out_ct: &Ciphertext,
-    poly_in: &crate::crypto::elgamal::EncryptedPoly,
-    poly_out: &crate::crypto::elgamal::EncryptedPoly,
+    accum_c_star: &Ciphertext,
+    accum_partial_out_ct: &Ciphertext,
+    accum_in: &crate::crypto::elgamal::EncryptedPoly,
+    accum_out: &crate::crypto::elgamal::EncryptedPoly,
     proof: &CombinedSigmaProof,
 ) -> Result<(), String> {
     if proof.chain_proof.e_comms.len() != coeff_cts.len() {
@@ -775,18 +838,22 @@ pub fn verify_round(
         .partial_a
         .decompress()
         .ok_or_else(|| "invalid partial A point".to_string())?;
-    let poly_a1 = proof
-        .poly_a1
+    let accum_partial_a = proof
+        .accum_partial_a
         .decompress()
-        .ok_or_else(|| "invalid poly A1 point".to_string())?;
-    let poly_a2 = proof
-        .poly_a2
+        .ok_or_else(|| "invalid accum partial A point".to_string())?;
+    let accum_mul_a1 = proof
+        .accum_mul_a1
         .decompress()
-        .ok_or_else(|| "invalid poly A2 point".to_string())?;
-    let poly_a_m = proof
-        .poly_a_m
+        .ok_or_else(|| "invalid accum mul A1 point".to_string())?;
+    let accum_mul_a2 = proof
+        .accum_mul_a2
         .decompress()
-        .ok_or_else(|| "invalid poly A_m point".to_string())?;
+        .ok_or_else(|| "invalid accum mul A2 point".to_string())?;
+    let accum_mul_a_m = proof
+        .accum_mul_a_m
+        .decompress()
+        .ok_or_else(|| "invalid accum mul A_m point".to_string())?;
 
     let (beta_y, beta_c1, beta_c2) = relation_scalars(&proof.chain_proof, pk, coeff_cts, c_star);
     let y_comm_pt = proof
@@ -798,20 +865,27 @@ pub fn verify_round(
         sigma::partial_decrypt_relation_scalars(pk2, pk1, c_star, partial_out_ct);
     let delta_c1 = partial_out_ct.c1 - c_star.c1;
     let delta_c2 = partial_out_ct.c2 - c_star.c2;
-    let (x_c1, x_c2, y_c1, y_c2, _) =
-        sigma::poly_div_relation_points(poly_in, poly_out, &alpha_tag);
-    let poly_temp = PolyDivProof {
-        a1: proof.poly_a1,
-        a2: proof.poly_a2,
+    let (beta_accum_pd, gamma_accum_pd) =
+        sigma::partial_decrypt_relation_scalars(pk2, pk1, accum_c_star, accum_partial_out_ct);
+    let accum_delta_c1 = accum_partial_out_ct.c1 - accum_c_star.c1;
+    let accum_delta_c2 = accum_partial_out_ct.c2 - accum_c_star.c2;
+    let (accum_mul_x_c1, accum_mul_x_c2, accum_mul_y_c1, accum_mul_y_c2, _) =
+        sigma::poly_scalar_mul_relation_points(accum_in, accum_out, &alpha_tag);
+    let accum_mul_temp = PolyScalarMulProof {
+        a1: proof.accum_mul_a1,
+        a2: proof.accum_mul_a2,
         alpha_tag: proof.alpha_tag,
-        a_m: proof.poly_a_m,
-        s_y: proof.poly_s_y,
-        s_delta: proof.poly_s_delta,
+        a_m: proof.accum_mul_a_m,
+        s_y: proof.accum_mul_s_y,
     };
-    let (beta_poly, gamma_poly) =
-        sigma::poly_div_batch_scalars(&poly_temp, poly_in, poly_out, &alpha_tag)
-            .map_err(str::to_string)?;
-    let (chal, rho_glue, rho_partial, rho_poly) = combined_challenge(
+    let (beta_accum_mul, gamma_accum_mul) = sigma::poly_scalar_mul_batch_scalars(
+        &accum_mul_temp,
+        accum_in,
+        accum_out,
+        &alpha_tag,
+    )
+    .map_err(str::to_string)?;
+    let (chal, rho_glue, rho_partial, rho_accum_partial, rho_accum_mul) = combined_challenge(
         pk,
         coeff_cts,
         c_star,
@@ -828,13 +902,18 @@ pub fn verify_round(
         beta_pd,
         gamma_pd,
         &proof.partial_a,
-        poly_in,
-        poly_out,
-        beta_poly,
-        gamma_poly,
-        &proof.poly_a1,
-        &proof.poly_a2,
-        &proof.poly_a_m,
+        accum_c_star,
+        accum_partial_out_ct,
+        beta_accum_pd,
+        gamma_accum_pd,
+        &proof.accum_partial_a,
+        accum_in,
+        accum_out,
+        beta_accum_mul,
+        gamma_accum_mul,
+        &proof.accum_mul_a1,
+        &proof.accum_mul_a2,
+        &proof.accum_mul_a_m,
     );
 
     let mut scalars = Vec::new();
@@ -880,25 +959,38 @@ pub fn verify_round(
     scalars.push(-rho_partial * chal * gamma_pd * beta_pd);
     points.push(delta_c1);
 
-    scalars.push(rho_poly * proof.poly_s_y);
-    points.push(x_c1);
-    scalars.push(rho_poly * beta_poly * proof.poly_s_y);
-    points.push(x_c2);
-    scalars.push(rho_poly * (gamma_poly * proof.poly_s_y + proof.poly_s_delta));
+    scalars.push(rho_accum_partial * (proof.accum_partial_z1 + proof.accum_partial_z2 * gamma_accum_pd * beta_accum_pd));
     points.push(G);
-    scalars.push(rho_poly * beta_poly * proof.poly_s_delta);
-    points.push(pk.0);
-    scalars.push(-rho_poly);
-    points.push(poly_a1);
-    scalars.push(-rho_poly * beta_poly);
-    points.push(poly_a2);
-    scalars.push(-rho_poly * gamma_poly);
-    points.push(poly_a_m);
-    scalars.push(-rho_poly * chal);
-    points.push(y_c1);
-    scalars.push(-rho_poly * chal * beta_poly);
-    points.push(y_c2);
-    scalars.push(-rho_poly * chal * gamma_poly);
+    scalars.push(rho_accum_partial * proof.accum_partial_z2 * gamma_accum_pd);
+    points.push(pk1.0);
+    scalars.push(-rho_accum_partial * proof.accum_partial_z1 * gamma_accum_pd);
+    points.push(accum_c_star.c1);
+    scalars.push(-rho_accum_partial);
+    points.push(accum_partial_a);
+    scalars.push(-rho_accum_partial * chal);
+    points.push(pk2.0);
+    scalars.push(-rho_accum_partial * chal * gamma_accum_pd);
+    points.push(accum_delta_c2);
+    scalars.push(-rho_accum_partial * chal * gamma_accum_pd * beta_accum_pd);
+    points.push(accum_delta_c1);
+
+    scalars.push(rho_accum_mul * proof.accum_mul_s_y);
+    points.push(accum_mul_x_c1);
+    scalars.push(rho_accum_mul * beta_accum_mul * proof.accum_mul_s_y);
+    points.push(accum_mul_x_c2);
+    scalars.push(rho_accum_mul * gamma_accum_mul * proof.accum_mul_s_y);
+    points.push(G);
+    scalars.push(-rho_accum_mul);
+    points.push(accum_mul_a1);
+    scalars.push(-rho_accum_mul * beta_accum_mul);
+    points.push(accum_mul_a2);
+    scalars.push(-rho_accum_mul * gamma_accum_mul);
+    points.push(accum_mul_a_m);
+    scalars.push(-rho_accum_mul * chal);
+    points.push(accum_mul_y_c1);
+    scalars.push(-rho_accum_mul * chal * beta_accum_mul);
+    points.push(accum_mul_y_c2);
+    scalars.push(-rho_accum_mul * chal * gamma_accum_mul);
     points.push(alpha_tag);
 
     let check = RistrettoPoint::vartime_multiscalar_mul(

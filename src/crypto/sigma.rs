@@ -56,7 +56,7 @@ use merlin::Transcript;
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::elgamal::{Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare};
+use crate::crypto::elgamal::{Ciphertext, EncryptedPoly, PublicKeyShare};
 
 // ── Proof type ────────────────────────────────────────────────────────────────
 
@@ -265,85 +265,24 @@ pub fn verify(
     Ok(())
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// PolyDivProof — correct homomorphic polynomial division
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// The monitor proves that `out_poly` was produced from `in_poly` by the
-// homomorphic synthetic division `TPolyCtext THDiv[pk] (X − m)` using the
-// same secret element `m = MElmt`.
-//
-// # Structure of the division
-//
-// `div_poly_linear` (degree-n input → degree-(n−1) output) computes:
-//
-// ```text
-//   b[n−1] = a[n]                            (leading term: exact copy)
-//   b[d]   = a[d+1] + m · b[d+1]   d = n−2…0  (n−1 scalar-multiplication steps)
-// ```
-//
-// Each step gives the relation  `b[d] − a[d+1] = m · b[d+1]`,  applied
-// component-wise to the two Ristretto-point halves of each ElGamal ciphertext.
-//
-// # Batched single-witness DLEQ
-//
-// All n−1 steps share the same scalar witness `m`.  The proof batches them:
-//
-// 1.  The statement transcript squeezes n−1 random weights `α[0], …, α[n−2]`.
-// 2.  Define (using component index j ∈ {c1, c2}):
-//
-//       X_j = Σ_d  α[d] · b[d+1].cj
-//       Y_j = Σ_d  α[d] · (b[d].cj − a[d+1].cj)
-//
-// 3.  Prove knowledge of `m` satisfying:
-//
-//       Y_c1 = m · X_c1   and   Y_c2 = m · X_c2
-//
-//     with one nonce `r` shared across both components.
-//
-// **Commit**: `A1 = r · X_c1`,  `A2 = r · X_c2`
-// **Challenge**: `e = H(statement, A1, A2)`
-// **Response**: `z = r + e · m`
-//
-// **Verify**:
-//   `z · X_c1  ==  A1 + e · Y_c1`
-//   `z · X_c2  ==  A2 + e · Y_c2`
-//
-// Proof size: 2 compressed Ristretto points + 1 scalar = 96 bytes (constant).
-
-/// Non-interactive proof that `out_poly` was produced from `in_poly` by the
-/// homomorphic polynomial division `in_poly THDiv[pk] (X − m)` for some
-/// secret `m`, i.e. each step `b[d] = a[d+1] + m·b[d+1]` used the same `m`.
-///
-/// The leading-term identity `b[n−1] = a[n]` is verified without a proof
-/// (it is publicly checkable from the wire ciphertexts).
+/// Non-interactive proof that `out_poly` was produced from `in_poly` by
+/// multiplying every coefficient ciphertext by the same secret scalar `y`,
+/// i.e. `out_poly[d] = y · in_poly[d]` for all `d`, with `alpha_tag = y·G`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PolyDivProof {
-    /// Batched round-1 commitment for c1:
-    /// `A1 = k_y·X_c1 + k_δ·G`.
+pub struct PolyScalarMulProof {
     pub a1: CompressedRistretto,
-    /// Batched round-1 commitment for c2:
-    /// `A2 = k_y·X_c2 + k_δ·pk`.
     pub a2: CompressedRistretto,
-    /// Public tag for the shared monitor input: `alpha_tag = m · G`.
     pub alpha_tag: CompressedRistretto,
-    /// Round-1 commitment for monitor-input linkage: `A_m = k_y·G`.
     pub a_m: CompressedRistretto,
-    /// Response `s_y = k_y + c·y`.
     pub s_y: Scalar,
-    /// Batched response `s_δ = k_δ + c·δ*`, where `δ* = Σ α_d·δ_d`.
-    pub s_delta: Scalar,
 }
 
-// ── Poly-div transcript helpers ───────────────────────────────────────────────
-
-/// Domain-separated transcript for the polynomial-division sigma proof.
-fn poly_div_transcript(
+fn poly_scalar_mul_transcript(
     in_poly: &EncryptedPoly,
     out_poly: &EncryptedPoly,
     alpha_tag: &RistrettoPoint,
 ) -> Transcript {
-    let mut t = Transcript::new(b"I-PSI-CA::poly_div_sigma_v1");
+    let mut t = Transcript::new(b"I-PSI-CA::poly_scalar_mul_sigma_v1");
     append_point(&mut t, b"alpha_tag", alpha_tag);
     for ct in &in_poly.0 {
         append_point(&mut t, b"in_c1", &ct.c1);
@@ -356,8 +295,8 @@ fn poly_div_transcript(
     t
 }
 
-pub(crate) fn poly_div_batch_scalars(
-    proof: &PolyDivProof,
+pub(crate) fn poly_scalar_mul_batch_scalars(
+    proof: &PolyScalarMulProof,
     in_poly: &EncryptedPoly,
     out_poly: &EncryptedPoly,
     alpha_tag: &RistrettoPoint,
@@ -366,12 +305,12 @@ pub(crate) fn poly_div_batch_scalars(
     proof.a2.decompress().ok_or("A2 is not a valid Ristretto point")?;
     proof.a_m.decompress().ok_or("A_m is not a valid Ristretto point")?;
 
-    let mut t = poly_div_transcript(in_poly, out_poly, alpha_tag);
+    let mut t = poly_scalar_mul_transcript(in_poly, out_poly, alpha_tag);
     append_compressed(&mut t, b"A1", &proof.a1);
     append_compressed(&mut t, b"A2", &proof.a2);
     append_compressed(&mut t, b"A_m", &proof.a_m);
-    let beta = batch_scalar_labeled(&mut t, b"poly_div_batch_1");
-    let gamma = batch_scalar_labeled(&mut t, b"poly_div_batch_2");
+    let beta = batch_scalar_labeled(&mut t, b"poly_scalar_mul_batch_1");
+    let gamma = batch_scalar_labeled(&mut t, b"poly_scalar_mul_batch_2");
     Ok((beta, gamma))
 }
 
@@ -382,164 +321,73 @@ fn squeeze_weight(t: &mut Transcript) -> Scalar {
     Scalar::from_bytes_mod_order_wide(&buf)
 }
 
-pub(crate) fn poly_div_relation_points(
+pub(crate) fn poly_scalar_mul_relation_points(
     in_poly: &EncryptedPoly,
     out_poly: &EncryptedPoly,
     alpha_tag: &RistrettoPoint,
 ) -> (RistrettoPoint, RistrettoPoint, RistrettoPoint, RistrettoPoint, Vec<Scalar>) {
-    let n = out_poly.0.len();
-    let mut t = poly_div_transcript(in_poly, out_poly, alpha_tag);
+    let n = in_poly.0.len();
+    let mut t = poly_scalar_mul_transcript(in_poly, out_poly, alpha_tag);
     let alphas: Vec<Scalar> = (0..n).map(|_| squeeze_weight(&mut t)).collect();
 
-    let x_c1_points: Vec<RistrettoPoint> = (0..n)
-        .map(|d| {
-            if d + 1 < n {
-                out_poly.0[d + 1].c1
-            } else {
-                RistrettoPoint::identity()
-            }
-        })
-        .collect();
-    let x_c2_points: Vec<RistrettoPoint> = (0..n)
-        .map(|d| {
-            if d + 1 < n {
-                out_poly.0[d + 1].c2
-            } else {
-                RistrettoPoint::identity()
-            }
-        })
-        .collect();
-    let y_c1_points: Vec<RistrettoPoint> = (0..n)
-        .map(|d| out_poly.0[d].c1 - in_poly.0[d + 1].c1)
-        .collect();
-    let y_c2_points: Vec<RistrettoPoint> = (0..n)
-        .map(|d| out_poly.0[d].c2 - in_poly.0[d + 1].c2)
-        .collect();
-
-    let x_c1 = RistrettoPoint::multiscalar_mul(alphas.iter().copied(), x_c1_points.iter().copied());
-    let x_c2 = RistrettoPoint::multiscalar_mul(alphas.iter().copied(), x_c2_points.iter().copied());
-    let y_c1 = RistrettoPoint::multiscalar_mul(alphas.iter().copied(), y_c1_points.iter().copied());
-    let y_c2 = RistrettoPoint::multiscalar_mul(alphas.iter().copied(), y_c2_points.iter().copied());
+    // Pass iterators directly to multiscalar_mul — avoids four intermediate
+    // Vec<RistrettoPoint> heap allocations.
+    let x_c1 = RistrettoPoint::multiscalar_mul(alphas.iter().copied(), in_poly.0.iter().map(|ct| ct.c1));
+    let x_c2 = RistrettoPoint::multiscalar_mul(alphas.iter().copied(), in_poly.0.iter().map(|ct| ct.c2));
+    let y_c1 = RistrettoPoint::multiscalar_mul(alphas.iter().copied(), out_poly.0.iter().map(|ct| ct.c1));
+    let y_c2 = RistrettoPoint::multiscalar_mul(alphas.iter().copied(), out_poly.0.iter().map(|ct| ct.c2));
 
     (x_c1, x_c2, y_c1, y_c2, alphas)
 }
 
-fn rerandom_relation_points(
-    in_poly: &EncryptedPoly,
-    out_poly: &EncryptedPoly,
-    alphas: &[Scalar],
-) -> (RistrettoPoint, RistrettoPoint) {
-    let x1_points: Vec<RistrettoPoint> = in_poly
-        .0
-        .iter()
-        .zip(out_poly.0.iter())
-        .map(|(i, o)| o.c1 - i.c1)
-        .collect();
-    let x2_points: Vec<RistrettoPoint> = in_poly
-        .0
-        .iter()
-        .zip(out_poly.0.iter())
-        .map(|(i, o)| o.c2 - i.c2)
-        .collect();
-
-    let x1 = RistrettoPoint::multiscalar_mul(alphas.iter().copied(), x1_points.iter().copied());
-    let x2 = RistrettoPoint::multiscalar_mul(alphas.iter().copied(), x2_points.iter().copied());
-    (x1, x2)
-}
-
-// ── prove_poly_div ────────────────────────────────────────────────────────────
-
-/// Prove that `out_poly = in_poly THDiv[pk] (X − m)` for secret `m`.
-///
-/// # Arguments
-///
-/// * `rng`      – cryptographically secure RNG
-/// * `m`        – the monitor's secret element (witness)
-/// * `in_poly`  – the current encrypted polynomial (input to division)
-/// * `out_poly` – the output of `div_poly_linear(in_poly, m)`
-pub fn prove_poly_div<R: CryptoRng + RngCore>(
+pub fn prove_poly_scalar_mul<R: CryptoRng + RngCore>(
     rng: &mut R,
     y: &Scalar,
-    pk: &PublicKey,
     in_poly: &EncryptedPoly,
     out_poly: &EncryptedPoly,
-    delta_vec: &[Scalar],
     alpha_tag: &RistrettoPoint,
-) -> PolyDivProof {
-    let n = in_poly.0.len().saturating_sub(1);
-    if out_poly.0.len() != n || delta_vec.len() != n {
-        return PolyDivProof {
+) -> PolyScalarMulProof {
+    if in_poly.0.len() != out_poly.0.len() {
+        return PolyScalarMulProof {
             a1: RistrettoPoint::identity().compress(),
             a2: RistrettoPoint::identity().compress(),
             alpha_tag: alpha_tag.compress(),
             a_m: RistrettoPoint::identity().compress(),
             s_y: Scalar::zero(),
-            s_delta: Scalar::zero(),
         };
     }
 
-    if n == 0 {
-        return PolyDivProof {
-            a1: RistrettoPoint::identity().compress(),
-            a2: RistrettoPoint::identity().compress(),
-            alpha_tag: alpha_tag.compress(),
-            a_m: RistrettoPoint::identity().compress(),
-            s_y: Scalar::zero(),
-            s_delta: Scalar::zero(),
-        };
-    }
-
-    let mut t = poly_div_transcript(in_poly, out_poly, alpha_tag);
-    let (x_c1, x_c2, _y_c1, _y_c2, alphas) =
-        poly_div_relation_points(in_poly, out_poly, alpha_tag);
-    let delta_star: Scalar = alphas
-        .iter()
-        .zip(delta_vec.iter())
-        .map(|(alpha, delta)| alpha * delta)
-        .sum();
+    let mut t = poly_scalar_mul_transcript(in_poly, out_poly, alpha_tag);
+    let (x_c1, x_c2, _, _, _) = poly_scalar_mul_relation_points(in_poly, out_poly, alpha_tag);
     let k_y = Scalar::random(rng);
-    let k_delta = Scalar::random(rng);
-    let a1 = (k_y * x_c1 + mul_g(&k_delta)).compress();
-    let a2 = (k_y * x_c2 + k_delta * pk.0).compress();
+    let a1 = (k_y * x_c1).compress();
+    let a2 = (k_y * x_c2).compress();
     let a_m = mul_g(&k_y).compress();
 
     append_compressed(&mut t, b"A1", &a1);
     append_compressed(&mut t, b"A2", &a2);
     append_compressed(&mut t, b"A_m", &a_m);
-    let _beta = batch_scalar_labeled(&mut t, b"poly_div_batch_1");
-    let _gamma = batch_scalar_labeled(&mut t, b"poly_div_batch_2");
+    let _beta = batch_scalar_labeled(&mut t, b"poly_scalar_mul_batch_1");
+    let _gamma = batch_scalar_labeled(&mut t, b"poly_scalar_mul_batch_2");
     let e = challenge_scalar(&mut t);
 
-    PolyDivProof {
+    PolyScalarMulProof {
         a1,
         a2,
         alpha_tag: alpha_tag.compress(),
         a_m,
         s_y: k_y + e * y,
-        s_delta: k_delta + e * delta_star,
     }
 }
 
-// ── verify_poly_div ───────────────────────────────────────────────────────────
-
-/// Verify a [`PolyDivProof`].
-///
-/// # Arguments
-///
-/// * `proof`    – the proof to verify
-/// * `in_poly`  – the input encrypted polynomial
-/// * `out_poly` – the output polynomial returned by the monitor
-pub fn verify_poly_div(
-    proof: &PolyDivProof,
-    pk: &PublicKey,
+pub fn verify_poly_scalar_mul(
+    proof: &PolyScalarMulProof,
     in_poly: &EncryptedPoly,
     out_poly: &EncryptedPoly,
     expected_alpha_tag: &RistrettoPoint,
 ) -> Result<(), &'static str> {
-    let n = in_poly.0.len().checked_sub(1).ok_or("in_poly must have degree ≥ 1")?;
-
-    if out_poly.0.len() != n {
-        return Err("out_poly length does not match expected quotient degree");
+    if in_poly.0.len() != out_poly.0.len() {
+        return Err("poly scalar mul length mismatch");
     }
 
     let alpha_tag = proof
@@ -550,35 +398,26 @@ pub fn verify_poly_div(
         return Err("alpha_tag mismatch across proofs");
     }
 
-    // Rebuild statement transcript.
-    let mut t = poly_div_transcript(in_poly, out_poly, &alpha_tag);
-    let (x_c1, x_c2, y_c1, y_c2, _) =
-        poly_div_relation_points(in_poly, out_poly, &alpha_tag);
-
+    let mut t = poly_scalar_mul_transcript(in_poly, out_poly, &alpha_tag);
+    let (x_c1, x_c2, y_c1, y_c2, _) = poly_scalar_mul_relation_points(in_poly, out_poly, &alpha_tag);
     let a1 = proof.a1.decompress().ok_or("A1 is not a valid Ristretto point")?;
     let a2 = proof.a2.decompress().ok_or("A2 is not a valid Ristretto point")?;
     let a_m = proof.a_m.decompress().ok_or("A_m is not a valid Ristretto point")?;
 
-    // Recompute challenge.
     append_compressed(&mut t, b"A1", &proof.a1);
     append_compressed(&mut t, b"A2", &proof.a2);
     append_compressed(&mut t, b"A_m", &proof.a_m);
-    let beta = batch_scalar_labeled(&mut t, b"poly_div_batch_1");
-    let gamma = batch_scalar_labeled(&mut t, b"poly_div_batch_2");
+    let beta = batch_scalar_labeled(&mut t, b"poly_scalar_mul_batch_1");
+    let gamma = batch_scalar_labeled(&mut t, b"poly_scalar_mul_batch_2");
     let e = challenge_scalar(&mut t);
+
     let lhs = RistrettoPoint::vartime_multiscalar_mul(
-        [
-            proof.s_y,
-            beta * proof.s_y,
-            gamma * proof.s_y,
-            proof.s_delta,
-            beta * proof.s_delta,
-        ],
-        [x_c1, x_c2, G, G, pk.0],
+        [proof.s_y, beta * proof.s_y, gamma * proof.s_y],
+        [x_c1, x_c2, G],
     );
     let rhs = a1 + beta * a2 + gamma * a_m + e * (y_c1 + beta * y_c2 + gamma * alpha_tag);
     if lhs != rhs {
-        return Err("poly-div batched verifier check failed");
+        return Err("poly-scalar-mul batched verifier check failed");
     }
 
     Ok(())
@@ -590,7 +429,7 @@ pub fn verify_poly_div(
 mod tests {
     use super::*;
     use crate::crypto::elgamal::{
-        combine_public_keys, ct_scalar_mul, div_poly_linear, encrypt, encrypt_poly, eval_poly,
+        combine_public_keys, ct_scalar_mul, encrypt, encrypt_poly, eval_poly,
         generate_key_share, partial_decrypt_with_witness,
     };
     use rand::rngs::OsRng;
@@ -689,346 +528,6 @@ mod tests {
         assert!(
             verify(&proof, &pk2, &pk1, &in_ct2, &out_ct).is_err(),
             "proof must not verify against a different input ciphertext"
-        );
-    }
-
-    // ── PolyDivProof tests ────────────────────────────────────────────────────
-
-    /// Happy path: an honest poly-div proof over a degree-3 polynomial verifies.
-    #[test]
-    fn test_poly_div_valid() {
-        let mut rng = OsRng;
-        let (_sk1, _pk1, _sk2, _pk2, pk) = setup();
-
-        // P(X) = (X−2)(X−3)(X−5) — encrypt it.
-        let coeffs = [
-            -Scalar::from(30u64),                          // constant: −2·3·5
-             Scalar::from(31u64),                          // X:       2·3 + 2·5 + 3·5
-            -Scalar::from(10u64),                          // X²:      −(2+3+5)
-             Scalar::from(1u64),                           // X³
-        ];
-        let in_poly = encrypt_poly(&mut rng, &pk, &coeffs);
-        let m = Scalar::from(2u64);
-        let out_poly = div_poly_linear(&in_poly, &m);
-
-        let alpha_tag = mul_g(&m);
-        let delta_vec = vec![Scalar::zero(); out_poly.0.len()];
-        let proof = prove_poly_div(&mut rng, &m, &pk, &in_poly, &out_poly, &delta_vec, &alpha_tag);
-        verify_poly_div(&proof, &pk, &in_poly, &out_poly, &alpha_tag)
-            .expect("valid poly-div proof must verify");
-    }
-
-    /// A proof for one output polynomial must not verify against a different output.
-    #[test]
-    fn test_poly_div_wrong_output_rejected() {
-        let mut rng = OsRng;
-        let (_sk1, _pk1, _sk2, _pk2, pk) = setup();
-
-        let coeffs = [Scalar::from(6u64), -Scalar::from(5u64), Scalar::from(1u64)];
-        let in_poly   = encrypt_poly(&mut rng, &pk, &coeffs);
-        let m         = Scalar::from(2u64);
-        let out_poly  = div_poly_linear(&in_poly, &m);
-        // A different division (wrong m).
-        let out_wrong = div_poly_linear(&in_poly, &Scalar::from(3u64));
-
-        let alpha_tag = mul_g(&m);
-        let delta_vec = vec![Scalar::zero(); out_poly.0.len()];
-        let proof = prove_poly_div(&mut rng, &m, &pk, &in_poly, &out_poly, &delta_vec, &alpha_tag);
-        assert!(
-            verify_poly_div(&proof, &pk, &in_poly, &out_wrong, &alpha_tag).is_err(),
-            "proof must not verify against a different output poly"
-        );
-    }
-
-    /// A proof generated with one secret m must not verify if the witness is wrong.
-    #[test]
-    fn test_poly_div_wrong_witness_rejected() {
-        let mut rng = OsRng;
-        let (_sk1, _pk1, _sk2, _pk2, pk) = setup();
-
-        let coeffs  = [Scalar::from(6u64), -Scalar::from(5u64), Scalar::from(1u64)];
-        let in_poly = encrypt_poly(&mut rng, &pk, &coeffs);
-        let m       = Scalar::from(2u64);
-        let out_poly = div_poly_linear(&in_poly, &m);
-
-        // Prove with a *wrong* witness m' ≠ m.
-        let m_wrong = Scalar::from(7u64);
-        let alpha_tag = mul_g(&m);
-        let delta_vec = vec![Scalar::zero(); out_poly.0.len()];
-        let proof   = prove_poly_div(&mut rng, &m_wrong, &pk, &in_poly, &out_poly, &delta_vec, &alpha_tag);
-        assert!(
-            verify_poly_div(&proof, &pk, &in_poly, &out_poly, &alpha_tag).is_err(),
-            "proof with wrong witness must be rejected"
-        );
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// RerandomProof — correct re-randomization of an encrypted polynomial
-// ═══════════════════════════════════════════════════════════════════════════════
-//
-// The target proves that `out_poly` was produced from `in_poly` by honest
-// re-randomization under the joint public key `pk`:
-//
-//   out_poly[i] = in_poly[i] + r_i · (G, pk)   for all i,  some r_i ∈ 𝔽.
-//
-// Equivalently, for each i:
-//   Δc1_i = r_i · G     (c1 component)
-//   Δc2_i = r_i · pk    (c2 component)
-//
-// # Batched single-witness DLEQ
-//
-// Using Fiat-Shamir weights α_i derived from the transcript of all points:
-//
-//   X1 = Σ α_i · Δc1_i = (Σ α_i · r_i) · G  = r* · G
-//   X2 = Σ α_i · Δc2_i = (Σ α_i · r_i) · pk = r* · pk
-//
-// Prove knowledge of `r* = Σ α_i · r_i` satisfying  (X1, X2) = r* · (G, pk).
-//
-// **Commit**: `A1 = k · G`,  `A2 = k · pk`
-// **Challenge**: `e = H(statement, A1, A2)`
-// **Response**: `z = k + e · r*`
-//
-// **Verify**:
-//   `z · G  == A1 + e · X1`
-//   `z · pk == A2 + e · X2`
-//
-// Proof size: 2 compressed Ristretto points + 1 scalar = 96 bytes (constant).
-
-/// Non-interactive proof that `out_poly` was produced from `in_poly` by honest
-/// per-coefficient re-randomization under `pk`:
-/// `out_poly[i] = in_poly[i] + r_i · (G, pk)` for secret scalars `r_i`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RerandomProof {
-    /// Batched nonce commitment for c1: `A1 = k · G`.
-    pub a1: CompressedRistretto,
-    /// Batched nonce commitment for c2: `A2 = k · pk`.
-    pub a2: CompressedRistretto,
-    /// Response `z = k + e · r*`.
-    pub z: Scalar,
-}
-
-// ── Rerandom transcript helper ────────────────────────────────────────────────
-
-fn rerandom_transcript(pk: &PublicKey, in_poly: &EncryptedPoly, out_poly: &EncryptedPoly) -> Transcript {
-    let mut t = Transcript::new(b"I-PSI-CA::rerandom_poly_sigma_v1");
-    append_point(&mut t, b"pk", &pk.0);
-    for ct in &in_poly.0 {
-        append_point(&mut t, b"in_c1",  &ct.c1);
-        append_point(&mut t, b"in_c2",  &ct.c2);
-    }
-    for ct in &out_poly.0 {
-        append_point(&mut t, b"out_c1", &ct.c1);
-        append_point(&mut t, b"out_c2", &ct.c2);
-    }
-    t
-}
-
-// ── prove_rerandom ────────────────────────────────────────────────────────────
-
-/// Prove that `out_poly` is a valid re-randomization of `in_poly` under `pk`.
-///
-/// # Arguments
-///
-/// * `rng`     – cryptographically secure RNG
-/// * `pk`      – the joint public key used for re-randomization
-/// * `r_vec`   – re-randomization scalars returned by `rerandomize_poly_with_witness`;
-///               `r_vec[i]` is the scalar added for ciphertext i
-/// * `in_poly` – the polynomial before re-randomization
-/// * `out_poly` – the polynomial after re-randomization
-pub fn prove_rerandom<R: CryptoRng + RngCore>(
-    rng: &mut R,
-    pk: &PublicKey,
-    r_vec: &[Scalar],
-    in_poly: &EncryptedPoly,
-    out_poly: &EncryptedPoly,
-) -> RerandomProof {
-    debug_assert_eq!(r_vec.len(), in_poly.0.len());
-    debug_assert_eq!(in_poly.0.len(), out_poly.0.len());
-
-    // Build statement transcript and squeeze per-coefficient batch weights α_i.
-    let mut t = rerandom_transcript(pk, in_poly, out_poly);
-    let alphas: Vec<Scalar> = (0..r_vec.len()).map(|_| squeeze_weight(&mut t)).collect();
-
-    // Aggregate witness: r* = Σ α_i · r_i
-    let r_star: Scalar = alphas.iter().zip(r_vec.iter()).map(|(a, r)| a * r).sum();
-
-    // Commit: A1 = k·G,  A2 = k·pk
-    let k = Scalar::random(rng);
-    let a1 = mul_g(&k);
-    let a2 = k * pk.0;
-
-    // Challenge
-    append_point(&mut t, b"A1", &a1);
-    append_point(&mut t, b"A2", &a2);
-    let _beta = batch_scalar_labeled(&mut t, b"rerandom_batch");
-    let e = challenge_scalar(&mut t);
-
-    RerandomProof {
-        a1: a1.compress(),
-        a2: a2.compress(),
-        z: k + e * r_star,
-    }
-}
-
-// ── verify_rerandom ───────────────────────────────────────────────────────────
-
-/// Verify a [`RerandomProof`].
-///
-/// Returns `Ok(())` if both verification equations hold, or `Err` with a
-/// description of the failing check.
-///
-/// # Arguments
-///
-/// * `proof`    – the proof to verify
-/// * `pk`       – the joint public key used for re-randomization
-/// * `in_poly`  – the polynomial before re-randomization
-/// * `out_poly` – the polynomial claimed to be a re-randomization of `in_poly`
-pub fn verify_rerandom(
-    proof: &RerandomProof,
-    pk: &PublicKey,
-    in_poly: &EncryptedPoly,
-    out_poly: &EncryptedPoly,
-) -> Result<(), &'static str> {
-    if in_poly.0.len() != out_poly.0.len() {
-        return Err("re-random: polynomial length mismatch");
-    }
-
-    // Rebuild statement transcript and derive the same batch weights.
-    let mut t = rerandom_transcript(pk, in_poly, out_poly);
-    let alphas: Vec<Scalar> = (0..in_poly.0.len()).map(|_| squeeze_weight(&mut t)).collect();
-    let (x1, x2) = rerandom_relation_points(in_poly, out_poly, &alphas);
-
-    let a1 = proof.a1.decompress().ok_or("re-random A1 is not a valid Ristretto point")?;
-    let a2 = proof.a2.decompress().ok_or("re-random A2 is not a valid Ristretto point")?;
-
-    // Recompute challenge.
-    append_point(&mut t, b"A1", &a1);
-    append_point(&mut t, b"A2", &a2);
-    let beta = batch_scalar_labeled(&mut t, b"rerandom_batch");
-    let e = challenge_scalar(&mut t);
-
-    let z = proof.z;
-
-    let lhs = RistrettoPoint::vartime_multiscalar_mul([z, beta * z], [G, pk.0]);
-    let rhs = a1 + beta * a2 + e * (x1 + beta * x2);
-    if lhs != rhs {
-        return Err("re-random batched verifier check failed");
-    }
-
-    Ok(())
-}
-
-/// Verify the full polynomial transition seen by the monitor in one API:
-///
-/// 1. `next_poly` is a valid `THDiv(X - m)` output from `current_poly`
-///    using monitor-input tag `alpha_tag`.
-/// 2. `alt_poly` is a valid re-randomization of either:
-///    - `next_poly` (match branch), or
-///    - `current_poly` (no-match branch).
-///
-/// Returns `Ok(true)` for the match branch and `Ok(false)` for the no-match branch.
-pub fn verify_poly_transition(
-    poly_div_proof: &PolyDivProof,
-    rerandom_proof: &RerandomProof,
-    pk: &PublicKey,
-    current_poly: &EncryptedPoly,
-    next_poly: &EncryptedPoly,
-    alt_poly: &EncryptedPoly,
-    alpha_tag: &RistrettoPoint,
-) -> Result<bool, &'static str> {
-    verify_poly_div(poly_div_proof, pk, current_poly, next_poly, alpha_tag)?;
-
-    let is_match_branch = alt_poly.0.len() == next_poly.0.len();
-    let base_poly = if is_match_branch { next_poly } else { current_poly };
-    verify_rerandom(rerandom_proof, pk, base_poly, alt_poly)?;
-
-    Ok(is_match_branch)
-}
-
-// ── RerandomProof tests ───────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod rerandom_tests {
-    use super::*;
-    use crate::crypto::elgamal::{
-        combine_public_keys, encrypt_poly, generate_key_share, rerandomize_poly_with_witness,
-    };
-    use rand::rngs::OsRng;
-
-    fn setup_pk() -> PublicKey {
-        let mut rng = OsRng;
-        let (_sk1, pk1) = generate_key_share(&mut rng);
-        let (_sk2, pk2) = generate_key_share(&mut rng);
-        combine_public_keys(&pk1, &pk2)
-    }
-
-    /// Happy path: an honestly generated re-random proof verifies.
-    #[test]
-    fn test_rerandom_valid() {
-        let mut rng = OsRng;
-        let pk = setup_pk();
-
-        let coeffs = [Scalar::from(1u64), Scalar::from(2u64), Scalar::from(3u64)];
-        let in_poly = encrypt_poly(&mut rng, &pk, &coeffs);
-        let (out_poly, r_vec) = rerandomize_poly_with_witness(&mut rng, &pk, &in_poly);
-
-        let proof = prove_rerandom(&mut rng, &pk, &r_vec, &in_poly, &out_poly);
-        verify_rerandom(&proof, &pk, &in_poly, &out_poly)
-            .expect("valid re-random proof must verify");
-    }
-
-    /// A proof for one output must not verify against a differently re-randomized output.
-    #[test]
-    fn test_rerandom_wrong_output_rejected() {
-        let mut rng = OsRng;
-        let pk = setup_pk();
-
-        let coeffs = [Scalar::from(5u64), Scalar::from(6u64)];
-        let in_poly = encrypt_poly(&mut rng, &pk, &coeffs);
-        let (out_poly, r_vec) = rerandomize_poly_with_witness(&mut rng, &pk, &in_poly);
-        let (out_other, _)    = rerandomize_poly_with_witness(&mut rng, &pk, &in_poly);
-
-        let proof = prove_rerandom(&mut rng, &pk, &r_vec, &in_poly, &out_poly);
-        assert!(
-            verify_rerandom(&proof, &pk, &in_poly, &out_other).is_err(),
-            "proof must not verify against a different output polynomial"
-        );
-    }
-
-    /// A proof built with wrong witnesses (r_vec doesn't match out_poly) must fail.
-    #[test]
-    fn test_rerandom_wrong_witness_rejected() {
-        let mut rng = OsRng;
-        let pk = setup_pk();
-
-        let coeffs = [Scalar::from(7u64), Scalar::from(8u64), Scalar::from(9u64)];
-        let in_poly = encrypt_poly(&mut rng, &pk, &coeffs);
-        let (out_poly, _)       = rerandomize_poly_with_witness(&mut rng, &pk, &in_poly);
-        let (_out_other, r_bad) = rerandomize_poly_with_witness(&mut rng, &pk, &in_poly);
-
-        let proof = prove_rerandom(&mut rng, &pk, &r_bad, &in_poly, &out_poly);
-        assert!(
-            verify_rerandom(&proof, &pk, &in_poly, &out_poly).is_err(),
-            "proof with wrong witnesses must be rejected"
-        );
-    }
-
-    /// A proof under one key must not verify under a different key.
-    #[test]
-    fn test_rerandom_wrong_key_rejected() {
-        let mut rng = OsRng;
-        let pk      = setup_pk();
-        let pk_other = setup_pk();
-
-        let coeffs = [Scalar::from(3u64), Scalar::from(4u64)];
-        let in_poly = encrypt_poly(&mut rng, &pk, &coeffs);
-        let (out_poly, r_vec) = rerandomize_poly_with_witness(&mut rng, &pk, &in_poly);
-
-        let proof = prove_rerandom(&mut rng, &pk, &r_vec, &in_poly, &out_poly);
-        assert!(
-            verify_rerandom(&proof, &pk_other, &in_poly, &out_poly).is_err(),
-            "proof must not verify under a different public key"
         );
     }
 }
