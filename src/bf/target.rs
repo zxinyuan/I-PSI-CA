@@ -39,8 +39,8 @@ use serde::{Deserialize, Serialize};
 use crate::bf::bloom::BloomFilterConfig;
 use crate::bf::proof as bfproof;
 use crate::crypto::elgamal::{
-    combine_public_keys, encrypt_one, encrypt_poly, encrypt_zero, rerandomize_poly_with_witness, test_zero,
-    Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare, SecretKeyShare,
+    combine_public_keys, encrypt_one, encrypt_poly, encrypt_zero, rerandomize_poly_with_witness,
+    test_zero, Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare, SecretKeyShare,
 };
 
 // ── Wire types (shared with Monitor) ─────────────────────────────────────────
@@ -95,9 +95,7 @@ pub enum TargetToMonitor {
         accum: WireEncryptedPoly,
     },
     /// Next-round ciphertext (re-randomised; either updated or the same poly).
-    NextRound {
-        accum: WireEncryptedPoly,
-    },
+    NextRound { accum: WireEncryptedPoly },
     /// Monitor's proof was rejected; contains a debug reason string.
     Reject { reason: String },
 }
@@ -105,13 +103,14 @@ pub enum TargetToMonitor {
 /// Monitor → Target message (one per round).
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MonitorToTarget {
-    /// `nextAccum = y · Accum`.
-    pub next_accum: WireEncryptedPoly,
-    /// `accum_scaled_eval = accum_mask · THEval[pk](Accum, y)` — the
-    /// ciphertext fed into partial decryption for the accumulated polynomial.
-    pub accum_scaled_eval: WireCiphertext,
-    /// `accum_m_poly_ctext = THDec[sk2](accum_scaled_eval)`.
-    pub accum_m_poly_ctext: WireCiphertext,
+    /// `accumNext = y · Accum`.
+    pub accum_next: WireEncryptedPoly,
+    /// Masked accumulated evaluation `accum_mask · THEval[pk](Accum, y)`,
+    /// included so the target can verify the corresponding sigma proof.
+    pub accum_eval_masked: WireCiphertext,
+    /// Partially decrypted accumulated evaluation used for the target's
+    /// non-zero test before advancing state.
+    pub accum_eval_ctext: WireCiphertext,
     /// `scaled_eval = mask · Σ_j THEval[pk](TPolyCtext, j)` over the bloom
     /// positions derived from `y`, fed into partial decryption.
     pub scaled_eval: WireCiphertext,
@@ -200,10 +199,8 @@ impl Target {
         pk2: PublicKeyShare,
     ) -> Self {
         let pk = combine_public_keys(&pk1, &pk2);
-        // Choose BP generator capacity ≥ 2·(|B|+2) rounded up to a power of two.
-        let n = marked_positions.len() + 2;
-        let cap = 1usize << (usize::BITS - (2 * n).leading_zeros()) as usize;
-        let cap = cap.max(64);
+        let max_degree = marked_positions.len();
+        let cap = crate::bf::bp_capacity(max_degree, bf_config);
         Target {
             marked_positions,
             bf_config,
@@ -229,7 +226,8 @@ impl Target {
 
     /// Build the initial accumulated polynomial ciphertext:
     /// an encryption of the constant polynomial `1`, padded with encrypted `0`s
-    /// through the configured accumulated-polynomial degree.
+    /// through the configured accumulated-polynomial degree. This degree stays
+    /// fixed across outsourcing and every subsequent rerandomized update.
     fn build_accum_ctext(&self, rng: &mut OsRng) -> EncryptedPoly {
         let mut coeffs = Vec::with_capacity(self.accum_degree + 1);
         coeffs.push(encrypt_one(rng, &self.pk));
@@ -251,11 +249,11 @@ impl Target {
         current_accum: &EncryptedPoly,
         msg: &MonitorToTarget,
     ) -> Result<(EncryptedPoly, bool), String> {
-        let next_accum = msg.next_accum.to_native()?;
-        let _accum_scaled_eval = msg.accum_scaled_eval.to_native()?;
-        let accum_m_poly_ct = msg.accum_m_poly_ctext.to_native()?;
+        let next_accum = msg.accum_next.to_native()?;
+        let accum_eval_masked = msg.accum_eval_masked.to_native()?;
+        let accum_eval_ctext = msg.accum_eval_ctext.to_native()?;
         let scaled_eval = msg.scaled_eval.to_native()?;
-        let m_poly_ct   = msg.m_poly_ctext.to_native()?;
+        let m_poly_ct = msg.m_poly_ctext.to_native()?;
 
         if next_accum.0.len() != current_accum.0.len() {
             return Err("next_accum length mismatch".to_string());
@@ -271,8 +269,8 @@ impl Target {
             current,
             &scaled_eval,
             &m_poly_ct,
-            &_accum_scaled_eval,
-            &accum_m_poly_ct,
+            &accum_eval_masked,
+            &accum_eval_ctext,
             current_accum,
             &next_accum,
             &msg.round_proof,
@@ -282,7 +280,7 @@ impl Target {
         //      MPolyCtext was partially decrypted by the monitor (THDec[sk2]),
         //      so it lives in THCtextSpace[pk1].  test_zero finishes the job.
         let is_match = test_zero(&self.sk1, &m_poly_ct);
-        let accum_is_nonzero = !test_zero(&self.sk1, &accum_m_poly_ct);
+        let accum_is_nonzero = !test_zero(&self.sk1, &accum_eval_ctext);
         let should_advance = is_match && accum_is_nonzero;
 
         // T.3  Advance the accumulated polynomial only when the accum witness
@@ -319,10 +317,13 @@ impl Target {
         let t_outsource_start = std::time::Instant::now();
         let current = self.build_poly_ctext(&mut rng);
         let mut current_accum = self.build_accum_ctext(&mut rng);
-        send_msg(&mut s, &TargetToMonitor::Outsource {
-            t_poly_ct: WireEncryptedPoly::from_native(&current),
-            accum: WireEncryptedPoly::from_native(&current_accum),
-        })?;
+        send_msg(
+            &mut s,
+            &TargetToMonitor::Outsource {
+                t_poly_ct: WireEncryptedPoly::from_native(&current),
+                accum: WireEncryptedPoly::from_native(&current_accum),
+            },
+        )?;
         let outsource_ms = t_outsource_start.elapsed().as_secs_f64() * 1000.0;
         eprintln!("[Target] Outsource Time (compute -> send): {outsource_ms:.3} ms");
         eprintln!(
@@ -345,9 +346,12 @@ impl Target {
                 Ok((next_accum, matched)) => {
                     eprintln!("[Target] match={matched}  state={}", self.state);
                     current_accum = next_accum;
-                    send_msg(&mut s, &TargetToMonitor::NextRound {
-                        accum: WireEncryptedPoly::from_native(&current_accum),
-                    })?;
+                    send_msg(
+                        &mut s,
+                        &TargetToMonitor::NextRound {
+                            accum: WireEncryptedPoly::from_native(&current_accum),
+                        },
+                    )?;
                 }
                 Err(reason) => {
                     eprintln!("[Target] Reject: {reason}");
@@ -376,6 +380,17 @@ mod tests {
         }
     }
 
+    fn input_for_position(target_position: Scalar) -> Scalar {
+        let config = test_config();
+        for candidate in 1u64..10_000 {
+            let input = Scalar::from(candidate);
+            if crate::bf::bloom::scalar_positions(input, config) == vec![target_position] {
+                return input;
+            }
+        }
+        panic!("no scalar input found for target position {target_position:?}");
+    }
+
     /// Verify that `poly_from_roots` evaluates to zero at each root.
     #[test]
     fn test_poly_roots_eval_zero() {
@@ -399,20 +414,43 @@ mod tests {
         let (sk2, pk2) = generate_key_share(&mut rng);
 
         let t_set = vec![Scalar::from(7u64), Scalar::from(42u64)];
-        let mut target = Target::new(t_set.clone(), test_config(), 5, sk1, pk1.clone(), pk2.clone());
+        let mut target = Target::new(
+            t_set.clone(),
+            test_config(),
+            5,
+            sk1,
+            pk1.clone(),
+            pk2.clone(),
+        );
         let poly_ct = target.build_poly_ctext(&mut rng);
         let accum_ct = target.build_accum_ctext(&mut rng);
-        let monitor = Monitor::new(Scalar::from(7u64), test_config(), sk2, pk1, pk2, t_set.len());
+        let monitor = Monitor::new(
+            input_for_position(Scalar::from(7u64)),
+            test_config(),
+            sk2,
+            pk1,
+            pk2,
+            t_set.len(),
+        );
 
         let msg = monitor
-            .compute_round(&mut rng, &WireEncryptedPoly::from_native(&poly_ct), &WireEncryptedPoly::from_native(&accum_ct))
+            .compute_round(
+                &mut rng,
+                &WireEncryptedPoly::from_native(&poly_ct),
+                &WireEncryptedPoly::from_native(&accum_ct),
+            )
             .unwrap();
 
-        let (next_accum_out, matched) =
-            target.process_round(&mut rng, &poly_ct, &accum_ct, &msg).unwrap();
+        let (next_accum_out, matched) = target
+            .process_round(&mut rng, &poly_ct, &accum_ct, &msg)
+            .unwrap();
         assert!(matched, "7 should be detected as a match");
         assert_eq!(target.state, 1);
-        assert_eq!(next_accum_out.0.len(), accum_ct.0.len(), "accum length should stay constant");
+        assert_eq!(
+            next_accum_out.0.len(),
+            accum_ct.0.len(),
+            "accum length should stay constant"
+        );
     }
 
     /// Non-match round: state stays at 0.
@@ -423,18 +461,126 @@ mod tests {
         let (sk2, pk2) = generate_key_share(&mut rng);
 
         let t_set = vec![Scalar::from(7u64)];
-        let mut target = Target::new(t_set.clone(), test_config(), 5, sk1, pk1.clone(), pk2.clone());
+        let mut target = Target::new(
+            t_set.clone(),
+            test_config(),
+            5,
+            sk1,
+            pk1.clone(),
+            pk2.clone(),
+        );
         let poly_ct = target.build_poly_ctext(&mut rng);
         let accum_ct = target.build_accum_ctext(&mut rng);
-        let monitor = Monitor::new(Scalar::from(9u64), test_config(), sk2, pk1, pk2, t_set.len());
+        let monitor = Monitor::new(
+            Scalar::from(9u64),
+            test_config(),
+            sk2,
+            pk1,
+            pk2,
+            t_set.len(),
+        );
         let msg = monitor
-            .compute_round(&mut rng, &WireEncryptedPoly::from_native(&poly_ct), &WireEncryptedPoly::from_native(&accum_ct))
+            .compute_round(
+                &mut rng,
+                &WireEncryptedPoly::from_native(&poly_ct),
+                &WireEncryptedPoly::from_native(&accum_ct),
+            )
             .unwrap();
 
-        let (next_accum_out, matched) =
-            target.process_round(&mut rng, &poly_ct, &accum_ct, &msg).unwrap();
+        let (next_accum_out, matched) = target
+            .process_round(&mut rng, &poly_ct, &accum_ct, &msg)
+            .unwrap();
         assert!(!matched, "9 should not match");
         assert_eq!(target.state, 0);
-        assert_eq!(next_accum_out.0.len(), accum_ct.0.len(), "accum length should stay constant");
+        assert_eq!(
+            next_accum_out.0.len(),
+            accum_ct.0.len(),
+            "accum length should stay constant"
+        );
+    }
+
+    #[test]
+    fn test_build_accum_ctext_uses_fixed_degree() {
+        let mut rng = OsRng;
+        let (sk1, pk1) = generate_key_share(&mut rng);
+        let (_sk2, pk2) = generate_key_share(&mut rng);
+
+        let accum_degree = 5;
+        let target = Target::new(
+            vec![Scalar::from(7u64)],
+            test_config(),
+            accum_degree,
+            sk1,
+            pk1,
+            pk2,
+        );
+        let accum_ct = target.build_accum_ctext(&mut rng);
+
+        assert_eq!(
+            accum_ct.0.len(),
+            accum_degree + 1,
+            "outsourced accum polynomial should be padded to the configured fixed degree"
+        );
+    }
+
+    #[test]
+    fn test_process_round_rejects_tampered_accum_witness() {
+        let mut rng = OsRng;
+        let (sk1, pk1) = generate_key_share(&mut rng);
+        let (sk2, pk2) = generate_key_share(&mut rng);
+
+        let t_set = vec![Scalar::from(7u64), Scalar::from(42u64)];
+        let mut target = Target::new(
+            t_set.clone(),
+            test_config(),
+            5,
+            sk1,
+            pk1.clone(),
+            pk2.clone(),
+        );
+        let poly_ct = target.build_poly_ctext(&mut rng);
+        let accum_ct = target.build_accum_ctext(&mut rng);
+        let monitor = Monitor::new(
+            Scalar::from(7u64),
+            test_config(),
+            sk2,
+            pk1,
+            pk2,
+            t_set.len(),
+        );
+
+        let msg = monitor
+            .compute_round(
+                &mut rng,
+                &WireEncryptedPoly::from_native(&poly_ct),
+                &WireEncryptedPoly::from_native(&accum_ct),
+            )
+            .unwrap();
+
+        let mut tampered_next = msg;
+        tampered_next.accum_next = WireEncryptedPoly::from_native(&accum_ct);
+        assert!(
+            target
+                .process_round(&mut rng, &poly_ct, &accum_ct, &tampered_next)
+                .is_err(),
+            "tampering with accum_next should break the sigma proof binding to the hidden y"
+        );
+
+        let msg = monitor
+            .compute_round(
+                &mut rng,
+                &WireEncryptedPoly::from_native(&poly_ct),
+                &WireEncryptedPoly::from_native(&accum_ct),
+            )
+            .unwrap();
+        let mut tampered_eval = msg;
+        tampered_eval.accum_eval_masked =
+            WireCiphertext::from_native(&tampered_eval.m_poly_ctext.to_native().unwrap());
+        assert!(
+            target
+                .process_round(&mut rng, &poly_ct, &accum_ct, &tampered_eval)
+                .is_err(),
+            "tampering with accum_eval should break the sigma proof binding to the hidden y"
+        );
     }
 }

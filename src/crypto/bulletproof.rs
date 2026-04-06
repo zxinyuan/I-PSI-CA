@@ -130,11 +130,7 @@ pub fn prove(
             "witness violates chain constraint at d = {d}"
         );
     }
-    debug_assert_ne!(
-        e_scalars[n],
-        Scalar::zero(),
-        "e_n must be non-zero"
-    );
+    debug_assert_ne!(e_scalars[n], Scalar::zero(), "e_n must be non-zero");
 
     let mut rng = thread_rng();
     let mut transcript = Transcript::new(b"I-PSI-CA::eval_chain");

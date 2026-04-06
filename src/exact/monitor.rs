@@ -27,21 +27,18 @@ use std::io;
 use std::net::TcpStream;
 
 use bulletproofs::{BulletproofGens, PedersenGens};
-use curve25519_dalek_ng::{
-    constants::RISTRETTO_BASEPOINT_TABLE,
-    scalar::Scalar,
-};
+use curve25519_dalek_ng::{constants::RISTRETTO_BASEPOINT_TABLE, scalar::Scalar};
 use rand::rngs::OsRng;
 
 use crate::crypto::elgamal::{
-    combine_public_keys, ct_add, ct_scalar_mul, eval_poly, poly_scalar_mul,
-    partial_decrypt_with_witness, PublicKey, PublicKeyShare, SecretKeyShare,
+    combine_public_keys, ct_add, ct_scalar_mul, eval_poly, partial_decrypt_with_witness,
+    poly_scalar_mul, PublicKey, PublicKeyShare, SecretKeyShare,
 };
 use crate::crypto::sigma_bullet;
 // Re-use all wire types from target.rs.
 use crate::exact::target::{
-    recv_msg, send_msg, MonitorToTarget, TargetToMonitor, WireCiphertext, WireEncryptedPoly,
-    WireCombinedSigmaProof,
+    recv_msg, send_msg, MonitorToTarget, TargetToMonitor, WireCiphertext, WireCombinedSigmaProof,
+    WireEncryptedPoly,
 };
 
 // ── Monitor ───────────────────────────────────────────────────────────────────
@@ -146,10 +143,10 @@ impl Monitor {
         .map_err(|e| format!("round prove: {e:?}"))?;
 
         Ok(MonitorToTarget {
-            next_accum:   WireEncryptedPoly::from_native(&next_accum),
+            next_accum: WireEncryptedPoly::from_native(&next_accum),
             accum_scaled_eval: WireCiphertext::from_native(&accum_scaled),
             accum_m_poly_ctext: WireCiphertext::from_native(&accum_m_poly_ct),
-            scaled_eval:  WireCiphertext::from_native(&scaled),
+            scaled_eval: WireCiphertext::from_native(&scaled),
             m_poly_ctext: WireCiphertext::from_native(&m_poly_ct),
             round_proof: WireCombinedSigmaProof::from_proof(&round_proof),
         })
@@ -167,7 +164,8 @@ impl Monitor {
         // Receive the initial T-polynomial ciphertext from the target.
         let first: TargetToMonitor = recv_msg(&mut stream)?;
         let outsource_bytes = bincode::serialized_size(&first)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? + 4;
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+            + 4;
         let (current_poly_ct, mut current_accum_ct) = match first {
             TargetToMonitor::Outsource { t_poly_ct, accum } => (t_poly_ct, accum),
             other => {
@@ -196,7 +194,8 @@ impl Monitor {
 
             // Measure sent bytes (4-byte length prefix + payload).
             let sent_bytes = bincode::serialized_size(&msg)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? + 4;
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                + 4;
 
             let t_send = std::time::Instant::now();
             send_msg(&mut stream, &msg)?;
@@ -209,7 +208,8 @@ impl Monitor {
 
             // Measure received bytes (4-byte length prefix + payload).
             let recv_bytes = bincode::serialized_size(&reply)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))? + 4;
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                + 4;
 
             eprintln!("[Monitor] Latency (recv outsource/prev -> recv next): {latency_ms:.3} ms");
             eprintln!("[Monitor] Compute Time (recv outsource/prev -> send): {compute_ms:.3} ms");
@@ -278,7 +278,9 @@ fn non_zero_scalar(rng: &mut OsRng) -> Scalar {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::elgamal::{encrypt_one, encrypt_poly, encrypt_zero, generate_key_share, test_zero, EncryptedPoly};
+    use crate::crypto::elgamal::{
+        encrypt_one, encrypt_poly, encrypt_zero, generate_key_share, test_zero, EncryptedPoly,
+    };
     use crate::exact::target::{poly_from_roots, Target, WireEncryptedPoly};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -308,7 +310,9 @@ mod tests {
         let wire_accum = WireEncryptedPoly::from_native(&accum_ct);
 
         // Run the monitor's computation.
-        let msg = monitor.compute_round(&mut rng, &wire_poly, &wire_accum).unwrap();
+        let msg = monitor
+            .compute_round(&mut rng, &wire_poly, &wire_accum)
+            .unwrap();
 
         // Verify the MPolyCtext decrypts to zero under sk1.
         let m_poly_ct = msg.m_poly_ctext.to_native().unwrap();
@@ -340,7 +344,9 @@ mod tests {
         let wire_poly = WireEncryptedPoly::from_native(&poly_ct);
         let wire_accum = WireEncryptedPoly::from_native(&accum_ct);
 
-        let msg = monitor.compute_round(&mut rng, &wire_poly, &wire_accum).unwrap();
+        let msg = monitor
+            .compute_round(&mut rng, &wire_poly, &wire_accum)
+            .unwrap();
         let m_poly_ct = msg.m_poly_ctext.to_native().unwrap();
 
         assert!(
@@ -359,8 +365,14 @@ mod tests {
         let (sk2, pk2) = generate_key_share(&mut rng);
         let pk = combine_public_keys(&pk1, &pk2);
 
-        let mut target  = Target::new(t_set.clone(), 5, sk1, pk1.clone(), pk2.clone());
-        let monitor_hit = Monitor::new(Scalar::from(7u64),  sk2, pk1.clone(), pk2.clone(), t_set.len());
+        let mut target = Target::new(t_set.clone(), 5, sk1, pk1.clone(), pk2.clone());
+        let monitor_hit = Monitor::new(
+            Scalar::from(7u64),
+            sk2,
+            pk1.clone(),
+            pk2.clone(),
+            t_set.len(),
+        );
 
         let coeffs = poly_from_roots(&t_set);
         let poly_ct = encrypt_poly(&mut rng, &pk, &coeffs);
@@ -373,8 +385,12 @@ mod tests {
         let wire_accum = WireEncryptedPoly::from_native(&accum_ct);
 
         // Round 1: hit
-        let msg  = monitor_hit.compute_round(&mut rng, &wire_poly, &wire_accum).unwrap();
-        let (next_accum, matched) = target.process_round(&mut rng, &poly_ct, &accum_ct, &msg).unwrap();
+        let msg = monitor_hit
+            .compute_round(&mut rng, &wire_poly, &wire_accum)
+            .unwrap();
+        let (next_accum, matched) = target
+            .process_round(&mut rng, &poly_ct, &accum_ct, &msg)
+            .unwrap();
         assert!(matched);
         assert_eq!(target.state, 1);
         let _ = next_accum;

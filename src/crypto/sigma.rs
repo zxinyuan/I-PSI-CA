@@ -130,10 +130,10 @@ fn statement_transcript(
     out_ct: &Ciphertext,
 ) -> Transcript {
     let mut t = Transcript::new(b"I-PSI-CA::partial_decrypt_sigma_v1");
-    append_point(&mut t, b"pk2",    &pk2.0);
-    append_point(&mut t, b"pk1",    &pk1.0);
-    append_point(&mut t, b"c1_in",  &in_ct.c1);
-    append_point(&mut t, b"c2_in",  &in_ct.c2);
+    append_point(&mut t, b"pk2", &pk2.0);
+    append_point(&mut t, b"pk1", &pk1.0);
+    append_point(&mut t, b"c1_in", &in_ct.c1);
+    append_point(&mut t, b"c2_in", &in_ct.c2);
     append_point(&mut t, b"c1_out", &out_ct.c1);
     append_point(&mut t, b"c2_out", &out_ct.c2);
     t
@@ -232,7 +232,10 @@ pub fn verify(
     out_ct: &Ciphertext,
 ) -> Result<(), &'static str> {
     // Decompress nonce commitments.
-    let a = proof.a.decompress().ok_or("A is not a valid Ristretto point")?;
+    let a = proof
+        .a
+        .decompress()
+        .ok_or("A is not a valid Ristretto point")?;
 
     let (beta, gamma) = partial_decrypt_relation_scalars(pk2, pk1, in_ct, out_ct);
 
@@ -259,7 +262,9 @@ pub fn verify(
     let lhs = mul_g(&z1) - z1 * (gamma * in_ct.c1) + z2 * (gamma * (pk1.0 + beta_g));
     let rhs = a + e * (pk2.0 + gamma * (delta_c2 + beta * delta_c1));
     if lhs != rhs {
-        return Err("V failed: batched key-ownership + rerandomization + partial-decryption consistency");
+        return Err(
+            "V failed: batched key-ownership + rerandomization + partial-decryption consistency",
+        );
     }
 
     Ok(())
@@ -301,9 +306,18 @@ pub(crate) fn poly_scalar_mul_batch_scalars(
     out_poly: &EncryptedPoly,
     alpha_tag: &RistrettoPoint,
 ) -> Result<(Scalar, Scalar), &'static str> {
-    proof.a1.decompress().ok_or("A1 is not a valid Ristretto point")?;
-    proof.a2.decompress().ok_or("A2 is not a valid Ristretto point")?;
-    proof.a_m.decompress().ok_or("A_m is not a valid Ristretto point")?;
+    proof
+        .a1
+        .decompress()
+        .ok_or("A1 is not a valid Ristretto point")?;
+    proof
+        .a2
+        .decompress()
+        .ok_or("A2 is not a valid Ristretto point")?;
+    proof
+        .a_m
+        .decompress()
+        .ok_or("A_m is not a valid Ristretto point")?;
 
     let mut t = poly_scalar_mul_transcript(in_poly, out_poly, alpha_tag);
     append_compressed(&mut t, b"A1", &proof.a1);
@@ -325,17 +339,27 @@ pub(crate) fn poly_scalar_mul_relation_points(
     in_poly: &EncryptedPoly,
     out_poly: &EncryptedPoly,
     alpha_tag: &RistrettoPoint,
-) -> (RistrettoPoint, RistrettoPoint, RistrettoPoint, RistrettoPoint, Vec<Scalar>) {
+) -> (
+    RistrettoPoint,
+    RistrettoPoint,
+    RistrettoPoint,
+    RistrettoPoint,
+    Vec<Scalar>,
+) {
     let n = in_poly.0.len();
     let mut t = poly_scalar_mul_transcript(in_poly, out_poly, alpha_tag);
     let alphas: Vec<Scalar> = (0..n).map(|_| squeeze_weight(&mut t)).collect();
 
     // Pass iterators directly to multiscalar_mul — avoids four intermediate
     // Vec<RistrettoPoint> heap allocations.
-    let x_c1 = RistrettoPoint::multiscalar_mul(alphas.iter().copied(), in_poly.0.iter().map(|ct| ct.c1));
-    let x_c2 = RistrettoPoint::multiscalar_mul(alphas.iter().copied(), in_poly.0.iter().map(|ct| ct.c2));
-    let y_c1 = RistrettoPoint::multiscalar_mul(alphas.iter().copied(), out_poly.0.iter().map(|ct| ct.c1));
-    let y_c2 = RistrettoPoint::multiscalar_mul(alphas.iter().copied(), out_poly.0.iter().map(|ct| ct.c2));
+    let x_c1 =
+        RistrettoPoint::multiscalar_mul(alphas.iter().copied(), in_poly.0.iter().map(|ct| ct.c1));
+    let x_c2 =
+        RistrettoPoint::multiscalar_mul(alphas.iter().copied(), in_poly.0.iter().map(|ct| ct.c2));
+    let y_c1 =
+        RistrettoPoint::multiscalar_mul(alphas.iter().copied(), out_poly.0.iter().map(|ct| ct.c1));
+    let y_c2 =
+        RistrettoPoint::multiscalar_mul(alphas.iter().copied(), out_poly.0.iter().map(|ct| ct.c2));
 
     (x_c1, x_c2, y_c1, y_c2, alphas)
 }
@@ -399,10 +423,20 @@ pub fn verify_poly_scalar_mul(
     }
 
     let mut t = poly_scalar_mul_transcript(in_poly, out_poly, &alpha_tag);
-    let (x_c1, x_c2, y_c1, y_c2, _) = poly_scalar_mul_relation_points(in_poly, out_poly, &alpha_tag);
-    let a1 = proof.a1.decompress().ok_or("A1 is not a valid Ristretto point")?;
-    let a2 = proof.a2.decompress().ok_or("A2 is not a valid Ristretto point")?;
-    let a_m = proof.a_m.decompress().ok_or("A_m is not a valid Ristretto point")?;
+    let (x_c1, x_c2, y_c1, y_c2, _) =
+        poly_scalar_mul_relation_points(in_poly, out_poly, &alpha_tag);
+    let a1 = proof
+        .a1
+        .decompress()
+        .ok_or("A1 is not a valid Ristretto point")?;
+    let a2 = proof
+        .a2
+        .decompress()
+        .ok_or("A2 is not a valid Ristretto point")?;
+    let a_m = proof
+        .a_m
+        .decompress()
+        .ok_or("A_m is not a valid Ristretto point")?;
 
     append_compressed(&mut t, b"A1", &proof.a1);
     append_compressed(&mut t, b"A2", &proof.a2);
@@ -429,14 +463,16 @@ pub fn verify_poly_scalar_mul(
 mod tests {
     use super::*;
     use crate::crypto::elgamal::{
-        combine_public_keys, ct_scalar_mul, encrypt, encrypt_poly, eval_poly,
-        generate_key_share, partial_decrypt_with_witness,
+        combine_public_keys, ct_scalar_mul, encrypt, encrypt_poly, eval_poly, generate_key_share,
+        partial_decrypt_with_witness,
     };
     use rand::rngs::OsRng;
 
     fn setup() -> (
-        crate::crypto::elgamal::SecretKeyShare, PublicKeyShare,
-        crate::crypto::elgamal::SecretKeyShare, PublicKeyShare,
+        crate::crypto::elgamal::SecretKeyShare,
+        PublicKeyShare,
+        crate::crypto::elgamal::SecretKeyShare,
+        PublicKeyShare,
         crate::crypto::elgamal::PublicKey,
     ) {
         let mut rng = OsRng;
@@ -455,7 +491,15 @@ mod tests {
         let in_ct = encrypt(&mut rng, &pk, &Scalar::from(42u64));
         let (out_ct, r_prime) = partial_decrypt_with_witness(&mut rng, &sk2, &pk1, &in_ct);
 
-        let proof = prove(&mut rng, sk2.as_scalar(), r_prime, &pk2, &pk1, &in_ct, &out_ct);
+        let proof = prove(
+            &mut rng,
+            sk2.as_scalar(),
+            r_prime,
+            &pk2,
+            &pk1,
+            &in_ct,
+            &out_ct,
+        );
         verify(&proof, &pk2, &pk1, &in_ct, &out_ct).expect("valid proof must verify");
     }
 
@@ -470,12 +514,20 @@ mod tests {
         let poly_ct = encrypt_poly(&mut rng, &pk, &coeffs);
 
         // Evaluate at x = 2 (a root → P(2) = 0) and scale by a random mask.
-        let x    = Scalar::from(2u64);
+        let x = Scalar::from(2u64);
         let mask = Scalar::from(13u64);
         let scaled_ct = ct_scalar_mul(&eval_poly(&poly_ct, &x), &mask);
 
         let (out_ct, r_prime) = partial_decrypt_with_witness(&mut rng, &sk2, &pk1, &scaled_ct);
-        let proof = prove(&mut rng, sk2.as_scalar(), r_prime, &pk2, &pk1, &scaled_ct, &out_ct);
+        let proof = prove(
+            &mut rng,
+            sk2.as_scalar(),
+            r_prime,
+            &pk2,
+            &pk1,
+            &scaled_ct,
+            &out_ct,
+        );
         verify(&proof, &pk2, &pk1, &scaled_ct, &out_ct)
             .expect("valid proof for scaled eval must verify");
     }
@@ -488,7 +540,15 @@ mod tests {
 
         let in_ct = encrypt(&mut rng, &pk, &Scalar::from(7u64));
         let (out_ct, r_prime) = partial_decrypt_with_witness(&mut rng, &sk2, &pk1, &in_ct);
-        let proof = prove(&mut rng, sk2.as_scalar(), r_prime, &pk2, &pk1, &in_ct, &out_ct);
+        let proof = prove(
+            &mut rng,
+            sk2.as_scalar(),
+            r_prime,
+            &pk2,
+            &pk1,
+            &in_ct,
+            &out_ct,
+        );
 
         let tampered = encrypt(&mut rng, &pk, &Scalar::from(99u64));
         assert!(
@@ -506,7 +566,15 @@ mod tests {
 
         let in_ct = encrypt(&mut rng, &pk, &Scalar::from(5u64));
         let (out_ct, r_prime) = partial_decrypt_with_witness(&mut rng, &sk2, &pk1, &in_ct);
-        let proof = prove(&mut rng, sk2.as_scalar(), r_prime, &pk2, &pk1, &in_ct, &out_ct);
+        let proof = prove(
+            &mut rng,
+            sk2.as_scalar(),
+            r_prime,
+            &pk2,
+            &pk1,
+            &in_ct,
+            &out_ct,
+        );
 
         assert!(
             verify(&proof, &pk2_other, &pk1, &in_ct, &out_ct).is_err(),
@@ -520,10 +588,18 @@ mod tests {
         let mut rng = OsRng;
         let (_sk1, pk1, sk2, pk2, pk) = setup();
 
-        let in_ct  = encrypt(&mut rng, &pk, &Scalar::from(3u64));
+        let in_ct = encrypt(&mut rng, &pk, &Scalar::from(3u64));
         let in_ct2 = encrypt(&mut rng, &pk, &Scalar::from(4u64));
         let (out_ct, r_prime) = partial_decrypt_with_witness(&mut rng, &sk2, &pk1, &in_ct);
-        let proof = prove(&mut rng, sk2.as_scalar(), r_prime, &pk2, &pk1, &in_ct, &out_ct);
+        let proof = prove(
+            &mut rng,
+            sk2.as_scalar(),
+            r_prime,
+            &pk2,
+            &pk1,
+            &in_ct,
+            &out_ct,
+        );
 
         assert!(
             verify(&proof, &pk2, &pk1, &in_ct2, &out_ct).is_err(),

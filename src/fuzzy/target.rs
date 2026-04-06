@@ -37,8 +37,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::bulletproof as bp;
 use crate::crypto::elgamal::{
-    combine_public_keys, encrypt_one, encrypt_poly, encrypt_zero, rerandomize_poly_with_witness, test_zero,
-    Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare, SecretKeyShare,
+    combine_public_keys, encrypt_one, encrypt_poly, encrypt_zero, rerandomize_poly_with_witness,
+    test_zero, Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare, SecretKeyShare,
 };
 use crate::crypto::sigma_bullet as sb;
 
@@ -285,9 +285,7 @@ pub enum TargetToMonitor {
         accum: WireEncryptedPoly,
     },
     /// Next-round ciphertext (re-randomised; either updated or the same poly).
-    NextRound {
-        accum: WireEncryptedPoly,
-    },
+    NextRound { accum: WireEncryptedPoly },
     /// Monitor's proof was rejected; contains a debug reason string.
     Reject { reason: String },
 }
@@ -441,7 +439,7 @@ impl Target {
         let _accum_scaled_eval = msg.accum_scaled_eval.to_native()?;
         let accum_m_poly_ct = msg.accum_m_poly_ctext.to_native()?;
         let scaled_eval = msg.scaled_eval.to_native()?;
-        let m_poly_ct   = msg.m_poly_ctext.to_native()?;
+        let m_poly_ct = msg.m_poly_ctext.to_native()?;
 
         if next_accum.0.len() != current_accum.0.len() {
             return Err("next_accum length mismatch".to_string());
@@ -507,10 +505,13 @@ impl Target {
         let t_outsource_start = std::time::Instant::now();
         let current = self.build_poly_ctext(&mut rng);
         let mut current_accum = self.build_accum_ctext(&mut rng);
-        send_msg(&mut s, &TargetToMonitor::Outsource {
-            t_poly_ct: WireEncryptedPoly::from_native(&current),
-            accum: WireEncryptedPoly::from_native(&current_accum),
-        })?;
+        send_msg(
+            &mut s,
+            &TargetToMonitor::Outsource {
+                t_poly_ct: WireEncryptedPoly::from_native(&current),
+                accum: WireEncryptedPoly::from_native(&current_accum),
+            },
+        )?;
         let outsource_ms = t_outsource_start.elapsed().as_secs_f64() * 1000.0;
         eprintln!("[Target] Outsource Time (compute -> send): {outsource_ms:.3} ms");
         eprintln!("[Target] Sent TPolyCtext (deg {})", self.t_set.len());
@@ -530,9 +531,12 @@ impl Target {
                 Ok((next_accum, matched)) => {
                     eprintln!("[Target] match={matched}  state={}", self.state);
                     current_accum = next_accum;
-                    send_msg(&mut s, &TargetToMonitor::NextRound {
-                        accum: WireEncryptedPoly::from_native(&current_accum),
-                    })?;
+                    send_msg(
+                        &mut s,
+                        &TargetToMonitor::NextRound {
+                            accum: WireEncryptedPoly::from_native(&current_accum),
+                        },
+                    )?;
                 }
                 Err(reason) => {
                     eprintln!("[Target] Reject: {reason}");
@@ -549,8 +553,8 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::elgamal::{ct_add, ct_scalar_mul, eval_poly, poly_scalar_mul};
     use crate::crypto::elgamal::generate_key_share;
+    use crate::crypto::elgamal::{ct_add, ct_scalar_mul, eval_poly, poly_scalar_mul};
 
     /// Verify that `poly_from_roots` evaluates to zero at each root.
     #[test]
@@ -570,9 +574,9 @@ mod tests {
     /// End-to-end test of one matched round using in-process crypto.
     #[test]
     fn test_process_round_match() {
-        use curve25519_dalek_ng::constants::RISTRETTO_BASEPOINT_POINT as G;
         use crate::crypto::elgamal::partial_decrypt_with_witness;
         use crate::crypto::sigma_bullet as sb_mod;
+        use curve25519_dalek_ng::constants::RISTRETTO_BASEPOINT_POINT as G;
 
         let mut rng = OsRng;
         let (sk1, pk1) = generate_key_share(&mut rng);
@@ -590,15 +594,22 @@ mod tests {
         let eval_ct = eval_poly(&poly_ct, &m);
         let accum_mask = Scalar::from(29u64);
         let accum_scaled_no_blind = ct_scalar_mul(&accum_eval, &accum_mask);
-        let accum_enc_zero_mask = Ciphertext { c1: accum_mask * G, c2: accum_mask * target.pk.0 };
+        let accum_enc_zero_mask = Ciphertext {
+            c1: accum_mask * G,
+            c2: accum_mask * target.pk.0,
+        };
         let accum_scaled = ct_add(&accum_scaled_no_blind, &accum_enc_zero_mask);
         let (accum_m_poly_ct, _accum_r_prime) =
             partial_decrypt_with_witness(&mut rng, &sk2, &target.pk1, &accum_scaled);
-        let mask    = Scalar::from(13u64);
+        let mask = Scalar::from(13u64);
         let scaled_no_blind = ct_scalar_mul(&eval_ct, &mask);
-        let enc_zero_mask = Ciphertext { c1: mask * G, c2: mask * target.pk.0 };
-        let scaled  = ct_add(&scaled_no_blind, &enc_zero_mask);
-        let (m_poly_ct, r_prime) = partial_decrypt_with_witness(&mut rng, &sk2, &target.pk1, &scaled);
+        let enc_zero_mask = Ciphertext {
+            c1: mask * G,
+            c2: mask * target.pk.0,
+        };
+        let scaled = ct_add(&scaled_no_blind, &enc_zero_mask);
+        let (m_poly_ct, r_prime) =
+            partial_decrypt_with_witness(&mut rng, &sk2, &target.pk1, &scaled);
 
         let round_proof = sb_mod::prove_round(
             &mut rng,
@@ -623,27 +634,32 @@ mod tests {
         .expect("round prove");
 
         let msg = MonitorToTarget {
-            next_accum:   WireEncryptedPoly::from_native(&next_accum),
+            next_accum: WireEncryptedPoly::from_native(&next_accum),
             accum_scaled_eval: WireCiphertext::from_native(&accum_scaled),
             accum_m_poly_ctext: WireCiphertext::from_native(&accum_m_poly_ct),
-            scaled_eval:  WireCiphertext::from_native(&scaled),
+            scaled_eval: WireCiphertext::from_native(&scaled),
             m_poly_ctext: WireCiphertext::from_native(&m_poly_ct),
             round_proof: WireCombinedSigmaProof::from_proof(&round_proof),
         };
 
-        let (next_accum_out, matched) =
-            target.process_round(&mut rng, &poly_ct, &accum_ct, &msg).unwrap();
+        let (next_accum_out, matched) = target
+            .process_round(&mut rng, &poly_ct, &accum_ct, &msg)
+            .unwrap();
         assert!(matched, "7 should be detected as a match");
         assert_eq!(target.state, 1);
-        assert_eq!(next_accum_out.0.len(), accum_ct.0.len(), "accum length should stay constant");
+        assert_eq!(
+            next_accum_out.0.len(),
+            accum_ct.0.len(),
+            "accum length should stay constant"
+        );
     }
 
     /// Non-match round: state stays at 0.
     #[test]
     fn test_process_round_no_match() {
-        use curve25519_dalek_ng::constants::RISTRETTO_BASEPOINT_POINT as G;
         use crate::crypto::elgamal::partial_decrypt_with_witness;
         use crate::crypto::sigma_bullet as sb_mod;
+        use curve25519_dalek_ng::constants::RISTRETTO_BASEPOINT_POINT as G;
 
         let mut rng = OsRng;
         let (sk1, pk1) = generate_key_share(&mut rng);
@@ -655,20 +671,27 @@ mod tests {
         let accum_ct = target.build_accum_ctext(&mut rng);
 
         // MElmt = 99 (NOT a root).
-        let m    = Scalar::from(99u64);
+        let m = Scalar::from(99u64);
         let mask = Scalar::from(5u64);
         let next_accum = poly_scalar_mul(&accum_ct, &m);
         let accum_eval = eval_poly(&accum_ct, &m);
         let accum_mask = Scalar::from(31u64);
         let accum_scaled_no_blind = ct_scalar_mul(&accum_eval, &accum_mask);
-        let accum_enc_zero_mask = Ciphertext { c1: accum_mask * G, c2: accum_mask * target.pk.0 };
+        let accum_enc_zero_mask = Ciphertext {
+            c1: accum_mask * G,
+            c2: accum_mask * target.pk.0,
+        };
         let accum_scaled = ct_add(&accum_scaled_no_blind, &accum_enc_zero_mask);
         let (accum_m_poly_ct, _accum_r_prime) =
             partial_decrypt_with_witness(&mut rng, &sk2, &target.pk1, &accum_scaled);
         let scaled_no_blind = ct_scalar_mul(&eval_poly(&poly_ct, &m), &mask);
-        let enc_zero_mask = Ciphertext { c1: mask * G, c2: mask * target.pk.0 };
+        let enc_zero_mask = Ciphertext {
+            c1: mask * G,
+            c2: mask * target.pk.0,
+        };
         let scaled = ct_add(&scaled_no_blind, &enc_zero_mask);
-        let (m_poly_ct, r_prime) = partial_decrypt_with_witness(&mut rng, &sk2, &target.pk1, &scaled);
+        let (m_poly_ct, r_prime) =
+            partial_decrypt_with_witness(&mut rng, &sk2, &target.pk1, &scaled);
 
         let round_proof = sb_mod::prove_round(
             &mut rng,
@@ -693,18 +716,23 @@ mod tests {
         .unwrap();
 
         let msg = MonitorToTarget {
-            next_accum:   WireEncryptedPoly::from_native(&next_accum),
+            next_accum: WireEncryptedPoly::from_native(&next_accum),
             accum_scaled_eval: WireCiphertext::from_native(&accum_scaled),
             accum_m_poly_ctext: WireCiphertext::from_native(&accum_m_poly_ct),
-            scaled_eval:  WireCiphertext::from_native(&scaled),
+            scaled_eval: WireCiphertext::from_native(&scaled),
             m_poly_ctext: WireCiphertext::from_native(&m_poly_ct),
             round_proof: WireCombinedSigmaProof::from_proof(&round_proof),
         };
 
-        let (next_accum_out, matched) =
-            target.process_round(&mut rng, &poly_ct, &accum_ct, &msg).unwrap();
+        let (next_accum_out, matched) = target
+            .process_round(&mut rng, &poly_ct, &accum_ct, &msg)
+            .unwrap();
         assert!(!matched, "99 should not match");
         assert_eq!(target.state, 0);
-        assert_eq!(next_accum_out.0.len(), accum_ct.0.len(), "accum length should stay constant");
+        assert_eq!(
+            next_accum_out.0.len(),
+            accum_ct.0.len(),
+            "accum length should stay constant"
+        );
     }
 }

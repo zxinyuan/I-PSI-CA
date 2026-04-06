@@ -27,7 +27,8 @@ impl BloomFilterConfig {
     }
 
     pub fn bit_density(self) -> f64 {
-        self.honeyword_probability.powf(1.0 / self.hash_count as f64)
+        self.honeyword_probability
+            .powf(1.0 / self.hash_count as f64)
     }
 
     pub fn target_marked_count(self) -> usize {
@@ -36,16 +37,34 @@ impl BloomFilterConfig {
     }
 }
 
+/// Choose a public Bloom-filter hash count `k` from the Bernoulli-honeyword
+/// relation `(|B| / b)^k = p_h`.
+///
+/// We pick the smallest integer `k` that keeps the expected bit density near
+/// `1/2`, which is the usual Bloom-filter sweet spot and also keeps later ZK
+/// proofs cheaper because both hashing witnesses and proof size scale with `k`.
+pub fn recommended_hash_count(honeyword_probability: f64) -> usize {
+    if !honeyword_probability.is_finite()
+        || honeyword_probability <= 0.0
+        || honeyword_probability >= 1.0
+    {
+        return 1;
+    }
+
+    let target_density = 0.5f64;
+    let k = (honeyword_probability.ln() / target_density.ln()).round() as isize;
+    k.max(1) as usize
+}
+
 pub fn scalar_positions(input: Scalar, config: BloomFilterConfig) -> Vec<Scalar> {
     let base = scalar_to_usize(input);
-    let usable_span = config.bloom_filter_size - config.hash_count + 1;
+    let usable_span = usable_input_span(config);
     assert!(
         (1..=usable_span).contains(&base),
         "input scalar must lie in the supported Bloom-hash domain"
     );
-    let start = base;
     (0..config.hash_count)
-        .map(|offset| Scalar::from((start + offset) as u64))
+        .map(|hash_index| hash_position(input, hash_index, config))
         .collect()
 }
 
@@ -70,7 +89,11 @@ pub fn sample_marked_positions(
         universe.swap(i, j);
     }
 
-    marked_positions.extend(universe.into_iter().take(target_count - marked_positions.len()));
+    marked_positions.extend(
+        universe
+            .into_iter()
+            .take(target_count - marked_positions.len()),
+    );
     marked_positions
 }
 
@@ -92,7 +115,7 @@ pub fn find_non_member_scalar(
         return None;
     }
 
-    let usable_span = config.bloom_filter_size - config.hash_count + 1;
+    let usable_span = usable_input_span(config);
     for candidate in 1..=usable_span as u64 {
         let candidate = Scalar::from(candidate);
         if !scalar_is_member(candidate, marked_positions, config) {
@@ -114,12 +137,35 @@ pub fn dedup_positions(positions: &[Scalar]) -> Vec<Scalar> {
 }
 
 pub fn sample_query_scalar<R: Rng + ?Sized>(rng: &mut R, config: BloomFilterConfig) -> Scalar {
-    let usable_span = config.bloom_filter_size - config.hash_count + 1;
+    let usable_span = usable_input_span(config);
     Scalar::from(rng.gen_range(1..=usable_span as u64))
 }
 
-pub fn hash_offset(hash_index: usize) -> Scalar {
-    Scalar::from((hash_index + 1) as u64)
+pub fn hash_params(hash_index: usize) -> (Scalar, Scalar) {
+    (
+        Scalar::from((hash_index + 1) as u64),
+        Scalar::from(hash_index as u64),
+    )
+}
+
+pub fn hash_position(input: Scalar, hash_index: usize, config: BloomFilterConfig) -> Scalar {
+    let input_scalar = scalar_to_usize(input);
+    let usable_span = usable_input_span(config);
+    assert!(
+        (1..=usable_span).contains(&input_scalar),
+        "input scalar must lie in the supported Bloom-hash domain"
+    );
+    let (slope, intercept) = hash_params(hash_index);
+    slope * input + intercept
+}
+
+pub fn usable_input_span(config: BloomFilterConfig) -> usize {
+    let max_slope = config.hash_count;
+    let max_intercept = config.hash_count.saturating_sub(1);
+    if config.bloom_filter_size <= max_intercept {
+        return 0;
+    }
+    (config.bloom_filter_size - max_intercept) / max_slope
 }
 
 pub fn scalar_to_usize(input: Scalar) -> usize {
@@ -145,8 +191,23 @@ mod tests {
         assert_eq!(positions.len(), 3);
         assert_eq!(
             positions,
-            vec![Scalar::from(3u64), Scalar::from(4u64), Scalar::from(5u64)]
+            vec![Scalar::from(3u64), Scalar::from(7u64), Scalar::from(11u64)]
         );
+    }
+
+    #[test]
+    fn test_hash_positions_stay_within_bloom_filter_range() {
+        let config = BloomFilterConfig {
+            bloom_filter_size: 32,
+            hash_count: 3,
+            honeyword_probability: 0.25,
+        };
+        let max_input = Scalar::from(usable_input_span(config) as u64);
+        let positions = scalar_positions(max_input, config);
+        for position in positions {
+            let value = scalar_to_usize(position);
+            assert!((1..=config.bloom_filter_size).contains(&value));
+        }
     }
 
     #[test]
@@ -163,5 +224,13 @@ mod tests {
         for position in required {
             assert!(marked_positions.contains(&position));
         }
+    }
+
+    #[test]
+    fn test_recommended_hash_count_tracks_bernoulli_density() {
+        assert_eq!(recommended_hash_count(0.125), 3);
+        assert_eq!(recommended_hash_count(0.25), 2);
+        assert_eq!(recommended_hash_count(1.0), 1);
+        assert_eq!(recommended_hash_count(0.0), 1);
     }
 }

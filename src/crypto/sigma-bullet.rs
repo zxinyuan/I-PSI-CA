@@ -417,7 +417,81 @@ fn combined_challenge(
     let rho_partial = batch_scalar(&mut t, b"rho_partial");
     let rho_accum_partial = batch_scalar(&mut t, b"rho_accum_partial");
     let rho_accum_mul = batch_scalar(&mut t, b"rho_accum_mul");
-    (challenge, rho_glue, rho_partial, rho_accum_partial, rho_accum_mul)
+    (
+        challenge,
+        rho_glue,
+        rho_partial,
+        rho_accum_partial,
+        rho_accum_mul,
+    )
+}
+
+/// Recompute the shared Fiat-Shamir challenge and per-relation batching
+/// scalars for a full combined round proof from public inputs only.
+#[allow(clippy::too_many_arguments)]
+pub fn round_challenge_and_batch_scalars(
+    pk: &PublicKey,
+    pk1: &crate::crypto::elgamal::PublicKeyShare,
+    pk2: &crate::crypto::elgamal::PublicKeyShare,
+    coeff_cts: &[Ciphertext],
+    c_star: &Ciphertext,
+    partial_out_ct: &Ciphertext,
+    accum_c_star: &Ciphertext,
+    accum_partial_out_ct: &Ciphertext,
+    accum_in: &crate::crypto::elgamal::EncryptedPoly,
+    accum_out: &crate::crypto::elgamal::EncryptedPoly,
+    proof: &CombinedSigmaProof,
+) -> Result<(Scalar, Scalar, Scalar, Scalar, Scalar), String> {
+    let alpha_tag = proof
+        .alpha_tag
+        .decompress()
+        .ok_or_else(|| "invalid alpha_tag point".to_string())?;
+    let (beta_y, beta_c1, beta_c2) = relation_scalars(&proof.chain_proof, pk, coeff_cts, c_star);
+    let (beta_pd, gamma_pd) =
+        sigma::partial_decrypt_relation_scalars(pk2, pk1, c_star, partial_out_ct);
+    let (beta_accum_pd, gamma_accum_pd) =
+        sigma::partial_decrypt_relation_scalars(pk2, pk1, accum_c_star, accum_partial_out_ct);
+    let accum_mul_temp = PolyScalarMulProof {
+        a1: proof.accum_mul_a1,
+        a2: proof.accum_mul_a2,
+        alpha_tag: proof.alpha_tag,
+        a_m: proof.accum_mul_a_m,
+        s_y: proof.accum_mul_s_y,
+    };
+    let (beta_accum_mul, gamma_accum_mul) =
+        sigma::poly_scalar_mul_batch_scalars(&accum_mul_temp, accum_in, accum_out, &alpha_tag)
+            .map_err(str::to_string)?;
+
+    Ok(combined_challenge(
+        pk,
+        coeff_cts,
+        c_star,
+        &proof.chain_proof,
+        &proof.alpha_tag,
+        &proof.glue_a_t,
+        beta_y,
+        beta_c1,
+        beta_c2,
+        pk2,
+        pk1,
+        c_star,
+        partial_out_ct,
+        beta_pd,
+        gamma_pd,
+        &proof.partial_a,
+        accum_c_star,
+        accum_partial_out_ct,
+        beta_accum_pd,
+        gamma_accum_pd,
+        &proof.accum_partial_a,
+        accum_in,
+        accum_out,
+        beta_accum_mul,
+        gamma_accum_mul,
+        &proof.accum_mul_a1,
+        &proof.accum_mul_a2,
+        &proof.accum_mul_a_m,
+    ))
 }
 
 fn relation_scalars(
@@ -589,8 +663,7 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         e_asc.push(e_asc[i - 1] * alpha);
     }
     let e_rev: Vec<Scalar> = e_asc.iter().cloned().rev().collect();
-    let (chain_proof, y_blind) =
-        prove_chain_with_openings(rng, pc_gens, bp_gens, &e_rev, alpha)?;
+    let (chain_proof, y_blind) = prove_chain_with_openings(rng, pc_gens, bp_gens, &e_rev, alpha)?;
 
     let (beta_y, beta_c1, beta_c2) = relation_scalars(&chain_proof, pk, coeff_cts, c_star);
     let mut k_e = Vec::with_capacity(e_asc.len());
@@ -618,32 +691,26 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         scalars.push(*ke);
         points.push(basis);
     }
-    let glue_a_t = RistrettoPoint::multiscalar_mul(scalars.iter().copied(), points.iter().copied())
-        .compress();
+    let glue_a_t =
+        RistrettoPoint::multiscalar_mul(scalars.iter().copied(), points.iter().copied()).compress();
 
     let (beta_pd, gamma_pd) =
         sigma::partial_decrypt_relation_scalars(pk2, pk1, c_star, partial_out_ct);
     let k_sk2 = Scalar::random(rng);
     let k_r_prime = Scalar::random(rng);
     let beta_g = mul_g(&beta_pd);
-    let partial_a = (
-        mul_g(&k_sk2)
-        - k_sk2 * (gamma_pd * c_star.c1)
-        + k_r_prime * (gamma_pd * (pk1.0 + beta_g))
-    )
-    .compress();
+    let partial_a = (mul_g(&k_sk2) - k_sk2 * (gamma_pd * c_star.c1)
+        + k_r_prime * (gamma_pd * (pk1.0 + beta_g)))
+        .compress();
 
     let (beta_accum_pd, gamma_accum_pd) =
         sigma::partial_decrypt_relation_scalars(pk2, pk1, accum_c_star, accum_partial_out_ct);
     let k_accum_sk2 = Scalar::random(rng);
     let k_accum_r_prime = Scalar::random(rng);
     let accum_beta_g = mul_g(&beta_accum_pd);
-    let accum_partial_a = (
-        mul_g(&k_accum_sk2)
-        - k_accum_sk2 * (gamma_accum_pd * accum_c_star.c1)
-        + k_accum_r_prime * (gamma_accum_pd * (pk1.0 + accum_beta_g))
-    )
-    .compress();
+    let accum_partial_a = (mul_g(&k_accum_sk2) - k_accum_sk2 * (gamma_accum_pd * accum_c_star.c1)
+        + k_accum_r_prime * (gamma_accum_pd * (pk1.0 + accum_beta_g)))
+        .compress();
 
     let (accum_x_c1, accum_x_c2, _accum_y_c1, _accum_y_c2, _) =
         sigma::poly_scalar_mul_relation_points(accum_in, accum_out, &alpha_tag_pt);
@@ -658,13 +725,9 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         a_m: accum_mul_a_m,
         s_y: Scalar::zero(),
     };
-    let (beta_accum_mul, gamma_accum_mul) = sigma::poly_scalar_mul_batch_scalars(
-        &accum_mul_temp,
-        accum_in,
-        accum_out,
-        &alpha_tag_pt,
-    )
-    .map_err(|_| R1CSError::FormatError)?;
+    let (beta_accum_mul, gamma_accum_mul) =
+        sigma::poly_scalar_mul_batch_scalars(&accum_mul_temp, accum_in, accum_out, &alpha_tag_pt)
+            .map_err(|_| R1CSError::FormatError)?;
 
     let shared_chal = combined_prover_challenge(
         pk,
@@ -791,7 +854,8 @@ pub fn verify(
         lhs_scalars.iter().copied(),
         lhs_points.iter().copied(),
     );
-    let rhs = a_t + chal * (alpha_tag + beta_y * y_comm_pt + beta_c1 * c_star.c1 + beta_c2 * c_star.c2);
+    let rhs =
+        a_t + chal * (alpha_tag + beta_y * y_comm_pt + beta_c1 * c_star.c1 + beta_c2 * c_star.c2);
     if lhs != rhs {
         return Err("glue batched relation failed".to_string());
     }
@@ -871,50 +935,33 @@ pub fn verify_round(
     let accum_delta_c2 = accum_partial_out_ct.c2 - accum_c_star.c2;
     let (accum_mul_x_c1, accum_mul_x_c2, accum_mul_y_c1, accum_mul_y_c2, _) =
         sigma::poly_scalar_mul_relation_points(accum_in, accum_out, &alpha_tag);
-    let accum_mul_temp = PolyScalarMulProof {
-        a1: proof.accum_mul_a1,
-        a2: proof.accum_mul_a2,
-        alpha_tag: proof.alpha_tag,
-        a_m: proof.accum_mul_a_m,
-        s_y: proof.accum_mul_s_y,
-    };
+    let (chal, rho_glue, rho_partial, rho_accum_partial, rho_accum_mul) =
+        round_challenge_and_batch_scalars(
+            pk,
+            pk1,
+            pk2,
+            coeff_cts,
+            c_star,
+            partial_out_ct,
+            accum_c_star,
+            accum_partial_out_ct,
+            accum_in,
+            accum_out,
+            proof,
+        )?;
     let (beta_accum_mul, gamma_accum_mul) = sigma::poly_scalar_mul_batch_scalars(
-        &accum_mul_temp,
+        &PolyScalarMulProof {
+            a1: proof.accum_mul_a1,
+            a2: proof.accum_mul_a2,
+            alpha_tag: proof.alpha_tag,
+            a_m: proof.accum_mul_a_m,
+            s_y: proof.accum_mul_s_y,
+        },
         accum_in,
         accum_out,
         &alpha_tag,
     )
     .map_err(str::to_string)?;
-    let (chal, rho_glue, rho_partial, rho_accum_partial, rho_accum_mul) = combined_challenge(
-        pk,
-        coeff_cts,
-        c_star,
-        &proof.chain_proof,
-        &proof.alpha_tag,
-        &proof.glue_a_t,
-        beta_y,
-        beta_c1,
-        beta_c2,
-        pk2,
-        pk1,
-        c_star,
-        partial_out_ct,
-        beta_pd,
-        gamma_pd,
-        &proof.partial_a,
-        accum_c_star,
-        accum_partial_out_ct,
-        beta_accum_pd,
-        gamma_accum_pd,
-        &proof.accum_partial_a,
-        accum_in,
-        accum_out,
-        beta_accum_mul,
-        gamma_accum_mul,
-        &proof.accum_mul_a1,
-        &proof.accum_mul_a2,
-        &proof.accum_mul_a_m,
-    );
 
     let mut scalars = Vec::new();
     let mut points = Vec::new();
@@ -959,7 +1006,10 @@ pub fn verify_round(
     scalars.push(-rho_partial * chal * gamma_pd * beta_pd);
     points.push(delta_c1);
 
-    scalars.push(rho_accum_partial * (proof.accum_partial_z1 + proof.accum_partial_z2 * gamma_accum_pd * beta_accum_pd));
+    scalars.push(
+        rho_accum_partial
+            * (proof.accum_partial_z1 + proof.accum_partial_z2 * gamma_accum_pd * beta_accum_pd),
+    );
     points.push(G);
     scalars.push(rho_accum_partial * proof.accum_partial_z2 * gamma_accum_pd);
     points.push(pk1.0);
@@ -993,10 +1043,8 @@ pub fn verify_round(
     scalars.push(-rho_accum_mul * chal * gamma_accum_mul);
     points.push(alpha_tag);
 
-    let check = RistrettoPoint::vartime_multiscalar_mul(
-        scalars.iter().copied(),
-        points.iter().copied(),
-    );
+    let check =
+        RistrettoPoint::vartime_multiscalar_mul(scalars.iter().copied(), points.iter().copied());
     if check != RistrettoPoint::identity() {
         return Err("combined sigma batch check failed".to_string());
     }
@@ -1069,11 +1117,10 @@ mod tests {
 
         let pc_gens = PedersenGens::default();
         let bp_gens = make_bp_gens(2 * poly.0.len());
-        let proof = prove(&pc_gens, &bp_gens, &pk, &poly.0, &c_star, alpha, r)
-            .expect("prove must succeed");
+        let proof =
+            prove(&pc_gens, &bp_gens, &pk, &poly.0, &c_star, alpha, r).expect("prove must succeed");
 
-        verify(&pc_gens, &bp_gens, &pk, &poly.0, &c_star, &proof)
-            .expect("verify must succeed");
+        verify(&pc_gens, &bp_gens, &pk, &poly.0, &c_star, &proof).expect("verify must succeed");
     }
 
     #[test]
@@ -1104,8 +1151,8 @@ mod tests {
 
         let pc_gens = PedersenGens::default();
         let bp_gens = make_bp_gens(2 * poly.0.len());
-        let proof = prove(&pc_gens, &bp_gens, &pk, &poly.0, &c_star, alpha, r)
-            .expect("prove must succeed");
+        let proof =
+            prove(&pc_gens, &bp_gens, &pk, &poly.0, &c_star, alpha, r).expect("prove must succeed");
 
         let tampered = Ciphertext {
             c1: c_star.c1 + G,

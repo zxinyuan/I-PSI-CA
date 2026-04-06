@@ -36,9 +36,7 @@
 //! ```
 
 use curve25519_dalek_ng::{
-    constants::RISTRETTO_BASEPOINT_TABLE,
-    ristretto::RistrettoPoint,
-    scalar::Scalar,
+    constants::RISTRETTO_BASEPOINT_TABLE, ristretto::RistrettoPoint, scalar::Scalar,
     traits::Identity,
 };
 use rand::{CryptoRng, RngCore};
@@ -109,11 +107,7 @@ pub fn combine_public_keys(pk1: &PublicKeyShare, pk2: &PublicKeyShare) -> Public
 /// `THEnc[pk](m)`: encrypt a scalar `m` under the joint public key.
 ///
 /// Maps `m` to the group as `m·G`, then encrypts.
-pub fn encrypt<R: CryptoRng + RngCore>(
-    rng: &mut R,
-    pk: &PublicKey,
-    msg: &Scalar,
-) -> Ciphertext {
+pub fn encrypt<R: CryptoRng + RngCore>(rng: &mut R, pk: &PublicKey, msg: &Scalar) -> Ciphertext {
     encrypt_point(rng, pk, &mul_g(msg))
 }
 
@@ -299,7 +293,10 @@ pub fn rerandomize_poly<R: CryptoRng + RngCore>(
 ///
 /// The result is a single ciphertext encrypting `P(x)`.
 pub fn eval_poly(poly: &EncryptedPoly, x: &Scalar) -> Ciphertext {
-    assert!(!poly.0.is_empty(), "polynomial must have at least one coefficient");
+    assert!(
+        !poly.0.is_empty(),
+        "polynomial must have at least one coefficient"
+    );
 
     // Horner: start from the highest-degree coefficient.
     let mut acc = poly.0.last().unwrap().clone();
@@ -325,7 +322,11 @@ pub fn eval_poly(poly: &EncryptedPoly, x: &Scalar) -> Ciphertext {
 ///
 /// Costs `n` scalar multiplications and `n` additions.
 pub fn div_poly_linear(poly: &EncryptedPoly, x: &Scalar) -> EncryptedPoly {
-    let n = poly.0.len().checked_sub(1).expect("polynomial must have degree >= 1");
+    let n = poly
+        .0
+        .len()
+        .checked_sub(1)
+        .expect("polynomial must have degree >= 1");
     assert!(n >= 1, "can only divide a polynomial of degree >= 1");
 
     // Build the quotient by pushing in reverse order (high to low coefficient),
@@ -406,7 +407,13 @@ mod tests {
     use super::*;
     use rand::rngs::OsRng;
 
-    fn setup() -> (SecretKeyShare, PublicKeyShare, SecretKeyShare, PublicKeyShare, PublicKey) {
+    fn setup() -> (
+        SecretKeyShare,
+        PublicKeyShare,
+        SecretKeyShare,
+        PublicKeyShare,
+        PublicKey,
+    ) {
         let mut rng = OsRng;
         let (sk1, pk1) = generate_key_share(&mut rng);
         let (sk2, pk2) = generate_key_share(&mut rng);
