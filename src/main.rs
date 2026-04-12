@@ -6,9 +6,9 @@
 //! Usage:
 //!   cargo run --release -- exact 1000 true    # exact with custom degree, match
 //!   cargo run --release -- exact 1000 false   # exact with custom degree, no match
-//!   cargo run --release -- bf 1000 true       # bf with size, auto-chosen k, hardcoded p_h
-//!   cargo run --release -- bf 1000 3 true     # bf with size, manual k override
-//!   cargo run --release -- fuzzy false        # fuzzy with default degree
+//!   cargo run --release -- bf 1000 3 158 true # bf with size, k, marked positions, match
+//!   cargo run --release -- bf 1000 3 158 false
+//!   cargo run --release -- fuzzy 1000 128 false    # fuzzy with set size and vector size
 
 use std::thread;
 use std::time::Duration;
@@ -20,13 +20,14 @@ use i_psi_ca::bf::bloom::{
     find_non_member_scalar, recommended_hash_count, sample_marked_positions, sample_query_scalar,
     BloomFilterConfig,
 };
-use i_psi_ca::crypto::elgamal::generate_key_share;
+use i_psi_ca::crypto::elgamal::{generate_key_share, PublicKey};
 
 const ADDR: &str = "127.0.0.1:7878";
 const DEGREE: usize = 1_000;
 const BLOOM_FILTER_SIZE: usize = 1_000;
-const BF_HONEYWORD_PROBABILITY: f64 = 0.125;
+const BF_HONEYWORD_PROBABILITY: f64 = 0.004;
 const ACCUM_DEGREE: usize = 5;
+const FUZZY_VECTOR_SIZE: usize = 128;
 
 #[derive(Clone, Copy, Debug)]
 enum ProtocolVersion {
@@ -53,6 +54,8 @@ struct RunConfig {
     protocol: ProtocolVersion,
     size: usize,
     bf_hash_count: usize,
+    bf_marked_count: usize,
+    fuzzy_vector_size: usize,
     in_set: bool,
 }
 
@@ -83,6 +86,11 @@ impl RunConfig {
                     protocol,
                     size: degree,
                     bf_hash_count: recommended_hash_count(BF_HONEYWORD_PROBABILITY),
+                    bf_marked_count: default_bf_marked_count(
+                        degree,
+                        recommended_hash_count(BF_HONEYWORD_PROBABILITY),
+                    ),
+                    fuzzy_vector_size: FUZZY_VECTOR_SIZE,
                     in_set,
                 })
             }
@@ -99,59 +107,187 @@ impl RunConfig {
                 }
 
                 let default_k = recommended_hash_count(BF_HONEYWORD_PROBABILITY);
-                let (bf_hash_count, in_set) = match (args.get(3), args.get(4)) {
-                    (None, None) => (default_k, true),
-                    (Some(third), None) => match third.parse::<bool>() {
-                        Ok(in_set) => (default_k, in_set),
-                        Err(_) => {
+                let default_marked_count = default_bf_marked_count(bloom_filter_size, default_k);
+                let (bf_hash_count, bf_marked_count, in_set) =
+                    match (args.get(3), args.get(4), args.get(5)) {
+                        (None, None, None) => (default_k, default_marked_count, true),
+                        (Some(third), None, None) => match third.parse::<bool>() {
+                            Ok(in_set) => (default_k, default_marked_count, in_set),
+                            Err(_) => {
+                                let bf_hash_count = third.parse::<usize>().map_err(|_| {
+                                    "for bf, third arg must be true/false or a positive integer hash count k"
+                                        .to_string()
+                                })?;
+                                if bf_hash_count == 0 {
+                                    return Err(
+                                        "hash count k must be greater than zero".to_string()
+                                    );
+                                }
+                                (
+                                    bf_hash_count,
+                                    default_bf_marked_count(bloom_filter_size, bf_hash_count),
+                                    true,
+                                )
+                            }
+                        },
+                        (Some(third), Some(fourth), None) => {
                             let bf_hash_count = third.parse::<usize>().map_err(|_| {
-                                "for bf, third arg must be true/false or a positive integer hash count k"
+                                "for bf, third arg must be a positive integer hash count k when a fourth arg is provided"
                                     .to_string()
                             })?;
                             if bf_hash_count == 0 {
                                 return Err("hash count k must be greater than zero".to_string());
                             }
-                            (bf_hash_count, true)
+
+                            match fourth.parse::<bool>() {
+                                Ok(in_set) => (
+                                    bf_hash_count,
+                                    default_bf_marked_count(bloom_filter_size, bf_hash_count),
+                                    in_set,
+                                ),
+                                Err(_) => {
+                                    let bf_marked_count =
+                                        fourth.parse::<usize>().map_err(|_| {
+                                            "for bf, fourth arg must be true/false or a positive integer marked-position count"
+                                                .to_string()
+                                        })?;
+                                    (bf_hash_count, bf_marked_count, true)
+                                }
+                            }
                         }
-                    },
-                    (Some(third), Some(fourth)) => {
-                        let bf_hash_count = third.parse::<usize>().map_err(|_| {
-                            "for bf, third arg must be a positive integer hash count k when a fourth arg is provided"
-                                .to_string()
-                        })?;
-                        if bf_hash_count == 0 {
-                            return Err("hash count k must be greater than zero".to_string());
+                        (Some(third), Some(fourth), Some(fifth)) => {
+                            let bf_hash_count = third.parse::<usize>().map_err(|_| {
+                                "for bf, third arg must be a positive integer hash count k when a fifth arg is provided"
+                                    .to_string()
+                            })?;
+                            if bf_hash_count == 0 {
+                                return Err("hash count k must be greater than zero".to_string());
+                            }
+                            let bf_marked_count = fourth.parse::<usize>().map_err(|_| {
+                                "for bf, fourth arg must be a positive integer marked-position count when a fifth arg is provided"
+                                    .to_string()
+                            })?;
+                            let in_set = fifth
+                                .parse::<bool>()
+                                .map_err(|_| "for bf, fifth arg must be true/false".to_string())?;
+                            (bf_hash_count, bf_marked_count, in_set)
                         }
-                        let in_set = fourth
-                            .parse::<bool>()
-                            .map_err(|_| "for bf, fourth arg must be true/false".to_string())?;
-                        (bf_hash_count, in_set)
-                    }
-                    (None, Some(_)) => unreachable!("arg 4 cannot exist without arg 3"),
+                        _ => unreachable!("bf arguments are positional"),
+                    };
+
+                if bf_marked_count > bloom_filter_size {
+                    return Err(
+                        "target marked-position count must be at most the bloom filter size"
+                            .to_string(),
+                    );
                 };
 
                 Ok(Self {
                     protocol,
                     size: bloom_filter_size,
                     bf_hash_count,
+                    bf_marked_count,
+                    fuzzy_vector_size: FUZZY_VECTOR_SIZE,
                     in_set,
                 })
             }
             ProtocolVersion::Fuzzy => {
-                let in_set = match args.get(2) {
-                    Some(flag) => flag
-                        .parse::<bool>()
-                        .map_err(|_| "second arg must be true/false".to_string())?,
-                    None => true,
+                let (set_size, fuzzy_vector_size, in_set) = match (args.get(2), args.get(3), args.get(4)) {
+                    (None, None, None) => (DEGREE, FUZZY_VECTOR_SIZE, true),
+                    (Some(second), None, None) => match second.parse::<bool>() {
+                        Ok(in_set) => (DEGREE, FUZZY_VECTOR_SIZE, in_set),
+                        Err(_) => {
+                            let set_size = second.parse::<usize>().map_err(|_| {
+                                "for fuzzy, second arg must be true/false or a positive integer set size"
+                                    .to_string()
+                            })?;
+                            (set_size, FUZZY_VECTOR_SIZE, true)
+                        }
+                    },
+                    (Some(second), Some(third), None) => {
+                        let set_size = second.parse::<usize>().map_err(|_| {
+                            "for fuzzy, second arg must be a positive integer set size when a third arg is provided"
+                                .to_string()
+                        })?;
+                        match third.parse::<bool>() {
+                            Ok(in_set) => (set_size, FUZZY_VECTOR_SIZE, in_set),
+                            Err(_) => {
+                                let vector_size = third.parse::<usize>().map_err(|_| {
+                                    "for fuzzy, third arg must be true/false or a positive integer vector size"
+                                        .to_string()
+                                })?;
+                                (set_size, vector_size, true)
+                            }
+                        }
+                    }
+                    (Some(second), Some(third), Some(fourth)) => {
+                        let set_size = second.parse::<usize>().map_err(|_| {
+                            "for fuzzy, second arg must be a positive integer set size when a fourth arg is provided"
+                                .to_string()
+                        })?;
+                        let vector_size = third.parse::<usize>().map_err(|_| {
+                            "for fuzzy, third arg must be a positive integer vector size when a fourth arg is provided"
+                                .to_string()
+                        })?;
+                        let in_set = fourth
+                            .parse::<bool>()
+                            .map_err(|_| "for fuzzy, fourth arg must be true/false".to_string())?;
+                        (set_size, vector_size, in_set)
+                    }
+                    _ => unreachable!("fuzzy arguments are positional"),
                 };
+                if set_size == 0 {
+                    return Err("fuzzy set size must be greater than zero".to_string());
+                }
+                if fuzzy_vector_size == 0 {
+                    return Err("fuzzy vector size must be greater than zero".to_string());
+                }
 
                 Ok(Self {
                     protocol,
-                    size: DEGREE,
+                    size: set_size,
                     bf_hash_count: recommended_hash_count(BF_HONEYWORD_PROBABILITY),
+                    bf_marked_count: default_bf_marked_count(
+                        DEGREE,
+                        recommended_hash_count(BF_HONEYWORD_PROBABILITY),
+                    ),
+                    fuzzy_vector_size,
                     in_set,
                 })
             }
+        }
+    }
+}
+
+fn default_bf_marked_count(bloom_filter_size: usize, hash_count: usize) -> usize {
+    let density = BF_HONEYWORD_PROBABILITY.powf(1.0 / hash_count as f64);
+    (density * bloom_filter_size as f64)
+        .round()
+        .clamp(0.0, bloom_filter_size as f64) as usize
+}
+
+fn sample_fuzzy_scalar(rng: &mut OsRng, vector_size: usize) -> Scalar {
+    let kept_bits = vector_size.min(256);
+    loop {
+        let mut bytes = [0u8; 32];
+        use rand::RngCore;
+        rng.fill_bytes(&mut bytes);
+
+        let full_bytes = kept_bits / 8;
+        let extra_bits = kept_bits % 8;
+
+        if full_bytes < 32 {
+            for byte in &mut bytes[(full_bytes + usize::from(extra_bits > 0))..] {
+                *byte = 0;
+            }
+        }
+        if extra_bits > 0 && full_bytes < 32 {
+            let mask = (1u8 << extra_bits) - 1;
+            bytes[full_bytes] &= mask;
+        }
+
+        if let Some(scalar) = Scalar::from_canonical_bytes(bytes) {
+            return scalar;
         }
     }
 }
@@ -160,7 +296,7 @@ fn main() {
     // Parse optional CLI args
     let args: Vec<String> = std::env::args().collect();
     let config = RunConfig::parse(&args).expect(
-        "usage: exact [degree] [true|false], bf [bloom_filter_size] [true|false] or bf [bloom_filter_size] [k] [true|false], or fuzzy [true|false]",
+        "usage: exact [degree] [true|false], bf [bloom_filter_size] [k] [marked_positions] [true|false], or fuzzy [set_size] [vector_size] [true|false]",
     );
 
     let mut rng = OsRng;
@@ -212,7 +348,7 @@ fn main() {
             let bf_config = BloomFilterConfig {
                 bloom_filter_size: config.size,
                 hash_count: config.bf_hash_count,
-                honeyword_probability: BF_HONEYWORD_PROBABILITY,
+                target_marked_count: config.bf_marked_count,
             }
             .validate()
             .expect("BF config should be valid after CLI parsing");
@@ -232,7 +368,7 @@ fn main() {
             println!("Protocol    = {:?}", config.protocol);
             println!("Bloom size  = [{} positions]", config.size);
             println!("k hashes    = {}", config.bf_hash_count);
-            println!("p_h         = {}", BF_HONEYWORD_PROBABILITY);
+            println!("Target bits = [{} marked positions]", config.bf_marked_count);
             println!(
                 "Marked bits = [{} positions set to 1]",
                 marked_positions.len()
@@ -260,25 +396,23 @@ fn main() {
             );
         }
         ProtocolVersion::Fuzzy => {
-            let t_set: Vec<Scalar> = (0..config.size).map(|_| Scalar::random(&mut rng)).collect();
+            let (monitor_only_sk, monitor_only_pk_share) = generate_key_share(&mut rng);
+            let monitor_only_pk = PublicKey(monitor_only_pk_share.0);
+            let t_set: Vec<Scalar> = (0..config.size)
+                .map(|_| sample_fuzzy_scalar(&mut rng, config.fuzzy_vector_size))
+                .collect();
             let m_elmt = if config.in_set {
                 t_set[0]
             } else {
-                Scalar::random(&mut rng)
+                sample_fuzzy_scalar(&mut rng, config.fuzzy_vector_size)
             };
 
             println!("Protocol    = {:?}", config.protocol);
-            println!(
-                "TSet        = [{} uniform random 𝔽_ℓ elements]",
-                config.size
-            );
+            println!("Set size    = {}", config.size);
+            println!("Vector size = {}", config.fuzzy_vector_size);
             println!(
                 "MElmt       = uniform random 𝔽_ℓ element  (in_set={})",
                 config.in_set
-            );
-            println!(
-                "Expected    = {}",
-                if config.in_set { "MATCH" } else { "NO MATCH" }
             );
             println!();
 
@@ -288,10 +422,12 @@ fn main() {
                 sk1,
                 pk1,
                 pk2_for_target,
+                monitor_only_sk,
+                monitor_only_pk,
                 sk2,
                 pk1_for_monitor,
                 pk2,
-                config.size,
+                config.fuzzy_vector_size,
             );
         }
     }
@@ -370,22 +506,37 @@ fn run_fuzzy(
     sk1: i_psi_ca::crypto::elgamal::SecretKeyShare,
     pk1: i_psi_ca::crypto::elgamal::PublicKeyShare,
     pk2_for_target: i_psi_ca::crypto::elgamal::PublicKeyShare,
+    monitor_only_sk: i_psi_ca::crypto::elgamal::SecretKeyShare,
+    monitor_only_pk: i_psi_ca::crypto::elgamal::PublicKey,
     sk2: i_psi_ca::crypto::elgamal::SecretKeyShare,
     pk1_for_monitor: i_psi_ca::crypto::elgamal::PublicKeyShare,
     pk2: i_psi_ca::crypto::elgamal::PublicKeyShare,
-    set_size: usize,
+    vector_size: usize,
 ) {
     let target_handle = thread::spawn(move || {
-        let mut target =
-            i_psi_ca::fuzzy::target::Target::new(t_set, ACCUM_DEGREE, sk1, pk1, pk2_for_target);
+        let mut target = i_psi_ca::fuzzy::target::Target::new(
+            t_set,
+            ACCUM_DEGREE,
+            sk1,
+            pk1,
+            pk2_for_target,
+            monitor_only_pk,
+            vector_size,
+        );
         target.run(ADDR).expect("[Target] server error");
-        println!("[Target] Final match count: {}", target.state);
     });
 
     thread::sleep(Duration::from_millis(50));
 
-    let monitor =
-        i_psi_ca::fuzzy::monitor::Monitor::new(m_elmt, sk2, pk1_for_monitor, pk2, set_size);
+    let monitor = i_psi_ca::fuzzy::monitor::Monitor::new(
+        m_elmt,
+        monitor_only_sk,
+        monitor_only_pk,
+        sk2,
+        pk1_for_monitor,
+        pk2,
+        vector_size,
+    );
     monitor.run(ADDR, 1).expect("[Monitor] client error");
 
     target_handle.join().expect("Target thread panicked");

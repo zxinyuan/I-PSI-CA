@@ -132,8 +132,9 @@ pub fn send_msg<T: Serialize>(stream: &mut TcpStream, msg: &T) -> io::Result<()>
     let total = len.len() + bytes.len();
     let mut written = 0;
     while written < total {
-        written += stream.write_vectored(bufs)?;
-        IoSlice::advance_slices(&mut bufs, written);
+        let n = stream.write_vectored(bufs)?;
+        written += n;
+        IoSlice::advance_slices(&mut bufs, n);
     }
     Ok(())
 }
@@ -376,7 +377,7 @@ mod tests {
         BloomFilterConfig {
             bloom_filter_size: 32,
             hash_count: 1,
-            honeyword_probability: 0.125,
+            target_marked_count: 4,
         }
     }
 

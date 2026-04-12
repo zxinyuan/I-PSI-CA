@@ -130,7 +130,7 @@ impl Monitor {
             &self.pc_gens,
             &self.bp_gens,
             &poly,
-            aggregate.positions.len(),
+            self.bf_config.hash_count,
             &aggregate.e_vals,
             &scaled,
             self.input_y,
@@ -285,7 +285,7 @@ mod tests {
         BloomFilterConfig {
             bloom_filter_size: 32,
             hash_count: 1,
-            honeyword_probability: 0.125,
+            target_marked_count: 4,
         }
     }
 

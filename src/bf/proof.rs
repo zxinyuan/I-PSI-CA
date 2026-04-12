@@ -22,7 +22,6 @@ use crate::crypto::elgamal::{
 use crate::crypto::sigma::{self, PolyScalarMulProof};
 
 pub(crate) struct AggregateEvalWitness {
-    pub positions: Vec<Scalar>,
     pub e_vals: Vec<Scalar>,
     pub scaled_eval: Ciphertext,
 }
@@ -31,20 +30,18 @@ pub(crate) struct AggregateEvalWitness {
 struct EvalSumProof {
     proof: R1CSProof,
     e_comms: Vec<CompressedRistretto>,
-    q_comms: Vec<CompressedRistretto>,
-    z_comms: Vec<CompressedRistretto>,
     y_comm: CompressedRistretto,
-    inv_e0_comm: CompressedRistretto,
+    r_comm: CompressedRistretto,
+    inv_r_comm: CompressedRistretto,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WireEvalSumProof {
     pub proof_bytes: Vec<u8>,
     pub e_comms: Vec<[u8; 32]>,
-    pub q_comms: Vec<[u8; 32]>,
-    pub z_comms: Vec<[u8; 32]>,
     pub y_comm: [u8; 32],
-    pub inv_e0_comm: [u8; 32],
+    pub r_comm: [u8; 32],
+    pub inv_r_comm: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
@@ -193,11 +190,16 @@ fn characteristic_coefficients(hash_count: usize) -> Arc<Vec<Vec<Scalar>>> {
 
     let max_deg = hash_count;
     let mut coeffs = vec![vec![Scalar::zero(); max_deg + 1]; max_deg + 1];
+    let mut next = vec![vec![Scalar::zero(); max_deg + 1]; max_deg + 1];
     coeffs[0][0] = Scalar::one();
     let mut poly_deg = 0usize;
     for hash_index in 0..hash_count {
         let (slope, intercept) = hash_params(hash_index);
-        let mut next = vec![vec![Scalar::zero(); max_deg + 1]; max_deg + 1];
+        for row in &mut next {
+            for val in row.iter_mut() {
+                *val = Scalar::zero();
+            }
+        }
         for x_deg in 0..=poly_deg {
             for y_deg in 0..=max_deg {
                 let coeff = coeffs[x_deg][y_deg];
@@ -206,12 +208,12 @@ fn characteristic_coefficients(hash_count: usize) -> Arc<Vec<Vec<Scalar>>> {
                 }
                 next[x_deg + 1][y_deg] += coeff;
                 next[x_deg][y_deg] -= intercept * coeff;
-                if y_deg + 1 <= max_deg {
+                if y_deg < max_deg {
                     next[x_deg][y_deg + 1] -= slope * coeff;
                 }
             }
         }
-        coeffs = next;
+        std::mem::swap(&mut coeffs, &mut next);
         poly_deg += 1;
     }
 
@@ -226,63 +228,60 @@ fn characteristic_coefficients(hash_count: usize) -> Arc<Vec<Vec<Scalar>>> {
 fn eval_sum_relation_gadget<CS: ConstraintSystem>(
     cs: &mut CS,
     e_vars: &[Variable],
-    q_vars: &[Variable],
-    z_vars: &[Variable],
     y_var: Variable,
+    r_var: Variable,
     hash_count: usize,
-    inv_e0_var: Variable,
+    inv_r_var: Variable,
 ) -> Result<(), R1CSError> {
     if e_vars.is_empty() {
         return Err(R1CSError::GadgetError {
             description: "e_vars must not be empty".to_string(),
         });
     }
-    if q_vars.len() != hash_count {
-        return Err(R1CSError::GadgetError {
-            description: "q_vars length must equal hash_count".to_string(),
-        });
-    }
-    if z_vars.len() != hash_count + 1 {
-        return Err(R1CSError::GadgetError {
-            description: "z_vars length must equal hash_count + 1".to_string(),
-        });
-    }
 
-    let (_, _, e0_nonzero) = cs.multiply(
-        LinearCombination::from(e_vars[0]),
-        LinearCombination::from(inv_e0_var),
+    let (_, _, r_nonzero) = cs.multiply(
+        LinearCombination::from(r_var),
+        LinearCombination::from(inv_r_var),
     );
-    cs.constrain(LinearCombination::from(e0_nonzero) - Scalar::one());
-    cs.constrain(LinearCombination::from(q_vars[0]) - LinearCombination::from(e_vars[0]));
-    cs.constrain(LinearCombination::from(z_vars[0]) - Scalar::one());
-
-    for idx in 0..hash_count {
-        let (_, _, next_z) = cs.multiply(
-            LinearCombination::from(z_vars[idx]),
-            LinearCombination::from(y_var),
-        );
-        cs.constrain(LinearCombination::from(next_z) - LinearCombination::from(z_vars[idx + 1]));
-    }
-
-    for idx in 0..q_vars.len().saturating_sub(1) {
-        let (_, _, next_q) = cs.multiply(
-            LinearCombination::from(q_vars[idx]),
-            LinearCombination::from(y_var),
-        );
-        cs.constrain(LinearCombination::from(next_q) - LinearCombination::from(q_vars[idx + 1]));
-    }
+    cs.constrain(LinearCombination::from(r_nonzero) - Scalar::one());
 
     let init_len = hash_count.min(e_vars.len());
     let init_coeffs = power_sum_coefficients(hash_count, init_len);
     let char_coeffs = characteristic_coefficients(hash_count);
-    let k_scalar = Scalar::from(hash_count as u64);
-    let k_inv = k_scalar.invert();
+
+    let mut q_vars = Vec::with_capacity(init_len);
+    if init_len > 0 {
+        q_vars.push(r_var);
+    }
+    let mut current_q = r_var;
+    for _ in 1..init_len {
+        let (_, _, next_q) = cs.multiply(
+            LinearCombination::from(current_q),
+            LinearCombination::from(y_var),
+        );
+        q_vars.push(next_q);
+        current_q = next_q;
+    }
+
+    let mut z_vars = Vec::with_capacity(hash_count + 1);
+    z_vars.push(None);
+    let mut current_z: Option<Variable> = None;
+    for _ in 0..hash_count {
+        let left = current_z.map_or_else(
+            || LinearCombination::from(Scalar::one()),
+            LinearCombination::from,
+        );
+        let (_, _, next_z) = cs.multiply(left, LinearCombination::from(y_var));
+        z_vars.push(Some(next_z));
+        current_z = Some(next_z);
+    }
+
     for degree in 0..init_len {
         let mut expected = LinearCombination::default();
-        for (t, q_var) in q_vars.iter().copied().take(init_len).enumerate() {
+        for (t, q_var) in q_vars.iter().copied().take(degree + 1).enumerate() {
             let coeff = init_coeffs[degree][t];
             if coeff != Scalar::zero() {
-                expected = expected + (k_inv * coeff) * LinearCombination::from(q_var);
+                expected = expected + coeff * LinearCombination::from(q_var);
             }
         }
         cs.constrain(expected - LinearCombination::from(e_vars[degree]));
@@ -292,11 +291,15 @@ fn eval_sum_relation_gadget<CS: ConstraintSystem>(
         let mut recurrence = LinearCombination::from(e_vars[m + hash_count]);
         for coeff_index in 0..hash_count {
             let mut coeff_lc = LinearCombination::default();
-            for (y_deg, z_var) in z_vars.iter().copied().enumerate() {
+            for (y_deg, z_var) in z_vars.iter().enumerate() {
                 let coeff = char_coeffs[coeff_index][y_deg];
-                if coeff != Scalar::zero() {
-                    coeff_lc = coeff_lc + coeff * LinearCombination::from(z_var);
+                if coeff == Scalar::zero() {
+                    continue;
                 }
+                coeff_lc = match z_var {
+                    Some(z_var) => coeff_lc + coeff * LinearCombination::from(*z_var),
+                    None => coeff_lc + coeff,
+                };
             }
             let (_, _, prod) =
                 cs.multiply(coeff_lc, LinearCombination::from(e_vars[m + coeff_index]));
@@ -332,11 +335,6 @@ fn prove_eval_sum_with_openings<R: CryptoRng + RngCore>(
             description: "mask r must be non-zero".to_string(),
         });
     }
-    if e_vals[0] != r * Scalar::from(hash_count as u64) {
-        return Err(R1CSError::GadgetError {
-            description: "e_0 must equal r times hash_count".to_string(),
-        });
-    }
 
     let mut transcript = Transcript::new(b"I-PSI-CA::bf_eval_sum_v1");
     let mut prover = Prover::new(pc_gens, &mut transcript);
@@ -349,60 +347,22 @@ fn prove_eval_sum_with_openings<R: CryptoRng + RngCore>(
         e_vars.push(var);
     }
 
-    let mut q_vals = Vec::with_capacity(e_vals.len());
-    let mut q = e_vals[0];
-    q_vals.push(q);
-    for _ in 1..hash_count {
-        q *= y;
-        q_vals.push(q);
-    }
-    let mut q_comms = Vec::with_capacity(q_vals.len());
-    let mut q_vars = Vec::with_capacity(q_vals.len());
-    for q_val in q_vals {
-        let (comm, var) = prover.commit(q_val, Scalar::random(rng));
-        q_comms.push(comm);
-        q_vars.push(var);
-    }
-
-    let mut z_vals = Vec::with_capacity(hash_count + 1);
-    let mut z = Scalar::one();
-    z_vals.push(z);
-    for _ in 0..hash_count {
-        z *= y;
-        z_vals.push(z);
-    }
-    let mut z_comms = Vec::with_capacity(z_vals.len());
-    let mut z_vars = Vec::with_capacity(z_vals.len());
-    for z_val in z_vals {
-        let (comm, var) = prover.commit(z_val, Scalar::random(rng));
-        z_comms.push(comm);
-        z_vars.push(var);
-    }
-
     let y_blind = Scalar::random(rng);
     let (y_comm, y_var) = prover.commit(y, y_blind);
 
-    let (inv_e0_comm, inv_e0_var) = prover.commit(e_vals[0].invert(), Scalar::random(rng));
+    let (r_comm, r_var) = prover.commit(r, Scalar::random(rng));
+    let (inv_r_comm, inv_r_var) = prover.commit(r.invert(), Scalar::random(rng));
 
-    eval_sum_relation_gadget(
-        &mut prover,
-        &e_vars,
-        &q_vars,
-        &z_vars,
-        y_var,
-        hash_count,
-        inv_e0_var,
-    )?;
+    eval_sum_relation_gadget(&mut prover, &e_vars, y_var, r_var, hash_count, inv_r_var)?;
 
     let proof = prover.prove(bp_gens)?;
     Ok((
         EvalSumProof {
             proof,
             e_comms,
-            q_comms,
-            z_comms,
             y_comm,
-            inv_e0_comm,
+            r_comm,
+            inv_r_comm,
         },
         y_blind,
     ))
@@ -427,31 +387,12 @@ fn verify_eval_sum(
         .copied()
         .map(|comm| verifier.commit(comm))
         .collect();
-    let q_vars: Vec<_> = proof
-        .q_comms
-        .iter()
-        .copied()
-        .map(|comm| verifier.commit(comm))
-        .collect();
-    let z_vars: Vec<_> = proof
-        .z_comms
-        .iter()
-        .copied()
-        .map(|comm| verifier.commit(comm))
-        .collect();
     let y_var = verifier.commit(proof.y_comm);
-    let inv_e0_var = verifier.commit(proof.inv_e0_comm);
+    let r_var = verifier.commit(proof.r_comm);
+    let inv_r_var = verifier.commit(proof.inv_r_comm);
 
-    eval_sum_relation_gadget(
-        &mut verifier,
-        &e_vars,
-        &q_vars,
-        &z_vars,
-        y_var,
-        hash_count,
-        inv_e0_var,
-    )
-    .map_err(|e| format!("BF Bulletproof gadget invalid: {e:?}"))?;
+    eval_sum_relation_gadget(&mut verifier, &e_vars, y_var, r_var, hash_count, inv_r_var)
+        .map_err(|e| format!("BF Bulletproof gadget invalid: {e:?}"))?;
 
     verifier
         .verify(&proof.proof, pc_gens, bp_gens)
@@ -481,11 +422,11 @@ fn weighted_ciphertext_sum(
         return Err("ciphertext/weight length mismatch".to_string());
     }
 
-    let zero = ct_scalar_mul(&coeff_cts[0], &Scalar::zero());
-    Ok(coeff_cts
+    let init = ct_scalar_mul(&coeff_cts[0], &weights[0]);
+    Ok(coeff_cts[1..]
         .iter()
-        .zip(weights.iter())
-        .fold(zero, |acc, (ct, weight)| {
+        .zip(weights[1..].iter())
+        .fold(init, |acc, (ct, weight)| {
             ct_add(&acc, &ct_scalar_mul(ct, weight))
         }))
 }
@@ -512,7 +453,6 @@ pub(crate) fn build_aggregate_eval_witness(
         },
     );
     Ok(AggregateEvalWitness {
-        positions,
         e_vals,
         scaled_eval,
     })
@@ -535,14 +475,8 @@ fn glue_transcript(
     for comm in &eval_proof.e_comms {
         append_compressed(&mut t, b"e_comm", comm);
     }
-    for comm in &eval_proof.q_comms {
-        append_compressed(&mut t, b"q_comm", comm);
-    }
-    for comm in &eval_proof.z_comms {
-        append_compressed(&mut t, b"z_comm", comm);
-    }
     append_compressed(&mut t, b"y_comm", &eval_proof.y_comm);
-    append_compressed(&mut t, b"inv_e0_comm", &eval_proof.inv_e0_comm);
+    append_compressed(&mut t, b"r_comm", &eval_proof.r_comm);
     t.append_message(b"r1cs", &eval_proof.proof.to_bytes());
     t
 }
@@ -583,14 +517,8 @@ fn append_glue_section(
     for comm in &eval_proof.e_comms {
         append_compressed(t, b"e_comm", comm);
     }
-    for comm in &eval_proof.q_comms {
-        append_compressed(t, b"q_comm", comm);
-    }
-    for comm in &eval_proof.z_comms {
-        append_compressed(t, b"z_comm", comm);
-    }
     append_compressed(t, b"y_comm", &eval_proof.y_comm);
-    append_compressed(t, b"inv_e0_comm", &eval_proof.inv_e0_comm);
+    append_compressed(t, b"r_comm", &eval_proof.r_comm);
     t.append_message(b"r1cs", &eval_proof.proof.to_bytes());
     t.append_message(b"beta_y", &beta_y.to_bytes());
     t.append_message(b"beta_c1", &beta_c1.to_bytes());
@@ -892,10 +820,9 @@ impl WireEvalSumProof {
         Self {
             proof_bytes: p.proof.to_bytes(),
             e_comms: p.e_comms.iter().map(|c| c.to_bytes()).collect(),
-            q_comms: p.q_comms.iter().map(|c| c.to_bytes()).collect(),
-            z_comms: p.z_comms.iter().map(|c| c.to_bytes()).collect(),
             y_comm: p.y_comm.to_bytes(),
-            inv_e0_comm: p.inv_e0_comm.to_bytes(),
+            r_comm: p.r_comm.to_bytes(),
+            inv_r_comm: p.inv_r_comm.to_bytes(),
         }
     }
 
@@ -908,18 +835,9 @@ impl WireEvalSumProof {
                 .iter()
                 .map(|b| CompressedRistretto::from_slice(b))
                 .collect(),
-            q_comms: self
-                .q_comms
-                .iter()
-                .map(|b| CompressedRistretto::from_slice(b))
-                .collect(),
-            z_comms: self
-                .z_comms
-                .iter()
-                .map(|b| CompressedRistretto::from_slice(b))
-                .collect(),
             y_comm: CompressedRistretto::from_slice(&self.y_comm),
-            inv_e0_comm: CompressedRistretto::from_slice(&self.inv_e0_comm),
+            r_comm: CompressedRistretto::from_slice(&self.r_comm),
+            inv_r_comm: CompressedRistretto::from_slice(&self.inv_r_comm),
         })
     }
 }

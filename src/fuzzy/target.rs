@@ -1,50 +1,21 @@
-//! Target's side of the exact I-PSI-CA protocol (Figure 2).
-//!
-//! # Role
-//! Holds a set `TSet ⊆ 𝔽`.  Encodes it as a polynomial whose roots are
-//! exactly the set elements, encrypts it under the joint public key, and
-//! outsources the ciphertext to the monitor.  For each subsequent round it
-//! verifies the monitor's proof and decides whether to increment its counter.
-//!
-//! # Network
-//! Runs as a **TCP server**; accepts one monitor connection and drives the
-//! protocol for an arbitrary number of rounds.
-//!
-//! # Module layout assumed
-//! ```text
-//! src/
-//!   crypto/elgamal.rs     ← ../Crypto/ElGamal.rs
-//!   crypto/bulletproof.rs ← ../Crypto/bulletproof.rs
-//!   exact/target.rs       ← this file
-//!   exact/monitor.rs
-//!   exact/wire.rs         ← shared wire types (defined here, re-exported)
-//! ```
-//!
-//! # Extra Cargo deps
-//! ```toml
-//! serde   = { version = "1", features = ["derive"] }
-//! bincode = "1"
-//! ```
-
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
-use bulletproofs::{BulletproofGens, PedersenGens};
-use curve25519_dalek_ng::ristretto::CompressedRistretto;
+use curve25519_dalek_ng::{
+    constants::RISTRETTO_BASEPOINT_TABLE,
+    ristretto::{CompressedRistretto, RistrettoPoint},
+};
 use curve25519_dalek_ng::scalar::Scalar;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::bulletproof as bp;
 use crate::crypto::elgamal::{
-    combine_public_keys, encrypt_one, encrypt_poly, encrypt_zero, rerandomize_poly_with_witness,
-    test_zero, Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare, SecretKeyShare,
+    combine_public_keys, encrypt_one, encrypt_zero, test_zero, Ciphertext, EncryptedPoly,
+    PublicKey, PublicKeyShare, SecretKeyShare,
 };
-use crate::crypto::sigma_bullet as sb;
+use crate::fuzzy::proof;
+use crate::fuzzy::target_proof::{self, WireTargetHybridProof};
 
-// ── Wire types (shared with Monitor) ─────────────────────────────────────────
-
-/// Serialisable ElGamal ciphertext: two 32-byte compressed Ristretto points.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireCiphertext {
     pub c1: [u8; 32],
@@ -53,11 +24,12 @@ pub struct WireCiphertext {
 
 impl WireCiphertext {
     pub fn from_native(ct: &Ciphertext) -> Self {
-        WireCiphertext {
+        Self {
             c1: ct.c1.compress().to_bytes(),
             c2: ct.c2.compress().to_bytes(),
         }
     }
+
     pub fn to_native(&self) -> Result<Ciphertext, String> {
         let c1 = CompressedRistretto::from_slice(&self.c1)
             .decompress()
@@ -69,254 +41,48 @@ impl WireCiphertext {
     }
 }
 
-/// Serialisable encrypted polynomial: a length-prefixed vector of wire ciphertexts.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireEncryptedPoly(pub Vec<WireCiphertext>);
 
 impl WireEncryptedPoly {
     pub fn from_native(p: &EncryptedPoly) -> Self {
-        WireEncryptedPoly(p.0.iter().map(WireCiphertext::from_native).collect())
+        Self(p.0.iter().map(WireCiphertext::from_native).collect())
     }
+
     pub fn to_native(&self) -> Result<EncryptedPoly, String> {
         let cts: Result<Vec<_>, _> = self.0.iter().map(|w| w.to_native()).collect();
         Ok(EncryptedPoly(cts?))
     }
 }
 
-/// Serialisable form of `bp::EvalChainProof`.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct WireEvalChainProof {
-    pub proof_bytes: Vec<u8>,
-    pub e_comms: Vec<[u8; 32]>,
-    pub y_comm: [u8; 32],
-    pub inv_en_comm: [u8; 32],
-}
-
-impl WireEvalChainProof {
-    pub fn from_proof(p: &bp::EvalChainProof) -> Self {
-        WireEvalChainProof {
-            proof_bytes: p.proof.to_bytes(),
-            e_comms: p.e_comms.iter().map(|c| c.to_bytes()).collect(),
-            y_comm: p.y_comm.to_bytes(),
-            inv_en_comm: p.inv_en_comm.to_bytes(),
-        }
-    }
-    pub fn to_proof(&self) -> Result<bp::EvalChainProof, String> {
-        use bulletproofs::r1cs::R1CSProof;
-        let proof = R1CSProof::from_bytes(&self.proof_bytes)
-            .map_err(|e| format!("R1CSProof decode: {e:?}"))?;
-        let e_comms: Vec<_> = self
-            .e_comms
-            .iter()
-            .map(|b| CompressedRistretto::from_slice(b))
-            .collect();
-        let y_comm = CompressedRistretto::from_slice(&self.y_comm);
-        let inv_en_comm = CompressedRistretto::from_slice(&self.inv_en_comm);
-        Ok(bp::EvalChainProof {
-            proof,
-            e_comms,
-            y_comm,
-            inv_en_comm,
-        })
-    }
-}
-
-/// The monitor's ZKPoK composed of two Bulletproof R1CS sub-proofs.
-///
-/// **power_chain**: proves `[y^n, y^{n-1}, …, y, 1]` is geometric with ratio `y`
-/// (binds the evaluation to a single consistent input point).
-///
-/// **mask_nonzero**: proves `mask ≠ 0` via the n=0 eval-chain gadget
-/// (just the inverse-exists gate: `mask · mask⁻¹ = 1`).
-///
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct WireMonitorProof {
-    pub power_chain: WireEvalChainProof,
-    pub mask_nonzero: WireEvalChainProof,
-}
-
-/// Serialisable form of `sigma_bullet::GlueProof`.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct WireGlueProof {
-    pub alpha_tag: [u8; 32],
-    pub a_t: [u8; 32],
-    pub z_e: Vec<[u8; 32]>,
-    pub z_alpha: [u8; 32],
-    pub z_y_blind: [u8; 32],
-}
-
-impl WireGlueProof {
-    pub fn from_proof(p: &sb::GlueProof) -> Self {
-        WireGlueProof {
-            alpha_tag: p.alpha_tag.to_bytes(),
-            a_t: p.a_t.to_bytes(),
-            z_e: p.z_e.iter().map(|s| s.to_bytes()).collect(),
-            z_alpha: p.z_alpha.to_bytes(),
-            z_y_blind: p.z_y_blind.to_bytes(),
-        }
-    }
-
-    pub fn to_proof(&self) -> Result<sb::GlueProof, String> {
-        let z_e: Result<Vec<_>, _> = self
-            .z_e
-            .iter()
-            .map(|b| Scalar::from_canonical_bytes(*b).ok_or("z_e: non-canonical scalar"))
-            .collect();
-        Ok(sb::GlueProof {
-            alpha_tag: CompressedRistretto::from_slice(&self.alpha_tag),
-            a_t: CompressedRistretto::from_slice(&self.a_t),
-            z_e: z_e?,
-            z_alpha: Scalar::from_canonical_bytes(self.z_alpha)
-                .ok_or("z_alpha: non-canonical scalar")?,
-            z_y_blind: Scalar::from_canonical_bytes(self.z_y_blind)
-                .ok_or("z_y_blind: non-canonical scalar")?,
-        })
-    }
-}
-
-/// Serialisable form of `sigma_bullet::SigmaBulletProof`.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct WireSigmaBulletProof {
-    pub chain_proof: WireEvalChainProof,
-    pub glue: WireGlueProof,
-}
-
-impl WireSigmaBulletProof {
-    pub fn from_proof(p: &sb::SigmaBulletProof) -> Self {
-        WireSigmaBulletProof {
-            chain_proof: WireEvalChainProof::from_proof(&p.chain_proof),
-            glue: WireGlueProof::from_proof(&p.glue),
-        }
-    }
-
-    pub fn to_proof(&self) -> Result<sb::SigmaBulletProof, String> {
-        Ok(sb::SigmaBulletProof {
-            chain_proof: self.chain_proof.to_proof()?,
-            glue: self.glue.to_proof()?,
-        })
-    }
-}
-
-/// Serialisable form of the full combined round proof.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct WireCombinedSigmaProof {
-    pub chain_proof: WireEvalChainProof,
-    pub alpha_tag: [u8; 32],
-    pub glue_a_t: [u8; 32],
-    pub glue_z_e: Vec<[u8; 32]>,
-    pub glue_z_alpha: [u8; 32],
-    pub glue_z_y_blind: [u8; 32],
-    pub partial_a: [u8; 32],
-    pub partial_z1: [u8; 32],
-    pub partial_z2: [u8; 32],
-    pub accum_partial_a: [u8; 32],
-    pub accum_partial_z1: [u8; 32],
-    pub accum_partial_z2: [u8; 32],
-    pub accum_mul_a1: [u8; 32],
-    pub accum_mul_a2: [u8; 32],
-    pub accum_mul_a_m: [u8; 32],
-    pub accum_mul_s_y: [u8; 32],
-}
-
-impl WireCombinedSigmaProof {
-    pub fn from_proof(p: &sb::CombinedSigmaProof) -> Self {
-        WireCombinedSigmaProof {
-            chain_proof: WireEvalChainProof::from_proof(&p.chain_proof),
-            alpha_tag: p.alpha_tag.to_bytes(),
-            glue_a_t: p.glue_a_t.to_bytes(),
-            glue_z_e: p.glue_z_e.iter().map(|s| s.to_bytes()).collect(),
-            glue_z_alpha: p.glue_z_alpha.to_bytes(),
-            glue_z_y_blind: p.glue_z_y_blind.to_bytes(),
-            partial_a: p.partial_a.to_bytes(),
-            partial_z1: p.partial_z1.to_bytes(),
-            partial_z2: p.partial_z2.to_bytes(),
-            accum_partial_a: p.accum_partial_a.to_bytes(),
-            accum_partial_z1: p.accum_partial_z1.to_bytes(),
-            accum_partial_z2: p.accum_partial_z2.to_bytes(),
-            accum_mul_a1: p.accum_mul_a1.to_bytes(),
-            accum_mul_a2: p.accum_mul_a2.to_bytes(),
-            accum_mul_a_m: p.accum_mul_a_m.to_bytes(),
-            accum_mul_s_y: p.accum_mul_s_y.to_bytes(),
-        }
-    }
-
-    pub fn to_proof(&self) -> Result<sb::CombinedSigmaProof, String> {
-        let glue_z_e: Result<Vec<_>, _> = self
-            .glue_z_e
-            .iter()
-            .map(|b| Scalar::from_canonical_bytes(*b).ok_or("glue_z_e: non-canonical scalar"))
-            .collect();
-        Ok(sb::CombinedSigmaProof {
-            chain_proof: self.chain_proof.to_proof()?,
-            alpha_tag: CompressedRistretto::from_slice(&self.alpha_tag),
-            glue_a_t: CompressedRistretto::from_slice(&self.glue_a_t),
-            glue_z_e: glue_z_e?,
-            glue_z_alpha: Scalar::from_canonical_bytes(self.glue_z_alpha)
-                .ok_or("glue_z_alpha: non-canonical scalar")?,
-            glue_z_y_blind: Scalar::from_canonical_bytes(self.glue_z_y_blind)
-                .ok_or("glue_z_y_blind: non-canonical scalar")?,
-            partial_a: CompressedRistretto::from_slice(&self.partial_a),
-            partial_z1: Scalar::from_canonical_bytes(self.partial_z1)
-                .ok_or("partial_z1: non-canonical scalar")?,
-            partial_z2: Scalar::from_canonical_bytes(self.partial_z2)
-                .ok_or("partial_z2: non-canonical scalar")?,
-            accum_partial_a: CompressedRistretto::from_slice(&self.accum_partial_a),
-            accum_partial_z1: Scalar::from_canonical_bytes(self.accum_partial_z1)
-                .ok_or("accum_partial_z1: non-canonical scalar")?,
-            accum_partial_z2: Scalar::from_canonical_bytes(self.accum_partial_z2)
-                .ok_or("accum_partial_z2: non-canonical scalar")?,
-            accum_mul_a1: CompressedRistretto::from_slice(&self.accum_mul_a1),
-            accum_mul_a2: CompressedRistretto::from_slice(&self.accum_mul_a2),
-            accum_mul_a_m: CompressedRistretto::from_slice(&self.accum_mul_a_m),
-            accum_mul_s_y: Scalar::from_canonical_bytes(self.accum_mul_s_y)
-                .ok_or("accum_mul_s_y: non-canonical scalar")?,
-        })
-    }
-}
-
-// ── Protocol messages ─────────────────────────────────────────────────────────
-
-/// Target → Monitor messages.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum TargetToMonitor {
-    /// Initial outsource: the encrypted T-polynomial ciphertext.
-    Outsource {
-        t_poly_ct: WireEncryptedPoly,
-        accum: WireEncryptedPoly,
+    Outsource { accum: WireEncryptedPoly },
+    NextRound {
+        masked_distances: Vec<WireCiphertext>,
+        masked_distance_proofs: Vec<WireTargetHybridProof>,
+        target_compute_proof_ms: f64,
     },
-    /// Next-round ciphertext (re-randomised; either updated or the same poly).
-    NextRound { accum: WireEncryptedPoly },
-    /// Monitor's proof was rejected; contains a debug reason string.
-    Reject { reason: String },
+    Reject {
+        reason: String,
+        target_compute_proof_ms: f64,
+    },
 }
 
-/// Monitor → Target message (one per round).
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MonitorToTarget {
-    /// `nextAccum = MElmt · Accum`.
     pub next_accum: WireEncryptedPoly,
-    /// `accum_scaled_eval = accum_mask · THEval[pk](Accum, MElmt)` — the
-    /// ciphertext fed into partial decryption for the accumulated polynomial.
-    pub accum_scaled_eval: WireCiphertext,
-    /// `accum_m_poly_ctext = THDec[sk2](accum_scaled_eval)`.
-    pub accum_m_poly_ctext: WireCiphertext,
-    /// `scaled_eval = mask · THEval[pk](TPolyCtext, MElmt)` — the ciphertext
-    /// fed into partial decryption; needed by the target to verify the sigma proof.
-    pub scaled_eval: WireCiphertext,
-    /// `MPolyCtext = THDec[sk2](scaled_eval)`.
-    pub m_poly_ctext: WireCiphertext,
-    /// One composite proof covering encrypted evaluation, partial decryption,
-    /// and accumulated-polynomial update under a shared Fiat-Shamir challenge.
-    pub round_proof: WireCombinedSigmaProof,
+    /// Threshold-partially-decrypted accumulated evaluation in `THCtextSpace[pk1]`.
+    pub accum_eval: WireCiphertext,
+    pub encrypted_input_bits: Vec<WireCiphertext>,
+    /// Placeholder until the fuzzy proof system is wired in.
+    pub proof: Vec<u8>,
 }
-
-// ── Framed TCP helpers ────────────────────────────────────────────────────────
 
 pub fn send_msg<T: Serialize>(stream: &mut TcpStream, msg: &T) -> io::Result<()> {
     let bytes =
         bincode::serialize(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let len = (bytes.len() as u32).to_be_bytes();
-    // Write length prefix and payload in a single syscall via vectored I/O.
     let mut bufs: &mut [IoSlice<'_>] = &mut [IoSlice::new(&len), IoSlice::new(&bytes)];
     let total = len.len() + bytes.len();
     let mut written = 0;
@@ -336,85 +102,49 @@ pub fn recv_msg<T: for<'de> Deserialize<'de>>(stream: &mut TcpStream) -> io::Res
     bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-// ── Polynomial utilities ──────────────────────────────────────────────────────
-
-/// Build the monic polynomial `P(X) = ∏_{t ∈ roots} (X − t)`.
-///
-/// Returns `[a_0, a_1, …, a_n]` where `a_d` is the coefficient of `X^d`.
-pub fn poly_from_roots(roots: &[Scalar]) -> Vec<Scalar> {
-    // Start from polynomial "1" (constant) and multiply in each linear factor
-    // in-place, walking the coefficient vector backwards to avoid a clone.
-    let mut coeffs = Vec::with_capacity(roots.len() + 1);
-    coeffs.push(Scalar::one());
-    for root in roots {
-        let n = coeffs.len();
-        // The new leading coefficient (degree n) equals the old leading
-        // coefficient (degree n-1) — copy it before the in-place updates below
-        // overwrite it.
-        let leading = *coeffs.last().unwrap();
-        coeffs.push(leading); // extend for the new degree-n term
-        for d in (1..n).rev() {
-            coeffs[d] = coeffs[d - 1] - root * coeffs[d]; // middle terms
-        }
-        coeffs[0] *= -root; // constant term
-    }
-    coeffs
-}
-
-// ── Target ────────────────────────────────────────────────────────────────────
-
 pub struct Target {
-    t_set: Vec<Scalar>,
+    _t_set: Vec<Scalar>,
+    _encoded_t_set: Vec<Vec<Scalar>>,
     accum_degree: usize,
     sk1: SecretKeyShare,
     pk1: PublicKeyShare,
     pk2: PublicKeyShare,
     pk: PublicKey,
-    /// Matching counter, incremented on each genuine match.
-    pub state: u64,
-    pc_gens: PedersenGens,
-    bp_gens: BulletproofGens,
+    monitor_pk: PublicKey,
+    vector_size: usize,
 }
 
 impl Target {
-    /// Construct a Target from its secret key share and the public parameters.
     pub fn new(
         t_set: Vec<Scalar>,
         accum_degree: usize,
         sk1: SecretKeyShare,
         pk1: PublicKeyShare,
         pk2: PublicKeyShare,
+        monitor_pk: PublicKey,
+        vector_size: usize,
     ) -> Self {
-        let pk = combine_public_keys(&pk1, &pk2);
-        // Choose BP generator capacity ≥ 2·(|TSet|+2) rounded up to a power of two.
-        let n = t_set.len() + 2;
-        let cap = 1usize << (usize::BITS - (2 * n).leading_zeros()) as usize;
-        let cap = cap.max(64);
-        Target {
-            t_set,
+        let encoded_t_set = t_set
+            .iter()
+            .map(|item| encode_scalar_bits(item, vector_size))
+            .collect();
+        Self {
+            _t_set: t_set,
+            _encoded_t_set: encoded_t_set,
             accum_degree,
             sk1,
             pk1,
             pk2,
-            pk,
-            state: 0,
-            pc_gens: PedersenGens::default(),
-            bp_gens: BulletproofGens::new(cap, 1),
+            pk: combine_public_keys(&pk1, &pk2),
+            monitor_pk,
+            vector_size,
         }
     }
 
-    // ── Setup ─────────────────────────────────────────────────────────────────
-
-    /// `THEnc[pk](T-poly)`: construct P(X) from TSet and encrypt.
-    fn build_poly_ctext(&self, rng: &mut OsRng) -> EncryptedPoly {
-        let coeffs = poly_from_roots(&self.t_set);
-        encrypt_poly(rng, &self.pk, &coeffs)
-    }
-
-    /// Build the initial accumulated polynomial ciphertext:
-    /// an encryption of the constant polynomial `1`, padded with encrypted `0`s
-    /// through the configured accumulated-polynomial degree.
-    fn build_accum_ctext(&self, rng: &mut OsRng) -> EncryptedPoly {
+    pub(crate) fn build_accum_ctext<R: rand::CryptoRng + rand::RngCore>(
+        &self,
+        rng: &mut R,
+    ) -> EncryptedPoly {
         let mut coeffs = Vec::with_capacity(self.accum_degree + 1);
         coeffs.push(encrypt_one(rng, &self.pk));
         while coeffs.len() < self.accum_degree + 1 {
@@ -423,73 +153,57 @@ impl Target {
         EncryptedPoly(coeffs)
     }
 
-    // ── Protocol round ────────────────────────────────────────────────────────
-
-    /// One complete round: verify proof, test match, produce next accumulated ciphertext.
-    ///
-    /// Returns `(next_accum, is_match)`.
     pub(crate) fn process_round(
         &mut self,
         rng: &mut OsRng,
-        current: &EncryptedPoly,
         current_accum: &EncryptedPoly,
         msg: &MonitorToTarget,
-    ) -> Result<(EncryptedPoly, bool), String> {
+    ) -> Result<(EncryptedPoly, Vec<Ciphertext>, Vec<WireTargetHybridProof>), String> {
         let next_accum = msg.next_accum.to_native()?;
-        let _accum_scaled_eval = msg.accum_scaled_eval.to_native()?;
-        let accum_m_poly_ct = msg.accum_m_poly_ctext.to_native()?;
-        let scaled_eval = msg.scaled_eval.to_native()?;
-        let m_poly_ct = msg.m_poly_ctext.to_native()?;
+        let accum_eval = msg.accum_eval.to_native()?;
 
         if next_accum.0.len() != current_accum.0.len() {
             return Err("next_accum length mismatch".to_string());
         }
-
-        // T.1  Verify the Sigma-Bullet glue proof for encrypted evaluation.
-        let round_proof = msg.round_proof.to_proof()?;
-        sb::verify_round(
-            &self.pc_gens,
-            &self.bp_gens,
+        if msg.encrypted_input_bits.len() != self.vector_size {
+            return Err("encrypted_input_bits length mismatch".to_string());
+        }
+        let encrypted_input_bits: Result<Vec<_>, _> =
+            msg.encrypted_input_bits.iter().map(|ct| ct.to_native()).collect();
+        let encrypted_input_bits = encrypted_input_bits?;
+        proof::verify_round(
+            &msg.proof,
+            &self.monitor_pk,
             &self.pk,
             &self.pk1,
             &self.pk2,
-            &current.0,
-            &scaled_eval,
-            &m_poly_ct,
-            &_accum_scaled_eval,
-            &accum_m_poly_ct,
             current_accum,
             &next_accum,
-            &round_proof,
-        )
-        .map_err(|e| format!("round proof invalid: {e}"))?;
-
-        // T.2  THTest[sk1]{0}{MPolyCtext}:
-        //      MPolyCtext was partially decrypted by the monitor (THDec[sk2]),
-        //      so it lives in THCtextSpace[pk1].  test_zero finishes the job.
-        let is_match = test_zero(&self.sk1, &m_poly_ct);
-        let accum_is_nonzero = !test_zero(&self.sk1, &accum_m_poly_ct);
-        let should_advance = is_match && accum_is_nonzero;
-
-        // T.3  Advance the accumulated polynomial only when the accum witness
-        //      stays non-zero and the membership test matched.
-        let base_accum = if should_advance {
-            self.state += 1;
-            &next_accum
-        } else {
-            current_accum
-        };
-        let (rerand_accum, _) = rerandomize_poly_with_witness(rng, &self.pk, base_accum);
-        if rerand_accum.0.len() != current_accum.0.len() {
-            return Err("rerandomized accum length mismatch".to_string());
+            &accum_eval,
+            &encrypted_input_bits,
+        )?;
+        if test_zero(&self.sk1, &accum_eval) {
+            return Err("accum_eval decrypts to 0".to_string());
         }
 
-        Ok((rerand_accum, is_match))
+        let masked_distances = self
+            ._encoded_t_set
+            .iter()
+            .map(|encoded_x| {
+                masked_distance_with_proof_for_item(
+                    rng,
+                    &self.monitor_pk,
+                    encoded_x,
+                    &encrypted_input_bits,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (masked_distances, masked_distance_proofs): (Vec<_>, Vec<_>) =
+            masked_distances.into_iter().unzip();
+
+        Ok((next_accum, masked_distances, masked_distance_proofs))
     }
 
-    // ── TCP server ────────────────────────────────────────────────────────────
-
-    /// Bind to `addr`, accept one monitor, and run the protocol.
     pub fn run(&mut self, addr: &str) -> io::Result<()> {
         let listener = TcpListener::bind(addr)?;
         eprintln!("[Target] Listening on {addr}");
@@ -500,47 +214,62 @@ impl Target {
 
     fn handle(&mut self, mut s: TcpStream) -> io::Result<()> {
         let mut rng = OsRng;
-
-        // Outsource: encrypt the T-polynomial and send it to the monitor.
         let t_outsource_start = std::time::Instant::now();
-        let current = self.build_poly_ctext(&mut rng);
         let mut current_accum = self.build_accum_ctext(&mut rng);
         send_msg(
             &mut s,
             &TargetToMonitor::Outsource {
-                t_poly_ct: WireEncryptedPoly::from_native(&current),
                 accum: WireEncryptedPoly::from_native(&current_accum),
             },
         )?;
         let outsource_ms = t_outsource_start.elapsed().as_secs_f64() * 1000.0;
         eprintln!("[Target] Outsource Time (compute -> send): {outsource_ms:.3} ms");
-        eprintln!("[Target] Sent TPolyCtext (deg {})", self.t_set.len());
+        eprintln!("[Target] Sent initial accum ciphertext (deg {})", self.accum_degree);
 
-        // Main loop: one iteration per monitor submission.
         loop {
             let msg: MonitorToTarget = match recv_msg(&mut s) {
                 Ok(m) => m,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    eprintln!("[Target] Done. state = {}", self.state);
+                    eprintln!("[Target] Done.");
                     return Ok(());
                 }
                 Err(e) => return Err(e),
             };
 
-            match self.process_round(&mut rng, &current, &current_accum, &msg) {
-                Ok((next_accum, matched)) => {
-                    eprintln!("[Target] match={matched}  state={}", self.state);
+            let target_round_start = std::time::Instant::now();
+            match self.process_round(&mut rng, &current_accum, &msg) {
+                Ok((next_accum, masked_distances, masked_distance_proofs)) => {
+                    let target_compute_proof_ms =
+                        target_round_start.elapsed().as_secs_f64() * 1000.0;
                     current_accum = next_accum;
+                    eprintln!(
+                        "[Target] Accepted fuzzy round update, produced {} masked distances in {:.3} ms",
+                        masked_distances.len(),
+                        target_compute_proof_ms
+                    );
                     send_msg(
                         &mut s,
                         &TargetToMonitor::NextRound {
-                            accum: WireEncryptedPoly::from_native(&current_accum),
+                            masked_distances: masked_distances
+                                .iter()
+                                .map(WireCiphertext::from_native)
+                                .collect(),
+                            masked_distance_proofs,
+                            target_compute_proof_ms,
                         },
                     )?;
                 }
                 Err(reason) => {
+                    let target_compute_proof_ms =
+                        target_round_start.elapsed().as_secs_f64() * 1000.0;
                     eprintln!("[Target] Reject: {reason}");
-                    send_msg(&mut s, &TargetToMonitor::Reject { reason })?;
+                    send_msg(
+                        &mut s,
+                        &TargetToMonitor::Reject {
+                            reason,
+                            target_compute_proof_ms,
+                        },
+                    )?;
                     return Ok(());
                 }
             }
@@ -548,191 +277,261 @@ impl Target {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
+fn encode_scalar_bits(input: &Scalar, vector_size: usize) -> Vec<Scalar> {
+    let bytes = input.to_bytes();
+    let mut bits = Vec::with_capacity(vector_size);
+    for bit_idx in 0..vector_size {
+        let bit = if bit_idx < bytes.len() * 8 {
+            let byte = bytes[bit_idx / 8];
+            ((byte >> (bit_idx % 8)) & 1) as u64
+        } else {
+            0
+        };
+        bits.push(Scalar::from(bit));
+    }
+    bits
+}
+
+fn masked_distance_with_proof_for_item<R: rand::CryptoRng + rand::RngCore>(
+    rng: &mut R,
+    monitor_pk: &PublicKey,
+    encoded_x: &[Scalar],
+    encrypted_y: &[Ciphertext],
+) -> Result<(Ciphertext, WireTargetHybridProof), String> {
+    if encoded_x.len() != encrypted_y.len() {
+        return Err("masked distance witness length mismatch".to_string());
+    }
+
+    let mut acc = Ciphertext {
+        c1: RistrettoPoint::default(),
+        c2: RistrettoPoint::default(),
+    };
+    let mut bit_randomness = Vec::with_capacity(encoded_x.len());
+    for (x_j, y_j) in encoded_x.iter().zip(encrypted_y.iter()) {
+        let x_r = Scalar::random(rng);
+        bit_randomness.push(x_r);
+        let enc_x = encrypt_with_randomness(monitor_pk, x_j, x_r);
+        let coeff = Scalar::one() - Scalar::from(2u64) * *x_j;
+        acc.c1 += enc_x.c1 + coeff * y_j.c1;
+        acc.c2 += enc_x.c2 + coeff * y_j.c2;
+    }
+
+    let u = Scalar::random(rng);
+    let u_r = Scalar::random(rng);
+    let z = Scalar::random(rng);
+    let enc_u = encrypt_with_randomness(monitor_pk, &u, u_r);
+    let ciphertext = Ciphertext {
+        c1: z * acc.c1 + enc_u.c1,
+        c2: z * acc.c2 + enc_u.c2,
+    };
+
+    let (pc_gens, bp_gens) = target_proof::default_gens(encoded_x.len());
+    let proof = target_proof::prove(
+        rng,
+        &pc_gens,
+        &bp_gens,
+        monitor_pk,
+        &ciphertext,
+        encrypted_y,
+        encoded_x,
+        &bit_randomness,
+        z,
+        u,
+        u_r,
+    )?;
+
+    Ok((ciphertext, WireTargetHybridProof::from_native(&proof)))
+}
+
+fn encrypt_with_randomness(pk: &PublicKey, msg: &Scalar, r: Scalar) -> Ciphertext {
+    Ciphertext {
+        c1: &r * &RISTRETTO_BASEPOINT_TABLE,
+        c2: msg * &RISTRETTO_BASEPOINT_TABLE + r * pk.0,
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::elgamal::generate_key_share;
-    use crate::crypto::elgamal::{ct_add, ct_scalar_mul, eval_poly, poly_scalar_mul};
+    use crate::crypto::elgamal::{
+        ct_add, ct_scalar_mul, eval_poly, generate_key_share, partial_decrypt_with_witness,
+        poly_scalar_mul,
+    };
+    use crate::fuzzy::proof;
+    use curve25519_dalek_ng::constants::RISTRETTO_BASEPOINT_TABLE;
 
-    /// Verify that `poly_from_roots` evaluates to zero at each root.
-    #[test]
-    fn test_poly_roots_eval_zero() {
-        let roots = [Scalar::from(2u64), Scalar::from(5u64), Scalar::from(11u64)];
-        let coeffs = poly_from_roots(&roots);
-        for r in &roots {
-            // Horner evaluation.
-            let mut val = *coeffs.last().unwrap();
-            for c in coeffs[..coeffs.len() - 1].iter().rev() {
-                val = val * r + c;
+    fn non_zero_scalar(rng: &mut OsRng) -> Scalar {
+        loop {
+            let s = Scalar::random(rng);
+            if s != Scalar::zero() {
+                return s;
             }
-            assert_eq!(val, Scalar::zero(), "P({r:?}) must be zero");
         }
     }
 
-    /// End-to-end test of one matched round using in-process crypto.
-    #[test]
-    fn test_process_round_match() {
-        use crate::crypto::elgamal::partial_decrypt_with_witness;
-        use crate::crypto::sigma_bullet as sb_mod;
-        use curve25519_dalek_ng::constants::RISTRETTO_BASEPOINT_POINT as G;
+    fn encrypt_with_randomness(pk: &PublicKey, msg: &Scalar, r: Scalar) -> Ciphertext {
+        Ciphertext {
+            c1: &r * &RISTRETTO_BASEPOINT_TABLE,
+            c2: msg * &RISTRETTO_BASEPOINT_TABLE + r * pk.0,
+        }
+    }
 
+    fn mask_eval(pk: &PublicKey, eval_ct: Ciphertext, mask: Scalar) -> Ciphertext {
+        let scaled_no_blind = ct_scalar_mul(&eval_ct, &mask);
+        let enc_zero_mask = Ciphertext {
+            c1: &mask * &RISTRETTO_BASEPOINT_TABLE,
+            c2: mask * pk.0,
+        };
+        ct_add(&scaled_no_blind, &enc_zero_mask)
+    }
+
+    #[test]
+    fn test_process_round_accepts_message() {
         let mut rng = OsRng;
         let (sk1, pk1) = generate_key_share(&mut rng);
         let (sk2, pk2) = generate_key_share(&mut rng);
-
-        let t_set = vec![Scalar::from(7u64), Scalar::from(42u64)];
-        let mut target = Target::new(t_set.clone(), 5, sk1, pk1, pk2.clone());
-        let poly_ct = target.build_poly_ctext(&mut rng);
+        let (_monitor_sk, monitor_pk_share) = generate_key_share(&mut rng);
+        let monitor_pk = PublicKey(monitor_pk_share.0);
+        let mut target = Target::new(
+            vec![Scalar::from(11u64), Scalar::from(13u64)],
+            5,
+            sk1,
+            pk1.clone(),
+            pk2,
+            monitor_pk,
+            12,
+        );
         let accum_ct = target.build_accum_ctext(&mut rng);
-
-        // Monitor side: MElmt = 7 (is a root).
         let m = Scalar::from(7u64);
         let next_accum = poly_scalar_mul(&accum_ct, &m);
-        let accum_eval = eval_poly(&accum_ct, &m);
-        let eval_ct = eval_poly(&poly_ct, &m);
-        let accum_mask = Scalar::from(29u64);
-        let accum_scaled_no_blind = ct_scalar_mul(&accum_eval, &accum_mask);
-        let accum_enc_zero_mask = Ciphertext {
-            c1: accum_mask * G,
-            c2: accum_mask * target.pk.0,
-        };
-        let accum_scaled = ct_add(&accum_scaled_no_blind, &accum_enc_zero_mask);
-        let (accum_m_poly_ct, _accum_r_prime) =
-            partial_decrypt_with_witness(&mut rng, &sk2, &target.pk1, &accum_scaled);
-        let mask = Scalar::from(13u64);
-        let scaled_no_blind = ct_scalar_mul(&eval_ct, &mask);
-        let enc_zero_mask = Ciphertext {
-            c1: mask * G,
-            c2: mask * target.pk.0,
-        };
-        let scaled = ct_add(&scaled_no_blind, &enc_zero_mask);
-        let (m_poly_ct, r_prime) =
-            partial_decrypt_with_witness(&mut rng, &sk2, &target.pk1, &scaled);
-
-        let round_proof = sb_mod::prove_round(
+        let accum_eval_joint = eval_poly(&accum_ct, &m);
+        let accum_mask = non_zero_scalar(&mut rng);
+        let accum_scaled_eval = mask_eval(&target.pk, accum_eval_joint, accum_mask);
+        let (accum_eval, accum_r_prime) =
+            partial_decrypt_with_witness(&mut rng, &sk2, &pk1, &accum_scaled_eval);
+        let input_bits = encode_scalar_bits(&m, 12);
+        let (encrypted_input_bits_native, input_bit_randomness): (Vec<_>, Vec<_>) = input_bits
+            .iter()
+            .map(|bit| {
+                let r = Scalar::random(&mut rng);
+                (encrypt_with_randomness(&monitor_pk, bit, r), r)
+            })
+            .unzip();
+        let proof = proof::prove_round(
             &mut rng,
-            &target.pc_gens,
-            &target.bp_gens,
+            &monitor_pk,
             &target.pk,
             &target.pk1,
-            &pk2,
-            &poly_ct.0,
-            &scaled,
-            &m_poly_ct,
-            &accum_scaled,
-            &accum_m_poly_ct,
+            &target.pk2,
             &accum_ct,
             &next_accum,
+            &accum_scaled_eval,
+            &accum_eval,
             m,
-            mask,
-            r_prime,
-            _accum_r_prime,
-            sk2.as_scalar(),
+            &input_bits,
+            &input_bit_randomness,
+            accum_mask,
+            accum_r_prime,
+            &sk2,
+            &encrypted_input_bits_native,
         )
-        .expect("round prove");
-
+        .unwrap();
         let msg = MonitorToTarget {
             next_accum: WireEncryptedPoly::from_native(&next_accum),
-            accum_scaled_eval: WireCiphertext::from_native(&accum_scaled),
-            accum_m_poly_ctext: WireCiphertext::from_native(&accum_m_poly_ct),
-            scaled_eval: WireCiphertext::from_native(&scaled),
-            m_poly_ctext: WireCiphertext::from_native(&m_poly_ct),
-            round_proof: WireCombinedSigmaProof::from_proof(&round_proof),
+            accum_eval: WireCiphertext::from_native(&accum_eval),
+            encrypted_input_bits: encrypted_input_bits_native
+                .iter()
+                .map(WireCiphertext::from_native)
+                .collect(),
+            proof,
         };
 
-        let (next_accum_out, matched) = target
-            .process_round(&mut rng, &poly_ct, &accum_ct, &msg)
-            .unwrap();
-        assert!(matched, "7 should be detected as a match");
-        assert_eq!(target.state, 1);
-        assert_eq!(
-            next_accum_out.0.len(),
-            accum_ct.0.len(),
-            "accum length should stay constant"
+        let (next_accum_out, masked_distances, masked_distance_proofs) =
+            target.process_round(&mut rng, &accum_ct, &msg).unwrap();
+        assert_eq!(next_accum_out.0.len(), accum_ct.0.len());
+        assert_eq!(masked_distances.len(), 2);
+        assert_eq!(masked_distance_proofs.len(), 2);
+    }
+
+    #[test]
+    fn test_process_round_rejects_zero_accum_eval() {
+        let mut rng = OsRng;
+        let (sk1, pk1) = generate_key_share(&mut rng);
+        let (sk2, pk2) = generate_key_share(&mut rng);
+        let (_monitor_sk, monitor_pk_share) = generate_key_share(&mut rng);
+        let monitor_pk = PublicKey(monitor_pk_share.0);
+        let mut target = Target::new(vec![Scalar::from(11u64)], 5, sk1, pk1.clone(), pk2, monitor_pk, 8);
+        let zero_accum = EncryptedPoly(vec![
+            encrypt_zero(&mut rng, &target.pk),
+            encrypt_zero(&mut rng, &target.pk),
+            encrypt_zero(&mut rng, &target.pk),
+        ]);
+        let next_accum = zero_accum.clone();
+        let m = Scalar::from(3u64);
+        let zero_eval_joint = eval_poly(&zero_accum, &m);
+        let accum_mask = non_zero_scalar(&mut rng);
+        let accum_scaled_eval = mask_eval(&target.pk, zero_eval_joint, accum_mask);
+        let (zero_eval, accum_r_prime) =
+            partial_decrypt_with_witness(&mut rng, &sk2, &pk1, &accum_scaled_eval);
+        let input_bits = encode_scalar_bits(&m, 8);
+        let (encrypted_input_bits_native, input_bit_randomness): (Vec<_>, Vec<_>) = input_bits
+            .iter()
+            .map(|bit| {
+                let r = Scalar::random(&mut rng);
+                (encrypt_with_randomness(&monitor_pk, bit, r), r)
+            })
+            .unzip();
+        let proof = proof::prove_round(
+            &mut rng,
+            &monitor_pk,
+            &target.pk,
+            &target.pk1,
+            &target.pk2,
+            &zero_accum,
+            &next_accum,
+            &accum_scaled_eval,
+            &zero_eval,
+            m,
+            &input_bits,
+            &input_bit_randomness,
+            accum_mask,
+            accum_r_prime,
+            &sk2,
+            &encrypted_input_bits_native,
+        )
+        .unwrap();
+        let msg = MonitorToTarget {
+            next_accum: WireEncryptedPoly::from_native(&next_accum),
+            accum_eval: WireCiphertext::from_native(&zero_eval),
+            encrypted_input_bits: encrypted_input_bits_native
+                .iter()
+                .map(WireCiphertext::from_native)
+                .collect(),
+            proof,
+        };
+
+        let err = target.process_round(&mut rng, &zero_accum, &msg).unwrap_err();
+        assert!(
+            err == "accum_eval decrypts to 0" || err.contains("sigma"),
+            "unexpected rejection reason: {err}"
         );
     }
 
-    /// Non-match round: state stays at 0.
     #[test]
-    fn test_process_round_no_match() {
-        use crate::crypto::elgamal::partial_decrypt_with_witness;
-        use crate::crypto::sigma_bullet as sb_mod;
-        use curve25519_dalek_ng::constants::RISTRETTO_BASEPOINT_POINT as G;
-
+    fn test_target_encodes_each_set_item() {
         let mut rng = OsRng;
         let (sk1, pk1) = generate_key_share(&mut rng);
-        let (sk2, pk2) = generate_key_share(&mut rng);
+        let (_sk2, pk2) = generate_key_share(&mut rng);
+        let (_monitor_sk, monitor_pk_share) = generate_key_share(&mut rng);
+        let monitor_pk = PublicKey(monitor_pk_share.0);
+        let t_set = vec![Scalar::from(5u64), Scalar::from(9u64), Scalar::from(12u64)];
+        let target = Target::new(t_set.clone(), 5, sk1, pk1, pk2, monitor_pk, 10);
 
-        let t_set = vec![Scalar::from(7u64)];
-        let mut target = Target::new(t_set.clone(), 5, sk1, pk1, pk2.clone());
-        let poly_ct = target.build_poly_ctext(&mut rng);
-        let accum_ct = target.build_accum_ctext(&mut rng);
-
-        // MElmt = 99 (NOT a root).
-        let m = Scalar::from(99u64);
-        let mask = Scalar::from(5u64);
-        let next_accum = poly_scalar_mul(&accum_ct, &m);
-        let accum_eval = eval_poly(&accum_ct, &m);
-        let accum_mask = Scalar::from(31u64);
-        let accum_scaled_no_blind = ct_scalar_mul(&accum_eval, &accum_mask);
-        let accum_enc_zero_mask = Ciphertext {
-            c1: accum_mask * G,
-            c2: accum_mask * target.pk.0,
-        };
-        let accum_scaled = ct_add(&accum_scaled_no_blind, &accum_enc_zero_mask);
-        let (accum_m_poly_ct, _accum_r_prime) =
-            partial_decrypt_with_witness(&mut rng, &sk2, &target.pk1, &accum_scaled);
-        let scaled_no_blind = ct_scalar_mul(&eval_poly(&poly_ct, &m), &mask);
-        let enc_zero_mask = Ciphertext {
-            c1: mask * G,
-            c2: mask * target.pk.0,
-        };
-        let scaled = ct_add(&scaled_no_blind, &enc_zero_mask);
-        let (m_poly_ct, r_prime) =
-            partial_decrypt_with_witness(&mut rng, &sk2, &target.pk1, &scaled);
-
-        let round_proof = sb_mod::prove_round(
-            &mut rng,
-            &target.pc_gens,
-            &target.bp_gens,
-            &target.pk,
-            &target.pk1,
-            &pk2,
-            &poly_ct.0,
-            &scaled,
-            &m_poly_ct,
-            &accum_scaled,
-            &accum_m_poly_ct,
-            &accum_ct,
-            &next_accum,
-            m,
-            mask,
-            r_prime,
-            _accum_r_prime,
-            sk2.as_scalar(),
-        )
-        .unwrap();
-
-        let msg = MonitorToTarget {
-            next_accum: WireEncryptedPoly::from_native(&next_accum),
-            accum_scaled_eval: WireCiphertext::from_native(&accum_scaled),
-            accum_m_poly_ctext: WireCiphertext::from_native(&accum_m_poly_ct),
-            scaled_eval: WireCiphertext::from_native(&scaled),
-            m_poly_ctext: WireCiphertext::from_native(&m_poly_ct),
-            round_proof: WireCombinedSigmaProof::from_proof(&round_proof),
-        };
-
-        let (next_accum_out, matched) = target
-            .process_round(&mut rng, &poly_ct, &accum_ct, &msg)
-            .unwrap();
-        assert!(!matched, "99 should not match");
-        assert_eq!(target.state, 0);
+        assert_eq!(target._t_set.len(), t_set.len());
+        assert_eq!(target._encoded_t_set.len(), t_set.len());
         assert_eq!(
-            next_accum_out.0.len(),
-            accum_ct.0.len(),
-            "accum length should stay constant"
+            target._encoded_t_set[0],
+            encode_scalar_bits(&Scalar::from(5u64), 10)
         );
     }
 }

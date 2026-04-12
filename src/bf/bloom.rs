@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use curve25519_dalek_ng::scalar::Scalar;
 use rand::rngs::OsRng;
 use rand::Rng;
@@ -6,7 +8,7 @@ use rand::Rng;
 pub struct BloomFilterConfig {
     pub bloom_filter_size: usize,
     pub hash_count: usize,
-    pub honeyword_probability: f64,
+    pub target_marked_count: usize,
 }
 
 impl BloomFilterConfig {
@@ -20,20 +22,12 @@ impl BloomFilterConfig {
         if self.hash_count > self.bloom_filter_size {
             return Err("hash count k must be at most the bloom filter size".to_string());
         }
-        if !(0.0..=1.0).contains(&self.honeyword_probability) {
-            return Err("honeyword probability p_h must be in [0, 1]".to_string());
+        if self.target_marked_count > self.bloom_filter_size {
+            return Err(
+                "target marked-position count must be at most the bloom filter size".to_string(),
+            );
         }
         Ok(self)
-    }
-
-    pub fn bit_density(self) -> f64 {
-        self.honeyword_probability
-            .powf(1.0 / self.hash_count as f64)
-    }
-
-    pub fn target_marked_count(self) -> usize {
-        let raw = (self.bit_density() * self.bloom_filter_size as f64).round() as usize;
-        raw.clamp(0, self.bloom_filter_size)
     }
 }
 
@@ -78,12 +72,13 @@ pub fn sample_marked_positions(
         .collect();
 
     let mut marked_positions = dedup_positions(required_positions);
-    let target_count = config.target_marked_count().max(marked_positions.len());
+    let target_count = config.target_marked_count.max(marked_positions.len());
     if target_count == marked_positions.len() {
         return marked_positions;
     }
 
-    universe.retain(|position| !marked_positions.contains(position));
+    let marked_set: HashSet<[u8; 32]> = marked_positions.iter().map(|p| p.to_bytes()).collect();
+    universe.retain(|position| !marked_set.contains(&position.to_bytes()));
     for i in (1..universe.len()).rev() {
         let j = rng.gen_range(0..=i);
         universe.swap(i, j);
@@ -102,19 +97,16 @@ pub fn scalar_is_member(
     marked_positions: &[Scalar],
     config: BloomFilterConfig,
 ) -> bool {
+    let marked_set: HashSet<[u8; 32]> = marked_positions.iter().map(|p| p.to_bytes()).collect();
     scalar_positions(input, config)
         .into_iter()
-        .all(|position| marked_positions.contains(&position))
+        .all(|position| marked_set.contains(&position.to_bytes()))
 }
 
 pub fn find_non_member_scalar(
     marked_positions: &[Scalar],
     config: BloomFilterConfig,
 ) -> Option<Scalar> {
-    if config.honeyword_probability == 1.0 {
-        return None;
-    }
-
     let usable_span = usable_input_span(config);
     for candidate in 1..=usable_span as u64 {
         let candidate = Scalar::from(candidate);
@@ -127,10 +119,11 @@ pub fn find_non_member_scalar(
 }
 
 pub fn dedup_positions(positions: &[Scalar]) -> Vec<Scalar> {
+    let mut seen = HashSet::new();
     let mut deduped = Vec::new();
-    for position in positions {
-        if !deduped.contains(position) {
-            deduped.push(*position);
+    for &position in positions {
+        if seen.insert(position.to_bytes()) {
+            deduped.push(position);
         }
     }
     deduped
@@ -185,7 +178,7 @@ mod tests {
         let config = BloomFilterConfig {
             bloom_filter_size: 32,
             hash_count: 3,
-            honeyword_probability: 0.25,
+            target_marked_count: 16,
         };
         let positions = scalar_positions(Scalar::from(3u64), config);
         assert_eq!(positions.len(), 3);
@@ -200,7 +193,7 @@ mod tests {
         let config = BloomFilterConfig {
             bloom_filter_size: 32,
             hash_count: 3,
-            honeyword_probability: 0.25,
+            target_marked_count: 16,
         };
         let max_input = Scalar::from(usable_input_span(config) as u64);
         let positions = scalar_positions(max_input, config);
@@ -216,7 +209,7 @@ mod tests {
         let config = BloomFilterConfig {
             bloom_filter_size: 32,
             hash_count: 3,
-            honeyword_probability: 0.125,
+            target_marked_count: 8,
         };
         let required = vec![Scalar::from(2u64), Scalar::from(7u64), Scalar::from(19u64)];
         let marked_positions = sample_marked_positions(&mut rng, config, &required);
