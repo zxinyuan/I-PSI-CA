@@ -12,7 +12,9 @@ use merlin::Transcript;
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::elgamal::{Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare, SecretKeyShare};
+use crate::crypto::elgamal::{
+    Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare, SecretKeyShare,
+};
 use crate::crypto::sigma::{self, PartialDecryptProof, PolyScalarMulProof};
 use crate::fuzzy::target::WireCiphertext;
 
@@ -111,10 +113,8 @@ impl WireBitEncryptionProof {
             a1: CompressedRistretto::from_slice(&self.a1),
             a2: CompressedRistretto::from_slice(&self.a2),
             a3: CompressedRistretto::from_slice(&self.a3),
-            z_bit: Scalar::from_canonical_bytes(self.z_bit)
-                .ok_or("z_bit: non-canonical scalar")?,
-            z_r: Scalar::from_canonical_bytes(self.z_r)
-                .ok_or("z_r: non-canonical scalar")?,
+            z_bit: Scalar::from_canonical_bytes(self.z_bit).ok_or("z_bit: non-canonical scalar")?,
+            z_r: Scalar::from_canonical_bytes(self.z_r).ok_or("z_r: non-canonical scalar")?,
             z_blind: Scalar::from_canonical_bytes(self.z_blind)
                 .ok_or("z_blind: non-canonical scalar")?,
         })
@@ -195,10 +195,23 @@ fn challenge_scalar(transcript: &mut Transcript) -> Scalar {
     Scalar::from_bytes_mod_order_wide(&buf)
 }
 
-fn batch_scalar(transcript: &mut Transcript, label: &'static [u8]) -> Scalar {
-    let mut buf = [0u8; 64];
-    transcript.challenge_bytes(label, &mut buf);
-    Scalar::from_bytes_mod_order_wide(&buf)
+fn nontrivial_challenge(transcript: &mut Transcript) -> Scalar {
+    let challenge = challenge_scalar(transcript);
+    if challenge == -Scalar::one() {
+        Scalar::from(2u64)
+    } else {
+        challenge + Scalar::one()
+    }
+}
+
+fn fixed_batch_weights(count: usize) -> Vec<Scalar> {
+    let mut weights = Vec::with_capacity(count);
+    let mut weight = Scalar::one();
+    for _ in 0..count {
+        weights.push(weight);
+        weight += Scalar::one();
+    }
+    weights
 }
 
 fn make_monitor_bp_gens(vector_size: usize, coeff_len: usize) -> BulletproofGens {
@@ -352,32 +365,6 @@ fn bit_encryption_transcript(
     t
 }
 
-fn bit_encryption_batch_transcript(
-    pk: &PublicKey,
-    encrypted_input_bits: &[Ciphertext],
-    bit_comms: &[CompressedRistretto],
-    proofs: &[BitEncryptionProof],
-) -> Transcript {
-    let mut t = Transcript::new(b"I-PSI-CA::fuzzy_bit_encrypt_batch_v1");
-    t.append_message(b"pk", pk.0.compress().as_bytes());
-    for ((ct, bit_comm), proof) in encrypted_input_bits
-        .iter()
-        .zip(bit_comms.iter())
-        .zip(proofs.iter())
-    {
-        t.append_message(b"ct_c1", ct.c1.compress().as_bytes());
-        t.append_message(b"ct_c2", ct.c2.compress().as_bytes());
-        t.append_message(b"bit_comm", bit_comm.as_bytes());
-        t.append_message(b"a1", proof.a1.as_bytes());
-        t.append_message(b"a2", proof.a2.as_bytes());
-        t.append_message(b"a3", proof.a3.as_bytes());
-        t.append_message(b"z_bit", &proof.z_bit.to_bytes());
-        t.append_message(b"z_r", &proof.z_r.to_bytes());
-        t.append_message(b"z_blind", &proof.z_blind.to_bytes());
-    }
-    t
-}
-
 fn prove_bit_encryption<R: CryptoRng + RngCore>(
     rng: &mut R,
     pc_gens: &PedersenGens,
@@ -400,7 +387,7 @@ fn prove_bit_encryption<R: CryptoRng + RngCore>(
     t.append_message(b"a1", a1.as_bytes());
     t.append_message(b"a2", a2.as_bytes());
     t.append_message(b"a3", a3.as_bytes());
-    let chal = challenge_scalar(&mut t);
+    let chal = nontrivial_challenge(&mut t);
 
     BitEncryptionProof {
         a1,
@@ -412,11 +399,22 @@ fn prove_bit_encryption<R: CryptoRng + RngCore>(
     }
 }
 
-fn parse_bit_encryption_proof(proof: &BitEncryptionProof) -> Result<ParsedBitEncryptionProof, String> {
+fn parse_bit_encryption_proof(
+    proof: &BitEncryptionProof,
+) -> Result<ParsedBitEncryptionProof, String> {
     Ok(ParsedBitEncryptionProof {
-        a1: proof.a1.decompress().ok_or("bit encryption A1 invalid point")?,
-        a2: proof.a2.decompress().ok_or("bit encryption A2 invalid point")?,
-        a3: proof.a3.decompress().ok_or("bit encryption A3 invalid point")?,
+        a1: proof
+            .a1
+            .decompress()
+            .ok_or("bit encryption A1 invalid point")?,
+        a2: proof
+            .a2
+            .decompress()
+            .ok_or("bit encryption A2 invalid point")?,
+        a3: proof
+            .a3
+            .decompress()
+            .ok_or("bit encryption A3 invalid point")?,
         z_bit: proof.z_bit,
         z_r: proof.z_r,
         z_blind: proof.z_blind,
@@ -443,8 +441,7 @@ fn verify_bit_encryptions_batched(
         .map(|comm| comm.decompress().ok_or("bit commitment invalid point"))
         .collect::<Result<_, _>>()?;
 
-    let mut batch_t =
-        bit_encryption_batch_transcript(pk, encrypted_input_bits, bit_comms, proofs);
+    let batch_weights = fixed_batch_weights(3 * proofs.len());
 
     let mut scalars = Vec::with_capacity(4 + 6 * proofs.len());
     let mut points = Vec::with_capacity(4 + 6 * proofs.len());
@@ -464,11 +461,11 @@ fn verify_bit_encryptions_batched(
         t.append_message(b"a1", proof.a1.as_bytes());
         t.append_message(b"a2", proof.a2.as_bytes());
         t.append_message(b"a3", proof.a3.as_bytes());
-        let chal = challenge_scalar(&mut t);
+        let chal = nontrivial_challenge(&mut t);
 
-        let rho1 = batch_scalar(&mut batch_t, b"rho1");
-        let rho2 = batch_scalar(&mut batch_t, b"rho2");
-        let rho3 = batch_scalar(&mut batch_t, b"rho3");
+        let rho1 = batch_weights[3 * idx];
+        let rho2 = batch_weights[3 * idx + 1];
+        let rho3 = batch_weights[3 * idx + 2];
 
         g_scalar += rho1 * parsed.z_r + rho2 * parsed.z_bit;
         pk_scalar += rho2 * parsed.z_r;
@@ -500,10 +497,8 @@ fn verify_bit_encryptions_batched(
     scalars.push(b_blind_scalar);
     points.push(pc_gens.B_blinding);
 
-    let check = RistrettoPoint::vartime_multiscalar_mul(
-        scalars.iter().copied(),
-        points.iter().copied(),
-    );
+    let check =
+        RistrettoPoint::vartime_multiscalar_mul(scalars.iter().copied(), points.iter().copied());
     if check != RistrettoPoint::identity() {
         return Err("batched bit encryption proof verification failed".to_string());
     }
@@ -538,16 +533,13 @@ fn glue_transcript(
 }
 
 fn glue_relation_scalars(
-    monitor_bulletproof: &MonitorBulletproof,
-    pk: &PublicKey,
-    coeff_cts: &[Ciphertext],
-    c_star: &Ciphertext,
+    _monitor_bulletproof: &MonitorBulletproof,
+    _pk: &PublicKey,
+    _coeff_cts: &[Ciphertext],
+    _c_star: &Ciphertext,
 ) -> (Scalar, Scalar, Scalar) {
-    let mut t = glue_transcript(monitor_bulletproof, pk, coeff_cts, c_star);
-    let beta_y = batch_scalar(&mut t, b"batch_y");
-    let beta_c1 = batch_scalar(&mut t, b"batch_c1");
-    let beta_c2 = batch_scalar(&mut t, b"batch_c2");
-    (beta_y, beta_c1, beta_c2)
+    let weights = fixed_batch_weights(3);
+    (weights[0], weights[1], weights[2])
 }
 
 fn prove_glue<R: CryptoRng + RngCore>(
@@ -594,7 +586,7 @@ fn prove_glue<R: CryptoRng + RngCore>(
     t.append_message(b"beta_c2", &beta_c2.to_bytes());
     t.append_message(b"alpha_tag", alpha_tag.as_bytes());
     t.append_message(b"A_t", a_t.compress().as_bytes());
-    let chal = challenge_scalar(&mut t);
+    let chal = nontrivial_challenge(&mut t);
 
     GlueProof {
         alpha_tag,
@@ -640,9 +632,13 @@ fn verify_glue(
     t.append_message(b"beta_c2", &beta_c2.to_bytes());
     t.append_message(b"alpha_tag", proof.alpha_tag.as_bytes());
     t.append_message(b"A_t", proof.a_t.as_bytes());
-    let chal = challenge_scalar(&mut t);
+    let chal = nontrivial_challenge(&mut t);
 
-    let fixed_scalars = [proof.z_alpha, beta_y * proof.z_alpha, beta_y * proof.z_y_blind];
+    let fixed_scalars = [
+        proof.z_alpha,
+        beta_y * proof.z_alpha,
+        beta_y * proof.z_y_blind,
+    ];
     let fixed_points = [G, pc_gens.B, pc_gens.B_blinding];
     let (var_scalars, var_points): (Vec<_>, Vec<_>) = proof
         .z_e
@@ -725,15 +721,9 @@ pub fn prove_round<R: CryptoRng + RngCore>(
     let pc_gens = PedersenGens::default();
     let bp_gens = make_monitor_bp_gens(input_bits.len(), current_accum.0.len());
     let e_asc = build_e_chain(y, accum_mask, current_accum.0.len());
-    let (monitor_bulletproof, monitor_witness) = prove_monitor_bulletproof(
-        rng,
-        &pc_gens,
-        &bp_gens,
-        input_bits,
-        y,
-        &e_asc,
-    )
-    .map_err(|e| format!("monitor bulletproof: {e:?}"))?;
+    let (monitor_bulletproof, monitor_witness) =
+        prove_monitor_bulletproof(rng, &pc_gens, &bp_gens, input_bits, y, &e_asc)
+            .map_err(|e| format!("monitor bulletproof: {e:?}"))?;
 
     let bit_encryption_proofs: Vec<_> = encrypted_input_bits
         .iter()
@@ -757,13 +747,8 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         accum_eval,
     );
     let alpha_tag_pt = mul_g(&y);
-    let next_accum_proof = sigma::prove_poly_scalar_mul(
-        rng,
-        &y,
-        current_accum,
-        next_accum,
-        &alpha_tag_pt,
-    );
+    let next_accum_proof =
+        sigma::prove_poly_scalar_mul(rng, &y, current_accum, next_accum, &alpha_tag_pt);
     let glue_proof = prove_glue(
         rng,
         &pc_gens,

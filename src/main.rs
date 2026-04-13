@@ -108,72 +108,73 @@ impl RunConfig {
 
                 let default_k = recommended_hash_count(BF_HONEYWORD_PROBABILITY);
                 let default_marked_count = default_bf_marked_count(bloom_filter_size, default_k);
-                let (bf_hash_count, bf_marked_count, in_set) =
-                    match (args.get(3), args.get(4), args.get(5)) {
-                        (None, None, None) => (default_k, default_marked_count, true),
-                        (Some(third), None, None) => match third.parse::<bool>() {
-                            Ok(in_set) => (default_k, default_marked_count, in_set),
-                            Err(_) => {
-                                let bf_hash_count = third.parse::<usize>().map_err(|_| {
+                let (bf_hash_count, bf_marked_count, in_set) = match (
+                    args.get(3),
+                    args.get(4),
+                    args.get(5),
+                ) {
+                    (None, None, None) => (default_k, default_marked_count, true),
+                    (Some(third), None, None) => match third.parse::<bool>() {
+                        Ok(in_set) => (default_k, default_marked_count, in_set),
+                        Err(_) => {
+                            let bf_hash_count = third.parse::<usize>().map_err(|_| {
                                     "for bf, third arg must be true/false or a positive integer hash count k"
                                         .to_string()
                                 })?;
-                                if bf_hash_count == 0 {
-                                    return Err(
-                                        "hash count k must be greater than zero".to_string()
-                                    );
-                                }
-                                (
-                                    bf_hash_count,
-                                    default_bf_marked_count(bloom_filter_size, bf_hash_count),
-                                    true,
-                                )
-                            }
-                        },
-                        (Some(third), Some(fourth), None) => {
-                            let bf_hash_count = third.parse::<usize>().map_err(|_| {
-                                "for bf, third arg must be a positive integer hash count k when a fourth arg is provided"
-                                    .to_string()
-                            })?;
                             if bf_hash_count == 0 {
                                 return Err("hash count k must be greater than zero".to_string());
                             }
+                            (
+                                bf_hash_count,
+                                default_bf_marked_count(bloom_filter_size, bf_hash_count),
+                                true,
+                            )
+                        }
+                    },
+                    (Some(third), Some(fourth), None) => {
+                        let bf_hash_count = third.parse::<usize>().map_err(|_| {
+                                "for bf, third arg must be a positive integer hash count k when a fourth arg is provided"
+                                    .to_string()
+                            })?;
+                        if bf_hash_count == 0 {
+                            return Err("hash count k must be greater than zero".to_string());
+                        }
 
-                            match fourth.parse::<bool>() {
-                                Ok(in_set) => (
-                                    bf_hash_count,
-                                    default_bf_marked_count(bloom_filter_size, bf_hash_count),
-                                    in_set,
-                                ),
-                                Err(_) => {
-                                    let bf_marked_count =
+                        match fourth.parse::<bool>() {
+                            Ok(in_set) => (
+                                bf_hash_count,
+                                default_bf_marked_count(bloom_filter_size, bf_hash_count),
+                                in_set,
+                            ),
+                            Err(_) => {
+                                let bf_marked_count =
                                         fourth.parse::<usize>().map_err(|_| {
                                             "for bf, fourth arg must be true/false or a positive integer marked-position count"
                                                 .to_string()
                                         })?;
-                                    (bf_hash_count, bf_marked_count, true)
-                                }
+                                (bf_hash_count, bf_marked_count, true)
                             }
                         }
-                        (Some(third), Some(fourth), Some(fifth)) => {
-                            let bf_hash_count = third.parse::<usize>().map_err(|_| {
+                    }
+                    (Some(third), Some(fourth), Some(fifth)) => {
+                        let bf_hash_count = third.parse::<usize>().map_err(|_| {
                                 "for bf, third arg must be a positive integer hash count k when a fifth arg is provided"
                                     .to_string()
                             })?;
-                            if bf_hash_count == 0 {
-                                return Err("hash count k must be greater than zero".to_string());
-                            }
-                            let bf_marked_count = fourth.parse::<usize>().map_err(|_| {
+                        if bf_hash_count == 0 {
+                            return Err("hash count k must be greater than zero".to_string());
+                        }
+                        let bf_marked_count = fourth.parse::<usize>().map_err(|_| {
                                 "for bf, fourth arg must be a positive integer marked-position count when a fifth arg is provided"
                                     .to_string()
                             })?;
-                            let in_set = fifth
-                                .parse::<bool>()
-                                .map_err(|_| "for bf, fifth arg must be true/false".to_string())?;
-                            (bf_hash_count, bf_marked_count, in_set)
-                        }
-                        _ => unreachable!("bf arguments are positional"),
-                    };
+                        let in_set = fifth
+                            .parse::<bool>()
+                            .map_err(|_| "for bf, fifth arg must be true/false".to_string())?;
+                        (bf_hash_count, bf_marked_count, in_set)
+                    }
+                    _ => unreachable!("bf arguments are positional"),
+                };
 
                 if bf_marked_count > bloom_filter_size {
                     return Err(
@@ -192,7 +193,11 @@ impl RunConfig {
                 })
             }
             ProtocolVersion::Fuzzy => {
-                let (set_size, fuzzy_vector_size, in_set) = match (args.get(2), args.get(3), args.get(4)) {
+                let (set_size, fuzzy_vector_size, in_set) = match (
+                    args.get(2),
+                    args.get(3),
+                    args.get(4),
+                ) {
                     (None, None, None) => (DEGREE, FUZZY_VECTOR_SIZE, true),
                     (Some(second), None, None) => match second.parse::<bool>() {
                         Ok(in_set) => (DEGREE, FUZZY_VECTOR_SIZE, in_set),
@@ -368,7 +373,10 @@ fn main() {
             println!("Protocol    = {:?}", config.protocol);
             println!("Bloom size  = [{} positions]", config.size);
             println!("k hashes    = {}", config.bf_hash_count);
-            println!("Target bits = [{} marked positions]", config.bf_marked_count);
+            println!(
+                "Target bits = [{} marked positions]",
+                config.bf_marked_count
+            );
             println!(
                 "Marked bits = [{} positions set to 1]",
                 marked_positions.len()

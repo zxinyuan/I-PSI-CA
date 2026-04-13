@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::elgamal::{Ciphertext, PublicKey};
 
+// ----- proof structures -------------------------------------------------------
+
 #[derive(Clone, Debug)]
 pub struct ArithmeticProof {
     pub proof: R1CSProof,
@@ -22,7 +24,7 @@ pub struct ArithmeticProof {
     pub r_x_comms: Vec<CompressedRistretto>,
     pub q_comms: Vec<CompressedRistretto>,
     pub s_comms: Vec<CompressedRistretto>,
-    pub beta_comms: Vec<CompressedRistretto>,
+    // beta_comms removed: beta_j = z - 2*q_j is linear, no commitment needed
 }
 
 #[derive(Clone, Debug)]
@@ -32,7 +34,8 @@ pub struct SigmaProof {
     pub a_c2: CompressedRistretto,
     pub z_q: Vec<Scalar>,
     pub z_s: Vec<Scalar>,
-    pub z_beta: Vec<Scalar>,
+    /// Response for z itself (replaces the n z_beta responses).
+    pub z_z: Scalar,
     pub z_zu: Scalar,
     pub z_zru: Scalar,
     pub z_blind_agg: Scalar,
@@ -44,17 +47,21 @@ pub struct TargetHybridProof {
     pub sigma: SigmaProof,
 }
 
+// z_val / z_blind added so the sigma prover can open z_comm.
+// beta_vals / beta_blinds removed.
 #[derive(Clone, Debug)]
 struct ArithmeticWitness {
     q_vals: Vec<Scalar>,
     s_vals: Vec<Scalar>,
-    beta_vals: Vec<Scalar>,
     q_blinds: Vec<Scalar>,
     s_blinds: Vec<Scalar>,
-    beta_blinds: Vec<Scalar>,
+    z_val: Scalar,
+    z_blind: Scalar,
     u_val: Scalar,
     r_u_val: Scalar,
 }
+
+// ----- wire (serialisable) types ----------------------------------------------
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireArithmeticProof {
@@ -64,7 +71,7 @@ pub struct WireArithmeticProof {
     r_x_comms: Vec<[u8; 32]>,
     q_comms: Vec<[u8; 32]>,
     s_comms: Vec<[u8; 32]>,
-    beta_comms: Vec<[u8; 32]>,
+    // beta_comms removed
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -74,7 +81,8 @@ pub struct WireSigmaProof {
     a_c2: [u8; 32],
     z_q: Vec<[u8; 32]>,
     z_s: Vec<[u8; 32]>,
-    z_beta: Vec<[u8; 32]>,
+    /// Response for z (replaces the n z_beta scalars).
+    z_z: [u8; 32],
     z_u: [u8; 32],
     z_r_u: [u8; 32],
     z_blind_agg: [u8; 32],
@@ -85,6 +93,8 @@ pub struct WireTargetHybridProof {
     arithmetic: WireArithmeticProof,
     sigma: WireSigmaProof,
 }
+
+// ----- wire conversions -------------------------------------------------------
 
 fn scalar_from_bytes(bytes: [u8; 32], label: &str) -> Result<Scalar, String> {
     Scalar::from_canonical_bytes(bytes).ok_or_else(|| format!("{label}: non-canonical scalar"))
@@ -99,7 +109,6 @@ impl WireArithmeticProof {
             r_x_comms: proof.r_x_comms.iter().map(|c| c.to_bytes()).collect(),
             q_comms: proof.q_comms.iter().map(|c| c.to_bytes()).collect(),
             s_comms: proof.s_comms.iter().map(|c| c.to_bytes()).collect(),
-            beta_comms: proof.beta_comms.iter().map(|c| c.to_bytes()).collect(),
         }
     }
 
@@ -128,11 +137,6 @@ impl WireArithmeticProof {
                 .iter()
                 .map(|b| CompressedRistretto::from_slice(b))
                 .collect(),
-            beta_comms: self
-                .beta_comms
-                .iter()
-                .map(|b| CompressedRistretto::from_slice(b))
-                .collect(),
         })
     }
 }
@@ -145,7 +149,7 @@ impl WireSigmaProof {
             a_c2: proof.a_c2.to_bytes(),
             z_q: proof.z_q.iter().map(Scalar::to_bytes).collect(),
             z_s: proof.z_s.iter().map(Scalar::to_bytes).collect(),
-            z_beta: proof.z_beta.iter().map(Scalar::to_bytes).collect(),
+            z_z: proof.z_z.to_bytes(),
             z_u: proof.z_zu.to_bytes(),
             z_r_u: proof.z_zru.to_bytes(),
             z_blind_agg: proof.z_blind_agg.to_bytes(),
@@ -167,11 +171,7 @@ impl WireSigmaProof {
                 .iter()
                 .map(|b| scalar_from_bytes(*b, "target sigma z_s"))
                 .collect::<Result<_, _>>()?,
-            z_beta: self
-                .z_beta
-                .iter()
-                .map(|b| scalar_from_bytes(*b, "target sigma z_beta"))
-                .collect::<Result<_, _>>()?,
+            z_z: scalar_from_bytes(self.z_z, "target sigma z_z")?,
             z_zu: scalar_from_bytes(self.z_u, "target sigma z_u")?,
             z_zru: scalar_from_bytes(self.z_r_u, "target sigma z_r_u")?,
             z_blind_agg: scalar_from_bytes(self.z_blind_agg, "target sigma z_blind_agg")?,
@@ -195,29 +195,29 @@ impl WireTargetHybridProof {
     }
 }
 
+// ----- transcript helpers -----------------------------------------------------
+
 fn challenge_scalar(t: &mut Transcript) -> Scalar {
     let mut buf = [0u8; 64];
     t.challenge_bytes(b"challenge", &mut buf);
     Scalar::from_bytes_mod_order_wide(&buf)
 }
 
-fn batch_scalar(t: &mut Transcript, label: &'static [u8]) -> Scalar {
-    let mut buf = [0u8; 64];
-    t.challenge_bytes(label, &mut buf);
-    Scalar::from_bytes_mod_order_wide(&buf)
+fn nontrivial_challenge(t: &mut Transcript) -> Scalar {
+    let challenge = challenge_scalar(t);
+    if challenge == -Scalar::one() {
+        Scalar::from(2u64)
+    } else {
+        challenge + Scalar::one()
+    }
 }
 
-fn make_bp_gens(bit_len: usize) -> BulletproofGens {
-    let multipliers = (3 * bit_len + 4).max(2);
-    let cap = 1usize << (usize::BITS - (multipliers - 1).leading_zeros()) as usize;
-    BulletproofGens::new(cap.max(64), 1)
-}
-
+// Bumped to v4: beta_comms removed, z_z added, transcript structure changed.
 fn arithmetic_transcript(
     encrypted_monitor_bits: &[Ciphertext],
     ciphertext: &Ciphertext,
 ) -> Transcript {
-    let mut t = Transcript::new(b"I-PSI-CA::fuzzy_target_bp_v3");
+    let mut t = Transcript::new(b"I-PSI-CA::fuzzy_target_bp_v4");
     t.append_message(b"ct_c1", ciphertext.c1.compress().as_bytes());
     t.append_message(b"ct_c2", ciphertext.c2.compress().as_bytes());
     for ct in encrypted_monitor_bits {
@@ -233,7 +233,7 @@ fn sigma_transcript(
     ciphertext: &Ciphertext,
     arithmetic: &ArithmeticProof,
 ) -> Transcript {
-    let mut t = Transcript::new(b"I-PSI-CA::fuzzy_target_sigma_v3");
+    let mut t = Transcript::new(b"I-PSI-CA::fuzzy_target_sigma_v4");
     t.append_message(b"pk", pk.0.compress().as_bytes());
     t.append_message(b"ct_c1", ciphertext.c1.compress().as_bytes());
     t.append_message(b"ct_c2", ciphertext.c2.compress().as_bytes());
@@ -254,35 +254,45 @@ fn sigma_transcript(
     for comm in &arithmetic.s_comms {
         t.append_message(b"s_comm", comm.as_bytes());
     }
-    for comm in &arithmetic.beta_comms {
-        t.append_message(b"beta_comm", comm.as_bytes());
-    }
+    // No beta_comms
     t.append_message(b"r1cs", &arithmetic.proof.to_bytes());
     t
 }
 
-fn sigma_weights(
+fn sigma_challenge_transcript(
     pk: &PublicKey,
     encrypted_monitor_bits: &[Ciphertext],
     ciphertext: &Ciphertext,
     arithmetic: &ArithmeticProof,
-) -> Vec<Scalar> {
-    let mut t = sigma_transcript(pk, encrypted_monitor_bits, ciphertext, arithmetic);
-    let mut weights = Vec::with_capacity(3 * arithmetic.q_comms.len() + 2);
-    for _ in 0..arithmetic.q_comms.len() {
-        weights.push(batch_scalar(&mut t, b"w_q"));
+) -> Transcript {
+    sigma_transcript(pk, encrypted_monitor_bits, ciphertext, arithmetic)
+}
+
+// Use fixed public batching weights so the outer sigma proof needs only one
+// Fiat-Shamir challenge, sampled after the prover's first message.
+fn sigma_weights(count: usize) -> Vec<Scalar> {
+    let mut weights = Vec::with_capacity(count);
+    let mut power = Scalar::one();
+    for _ in 0..count {
+        weights.push(power);
+        power += Scalar::one();
     }
-    for _ in 0..arithmetic.s_comms.len() {
-        weights.push(batch_scalar(&mut t, b"w_s"));
-    }
-    for _ in 0..arithmetic.beta_comms.len() {
-        weights.push(batch_scalar(&mut t, b"w_beta"));
-    }
-    weights.push(batch_scalar(&mut t, b"w_u"));
-    weights.push(batch_scalar(&mut t, b"w_r_u"));
     weights
 }
 
+// ----- BulletproofGens sizing -------------------------------------------------
+
+fn make_bp_gens(bit_len: usize) -> BulletproofGens {
+    // 3 multiply gates per bit: x*(x-1)=0, q=z*x, s=z*r_x.
+    // beta=z-2q is linear — no multiply gate.
+    let multipliers = (3 * bit_len + 4).max(2);
+    BulletproofGens::new(multipliers.next_power_of_two().max(64), 1)
+}
+
+// ----- R1CS gadget ------------------------------------------------------------
+
+// beta_j = z - 2*q_j is a linear identity, so we don't commit to beta or add
+// a linear constraint here; it is enforced in the sigma proof via z_z.
 fn arithmetic_gadget<CS: ConstraintSystem>(
     cs: &mut CS,
     x_vars: &[Variable],
@@ -290,51 +300,48 @@ fn arithmetic_gadget<CS: ConstraintSystem>(
     r_x_vars: &[Variable],
     q_vars: &[Variable],
     s_vars: &[Variable],
-    beta_vars: &[Variable],
 ) -> Result<(), R1CSError> {
     if x_vars.len() != r_x_vars.len()
         || x_vars.len() != q_vars.len()
         || x_vars.len() != s_vars.len()
-        || x_vars.len() != beta_vars.len()
     {
         return Err(R1CSError::GadgetError {
             description: "target witness length mismatch".to_string(),
         });
     }
 
-    for ((((&x_var, &r_x_var), &q_var), &s_var), &beta_var) in x_vars
+    for (((&x_var, &r_x_var), &q_var), &s_var) in x_vars
         .iter()
         .zip(r_x_vars.iter())
         .zip(q_vars.iter())
         .zip(s_vars.iter())
-        .zip(beta_vars.iter())
     {
+        // x_j ∈ {0, 1}
         let (_, _, bit_out) = cs.multiply(
             LinearCombination::from(x_var),
             LinearCombination::from(x_var) - Scalar::one(),
         );
         cs.constrain(LinearCombination::from(bit_out));
 
+        // q_j = z * x_j
         let (_, _, q_out) = cs.multiply(
             LinearCombination::from(z_var),
             LinearCombination::from(x_var),
         );
         cs.constrain(LinearCombination::from(q_out) - LinearCombination::from(q_var));
 
+        // s_j = z * r_{x_j}
         let (_, _, s_out) = cs.multiply(
             LinearCombination::from(z_var),
             LinearCombination::from(r_x_var),
         );
         cs.constrain(LinearCombination::from(s_out) - LinearCombination::from(s_var));
-
-        cs.constrain(
-            LinearCombination::from(beta_var) - LinearCombination::from(z_var)
-                + Scalar::from(2u64) * LinearCombination::from(q_var),
-        );
     }
 
     Ok(())
 }
+
+// ----- arithmetic prove/verify ------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 fn prove_arithmetic<R: CryptoRng + RngCore>(
@@ -381,10 +388,6 @@ fn prove_arithmetic<R: CryptoRng + RngCore>(
 
     let q_vals: Vec<_> = secret_bits.iter().map(|x| z * *x).collect();
     let s_vals: Vec<_> = bit_randomness.iter().map(|r_x| z * *r_x).collect();
-    let beta_vals: Vec<_> = secret_bits
-        .iter()
-        .map(|x| z * (Scalar::one() - Scalar::from(2u64) * *x))
-        .collect();
 
     let mut q_comms = Vec::with_capacity(q_vals.len());
     let mut q_vars = Vec::with_capacity(q_vals.len());
@@ -408,26 +411,7 @@ fn prove_arithmetic<R: CryptoRng + RngCore>(
         s_blinds.push(blind);
     }
 
-    let mut beta_comms = Vec::with_capacity(beta_vals.len());
-    let mut beta_vars = Vec::with_capacity(beta_vals.len());
-    let mut beta_blinds = Vec::with_capacity(beta_vals.len());
-    for &beta in &beta_vals {
-        let blind = Scalar::random(rng);
-        let (comm, var) = prover.commit(beta, blind);
-        beta_comms.push(comm);
-        beta_vars.push(var);
-        beta_blinds.push(blind);
-    }
-
-    arithmetic_gadget(
-        &mut prover,
-        &x_vars,
-        z_var,
-        &r_x_vars,
-        &q_vars,
-        &s_vars,
-        &beta_vars,
-    )?;
+    arithmetic_gadget(&mut prover, &x_vars, z_var, &r_x_vars, &q_vars, &s_vars)?;
     let proof = prover.prove(bp_gens)?;
 
     Ok((
@@ -438,15 +422,14 @@ fn prove_arithmetic<R: CryptoRng + RngCore>(
             r_x_comms,
             q_comms,
             s_comms,
-            beta_comms,
         },
         ArithmeticWitness {
             q_vals,
             s_vals,
-            beta_vals,
             q_blinds,
             s_blinds,
-            beta_blinds,
+            z_val: z,
+            z_blind,
             u_val: u,
             r_u_val: r_u,
         },
@@ -461,11 +444,7 @@ fn verify_arithmetic(
     proof: &ArithmeticProof,
 ) -> Result<(), String> {
     let n = proof.x_comms.len();
-    if proof.r_x_comms.len() != n
-        || proof.q_comms.len() != n
-        || proof.s_comms.len() != n
-        || proof.beta_comms.len() != n
-    {
+    if proof.r_x_comms.len() != n || proof.q_comms.len() != n || proof.s_comms.len() != n {
         return Err("target arithmetic commitment length mismatch".to_string());
     }
 
@@ -481,27 +460,16 @@ fn verify_arithmetic(
         .collect();
     let q_vars: Vec<_> = proof.q_comms.iter().map(|&c| verifier.commit(c)).collect();
     let s_vars: Vec<_> = proof.s_comms.iter().map(|&c| verifier.commit(c)).collect();
-    let beta_vars: Vec<_> = proof
-        .beta_comms
-        .iter()
-        .map(|&c| verifier.commit(c))
-        .collect();
 
-    arithmetic_gadget(
-        &mut verifier,
-        &x_vars,
-        z_var,
-        &r_x_vars,
-        &q_vars,
-        &s_vars,
-        &beta_vars,
-    )
-    .map_err(|e| format!("target arithmetic gadget invalid: {e:?}"))?;
+    arithmetic_gadget(&mut verifier, &x_vars, z_var, &r_x_vars, &q_vars, &s_vars)
+        .map_err(|e| format!("target arithmetic gadget invalid: {e:?}"))?;
 
     verifier
         .verify(&proof.proof, pc_gens, bp_gens)
         .map_err(|e| format!("target arithmetic proof invalid: {e:?}"))
 }
+
+// ----- sigma prove/verify -----------------------------------------------------
 
 fn prove_sigma<R: CryptoRng + RngCore>(
     rng: &mut R,
@@ -512,54 +480,56 @@ fn prove_sigma<R: CryptoRng + RngCore>(
     arithmetic: &ArithmeticProof,
     witness: &ArithmeticWitness,
 ) -> SigmaProof {
-    let weights = sigma_weights(pk, encrypted_monitor_bits, ciphertext, arithmetic);
     let n = arithmetic.q_comms.len();
+    let weights = sigma_weights(2 * n + 3);
     let (w_q, rest) = weights.split_at(n);
     let (w_s, rest) = rest.split_at(n);
-    let (w_beta, rest) = rest.split_at(n);
-    let _w_u = rest[0];
-    let _w_r_u = rest[1];
+    let w_z = rest[0];
 
+    // Nonces
     let k_q: Vec<_> = (0..n).map(|_| Scalar::random(rng)).collect();
     let k_s: Vec<_> = (0..n).map(|_| Scalar::random(rng)).collect();
-    let k_beta: Vec<_> = (0..n).map(|_| Scalar::random(rng)).collect();
+    let k_z = Scalar::random(rng);
     let k_u = Scalar::random(rng);
     let k_r_u = Scalar::random(rng);
     let k_blinds_q: Vec<_> = (0..n).map(|_| Scalar::random(rng)).collect();
     let k_blinds_s: Vec<_> = (0..n).map(|_| Scalar::random(rng)).collect();
-    let k_blinds_beta: Vec<_> = (0..n).map(|_| Scalar::random(rng)).collect();
+    let k_z_blind = Scalar::random(rng);
 
-    let mut a_open_pt = RistrettoPoint::identity();
-    let mut blind_agg = Scalar::zero();
+    // --- a_open: batch Pedersen opening for q, s, z (beta dropped) ---
+    let mut a_open_pt = w_z * (k_z * pc_gens.B + k_z_blind * pc_gens.B_blinding);
+    let mut blind_agg = w_z * k_z_blind;
     for idx in 0..n {
         a_open_pt += w_q[idx] * (k_q[idx] * pc_gens.B + k_blinds_q[idx] * pc_gens.B_blinding);
         blind_agg += w_q[idx] * k_blinds_q[idx];
         a_open_pt += w_s[idx] * (k_s[idx] * pc_gens.B + k_blinds_s[idx] * pc_gens.B_blinding);
         blind_agg += w_s[idx] * k_blinds_s[idx];
-        a_open_pt +=
-            w_beta[idx] * (k_beta[idx] * pc_gens.B + k_blinds_beta[idx] * pc_gens.B_blinding);
-        blind_agg += w_beta[idx] * k_blinds_beta[idx];
     }
 
-    let mut a_c1_pt = k_r_u * G;
-    let mut a_c2_pt = k_u * G + k_r_u * pk.0;
+    // --- a_c1, a_c2: substitute k_beta[j] = k_z - 2*k_q[j] ---
+    // Opt 4: precompute M_c1 = Σ m_j.c1, M_c2 = Σ m_j.c2 for the k_z term.
+    let m_sum_c1: RistrettoPoint = encrypted_monitor_bits.iter().map(|m| m.c1).sum();
+    let m_sum_c2: RistrettoPoint = encrypted_monitor_bits.iter().map(|m| m.c2).sum();
+
+    let two = Scalar::from(2u64);
+    let mut a_c1_pt = k_r_u * G + k_z * m_sum_c1;
+    let mut a_c2_pt = k_u * G + k_r_u * pk.0 + k_z * m_sum_c2;
     for idx in 0..n {
-        a_c1_pt += k_s[idx] * G + k_beta[idx] * encrypted_monitor_bits[idx].c1;
-        a_c2_pt += k_q[idx] * G + k_s[idx] * pk.0 + k_beta[idx] * encrypted_monitor_bits[idx].c2;
+        // k_beta contribution to c1: k_z * m.c1 - 2*k_q * m.c1 (k_z part already added above)
+        a_c1_pt += k_s[idx] * G - two * k_q[idx] * encrypted_monitor_bits[idx].c1;
+        // k_beta contribution to c2: k_z * m.c2 - 2*k_q * m.c2
+        a_c2_pt += k_q[idx] * G + k_s[idx] * pk.0 - two * k_q[idx] * encrypted_monitor_bits[idx].c2;
     }
 
     let a_open = a_open_pt.compress();
     let a_c1 = a_c1_pt.compress();
     let a_c2 = a_c2_pt.compress();
 
-    let mut t = sigma_transcript(pk, encrypted_monitor_bits, ciphertext, arithmetic);
-    for w in &weights {
-        t.append_message(b"w", &w.to_bytes());
-    }
+    let mut t = sigma_challenge_transcript(pk, encrypted_monitor_bits, ciphertext, arithmetic);
     t.append_message(b"A_open", a_open.as_bytes());
     t.append_message(b"A_c1", a_c1.as_bytes());
     t.append_message(b"A_c2", a_c2.as_bytes());
-    let chal = challenge_scalar(&mut t);
+    let chal = nontrivial_challenge(&mut t);
 
     let z_q: Vec<_> = k_q
         .iter()
@@ -571,20 +541,14 @@ fn prove_sigma<R: CryptoRng + RngCore>(
         .zip(witness.s_vals.iter())
         .map(|(k, v)| *k + chal * *v)
         .collect();
-    let z_beta: Vec<_> = k_beta
-        .iter()
-        .zip(witness.beta_vals.iter())
-        .map(|(k, v)| *k + chal * *v)
-        .collect();
+    let z_z = k_z + chal * witness.z_val;
     let z_zu = k_u + chal * witness.u_val;
     let z_zru = k_r_u + chal * witness.r_u_val;
 
-    let mut z_blind_agg = blind_agg;
+    // Aggregate blinding response: includes z's blinding contribution.
+    let mut z_blind_agg = blind_agg + chal * w_z * witness.z_blind;
     for idx in 0..n {
-        z_blind_agg += chal
-            * (w_q[idx] * witness.q_blinds[idx]
-                + w_s[idx] * witness.s_blinds[idx]
-                + w_beta[idx] * witness.beta_blinds[idx]);
+        z_blind_agg += chal * (w_q[idx] * witness.q_blinds[idx] + w_s[idx] * witness.s_blinds[idx]);
     }
 
     SigmaProof {
@@ -593,7 +557,7 @@ fn prove_sigma<R: CryptoRng + RngCore>(
         a_c2,
         z_q,
         z_s,
-        z_beta,
+        z_z,
         z_zu,
         z_zru,
         z_blind_agg,
@@ -609,13 +573,10 @@ fn verify_sigma(
     sigma: &SigmaProof,
 ) -> Result<(), String> {
     let n = arithmetic.q_comms.len();
-    if sigma.z_q.len() != n || sigma.z_s.len() != n || sigma.z_beta.len() != n {
+    if sigma.z_q.len() != n || sigma.z_s.len() != n {
         return Err("target sigma vector length mismatch".to_string());
     }
-    if encrypted_monitor_bits.len() != n
-        || arithmetic.s_comms.len() != n
-        || arithmetic.beta_comms.len() != n
-    {
+    if encrypted_monitor_bits.len() != n || arithmetic.s_comms.len() != n {
         return Err("target sigma statement length mismatch".to_string());
     }
 
@@ -632,58 +593,59 @@ fn verify_sigma(
         .decompress()
         .ok_or("target sigma A_c2 invalid point")?;
 
-    let weights = sigma_weights(pk, encrypted_monitor_bits, ciphertext, arithmetic);
-    let mut t = sigma_transcript(pk, encrypted_monitor_bits, ciphertext, arithmetic);
-    for w in &weights {
-        t.append_message(b"w", &w.to_bytes());
-    }
+    let mut t = sigma_challenge_transcript(pk, encrypted_monitor_bits, ciphertext, arithmetic);
     t.append_message(b"A_open", sigma.a_open.as_bytes());
     t.append_message(b"A_c1", sigma.a_c1.as_bytes());
     t.append_message(b"A_c2", sigma.a_c2.as_bytes());
-    let chal = challenge_scalar(&mut t);
+    let chal = nontrivial_challenge(&mut t);
+    let weights = sigma_weights(2 * n + 3);
 
     let (w_q, rest) = weights.split_at(n);
     let (w_s, rest) = rest.split_at(n);
-    let (w_beta, rest) = rest.split_at(n);
-    let _w_u = rest[0];
-    let _w_r_u = rest[1];
+    let w_z = rest[0];
 
-    let mut open_scalars = Vec::with_capacity(3 * n + 2);
-    let mut open_points = Vec::with_capacity(3 * n + 2);
-    let mut b_scalar = Scalar::zero();
+    // Derive z_beta[j] = z_z - 2*z_q[j]  (no longer transmitted).
+    let two = Scalar::from(2u64);
+
+    // --- Opt 2: collapse all B-coefficient terms into one MSM entry ---
+    // open check:
+    //   (w_z*z_z + Σ_j(w_q[j]*z_q[j] + w_s[j]*z_s[j])) * B
+    //   + z_blind_agg * B_blinding
+    //   - a_open
+    //   - chal * (w_z*z_comm + Σ_j(w_q[j]*q_comm[j] + w_s[j]*s_comm[j])) = 0
+    let mut b_coeff = w_z * sigma.z_z;
+    // 2n decompressed commitment points + B + B_blinding + a_open + z_comm = 2n+4 points
+    let mut open_scalars: Vec<Scalar> = Vec::with_capacity(2 * n + 4);
+    let mut open_points: Vec<RistrettoPoint> = Vec::with_capacity(2 * n + 4);
+
     for idx in 0..n {
-        open_scalars.push(w_q[idx] * sigma.z_q[idx]);
-        open_points.push(pc_gens.B);
+        b_coeff += w_q[idx] * sigma.z_q[idx] + w_s[idx] * sigma.z_s[idx];
         open_scalars.push(-chal * w_q[idx]);
         open_points.push(
             arithmetic.q_comms[idx]
                 .decompress()
                 .ok_or("target q commitment invalid point")?,
         );
-
-        open_scalars.push(w_s[idx] * sigma.z_s[idx]);
-        open_points.push(pc_gens.B);
         open_scalars.push(-chal * w_s[idx]);
         open_points.push(
             arithmetic.s_comms[idx]
                 .decompress()
                 .ok_or("target s commitment invalid point")?,
         );
-
-        open_scalars.push(w_beta[idx] * sigma.z_beta[idx]);
-        open_points.push(pc_gens.B);
-        open_scalars.push(-chal * w_beta[idx]);
-        open_points.push(
-            arithmetic.beta_comms[idx]
-                .decompress()
-                .ok_or("target beta commitment invalid point")?,
-        );
     }
-    b_scalar += sigma.z_blind_agg;
-    open_scalars.push(b_scalar);
+    open_scalars.push(b_coeff);
+    open_points.push(pc_gens.B);
+    open_scalars.push(sigma.z_blind_agg);
     open_points.push(pc_gens.B_blinding);
     open_scalars.push(-Scalar::one());
     open_points.push(a_open);
+    open_scalars.push(-chal * w_z);
+    open_points.push(
+        arithmetic
+            .z_comm
+            .decompress()
+            .ok_or("target z commitment invalid point")?,
+    );
 
     let open_check = RistrettoPoint::vartime_multiscalar_mul(
         open_scalars.iter().copied(),
@@ -693,12 +655,15 @@ fn verify_sigma(
         return Err("target sigma commitment opening relation failed".to_string());
     }
 
+    // --- c1 check ---
+    // (z_zru + Σ z_s[j]) * G + Σ (z_beta[j] * m_j.c1) - a_c1 - chal * c.c1 = 0
     let mut c1_scalars = Vec::with_capacity(2 * n + 3);
     let mut c1_points = Vec::with_capacity(2 * n + 3);
     let mut g1 = sigma.z_zru;
     for idx in 0..n {
+        let z_beta_j = sigma.z_z - two * sigma.z_q[idx];
         g1 += sigma.z_s[idx];
-        c1_scalars.push(sigma.z_beta[idx]);
+        c1_scalars.push(z_beta_j);
         c1_points.push(encrypted_monitor_bits[idx].c1);
     }
     c1_scalars.push(g1);
@@ -715,14 +680,18 @@ fn verify_sigma(
         return Err("target sigma c1 relation failed".to_string());
     }
 
+    // --- c2 check ---
+    // (z_zu + Σ z_q[j]) * G + (z_zru + Σ z_s[j]) * pk
+    // + Σ (z_beta[j] * m_j.c2) - a_c2 - chal * c.c2 = 0
     let mut c2_scalars = Vec::with_capacity(3 * n + 5);
     let mut c2_points = Vec::with_capacity(3 * n + 5);
     let mut g2 = sigma.z_zu;
     let mut pk2 = sigma.z_zru;
     for idx in 0..n {
+        let z_beta_j = sigma.z_z - two * sigma.z_q[idx];
         g2 += sigma.z_q[idx];
         pk2 += sigma.z_s[idx];
-        c2_scalars.push(sigma.z_beta[idx]);
+        c2_scalars.push(z_beta_j);
         c2_points.push(encrypted_monitor_bits[idx].c2);
     }
     c2_scalars.push(g2);
@@ -743,6 +712,8 @@ fn verify_sigma(
 
     Ok(())
 }
+
+// ----- public API -------------------------------------------------------------
 
 pub fn default_gens(bit_len: usize) -> (PedersenGens, BulletproofGens) {
     (PedersenGens::default(), make_bp_gens(bit_len))
@@ -813,6 +784,8 @@ pub fn verify(
     )?;
     Ok(())
 }
+
+// ----- tests ------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

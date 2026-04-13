@@ -1,6 +1,7 @@
 use std::io;
 use std::net::TcpStream;
 
+use bulletproofs::{BulletproofGens, PedersenGens};
 use curve25519_dalek_ng::{constants::RISTRETTO_BASEPOINT_TABLE, scalar::Scalar};
 use rand::rngs::OsRng;
 
@@ -9,10 +10,10 @@ use crate::crypto::elgamal::{
     poly_scalar_mul, Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare, SecretKeyShare,
 };
 use crate::fuzzy::proof;
-use crate::fuzzy::target_proof::{self, WireTargetHybridProof};
 use crate::fuzzy::target::{
     recv_msg, send_msg, MonitorToTarget, TargetToMonitor, WireCiphertext, WireEncryptedPoly,
 };
+use crate::fuzzy::target_proof::{self, WireTargetHybridProof};
 
 pub struct Monitor {
     m_elmt: Scalar,
@@ -23,6 +24,8 @@ pub struct Monitor {
     pk2: PublicKeyShare,
     pk: PublicKey,
     vector_size: usize,
+    pc_gens: PedersenGens,
+    bp_gens: BulletproofGens,
 }
 
 impl Monitor {
@@ -35,6 +38,7 @@ impl Monitor {
         pk2: PublicKeyShare,
         vector_size: usize,
     ) -> Self {
+        let (pc_gens, bp_gens) = target_proof::default_gens(vector_size);
         Self {
             m_elmt,
             _monitor_only_sk: monitor_only_sk,
@@ -44,6 +48,8 @@ impl Monitor {
             pk2,
             pk: combine_public_keys(&pk1, &pk2),
             vector_size,
+            pc_gens,
+            bp_gens,
         }
     }
 
@@ -63,7 +69,10 @@ impl Monitor {
             .iter()
             .map(|bit| {
                 let enc_r = Scalar::random(rng);
-                (encrypt_with_randomness(&self.monitor_only_pk, bit, enc_r), enc_r)
+                (
+                    encrypt_with_randomness(&self.monitor_only_pk, bit, enc_r),
+                    enc_r,
+                )
             })
             .unzip();
         let proof = proof::prove_round(
@@ -113,7 +122,10 @@ impl Monitor {
                 ))
             }
         };
-        eprintln!("[Monitor] Received Accum ciphertext (len={})", current_accum_wire.0.len());
+        eprintln!(
+            "[Monitor] Received Accum ciphertext (len={})",
+            current_accum_wire.0.len()
+        );
         let current_accum = current_accum_wire
             .to_native()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -146,14 +158,12 @@ impl Monitor {
                     masked_distance_proofs,
                     target_compute_proof_ms,
                 } => {
-                    self.verify_target_reply(
-                        &msg,
-                        &masked_distances,
-                        &masked_distance_proofs,
-                    )
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    self.verify_target_reply(&msg, &masked_distances, &masked_distance_proofs)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     let latency_ms = latency_start.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("[Monitor] Latency (recv accum -> monitor decrypt): {latency_ms:.3} ms");
+                    eprintln!(
+                        "[Monitor] Latency (recv accum -> monitor decrypt): {latency_ms:.3} ms"
+                    );
                     eprintln!(
                         "[Monitor] Compute Time: monitor compute+proof={monitor_compute_proof_ms:.3} ms  target compute+proof={target_compute_proof_ms:.3} ms"
                     );
@@ -170,7 +180,9 @@ impl Monitor {
                     target_compute_proof_ms,
                 } => {
                     let latency_ms = latency_start.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!("[Monitor] Latency (recv accum -> monitor decrypt): {latency_ms:.3} ms");
+                    eprintln!(
+                        "[Monitor] Latency (recv accum -> monitor decrypt): {latency_ms:.3} ms"
+                    );
                     eprintln!(
                         "[Monitor] Compute Time: monitor compute+proof={monitor_compute_proof_ms:.3} ms  target compute+proof={target_compute_proof_ms:.3} ms"
                     );
@@ -221,13 +233,12 @@ impl Monitor {
             .map(WireCiphertext::to_native)
             .collect::<Result<_, _>>()?;
 
-        let (pc_gens, bp_gens) = target_proof::default_gens(encrypted_input_bits.len());
         for (ciphertext, proof) in masked_distances.iter().zip(masked_distance_proofs.iter()) {
             let ciphertext = ciphertext.to_native()?;
             let proof = proof.to_native()?;
             target_proof::verify(
-                &pc_gens,
-                &bp_gens,
+                &self.pc_gens,
+                &self.bp_gens,
                 &self.monitor_only_pk,
                 &ciphertext,
                 &encrypted_input_bits,
@@ -264,10 +275,17 @@ fn non_zero_scalar(rng: &mut OsRng) -> Scalar {
 }
 
 fn encrypt_with_randomness(pk: &PublicKey, msg: &Scalar, r: Scalar) -> Ciphertext {
-    Ciphertext {
-        c1: &r * &RISTRETTO_BASEPOINT_TABLE,
-        c2: msg * &RISTRETTO_BASEPOINT_TABLE + r * pk.0,
-    }
+    let c1 = &r * &RISTRETTO_BASEPOINT_TABLE;
+    let r_pk = r * pk.0;
+    let c2 = if *msg == Scalar::zero() {
+        r_pk
+    } else if *msg == Scalar::one() {
+        &Scalar::one() * &RISTRETTO_BASEPOINT_TABLE + r_pk
+    } else {
+        msg * &RISTRETTO_BASEPOINT_TABLE + r_pk
+    };
+
+    Ciphertext { c1, c2 }
 }
 
 #[cfg(test)]
@@ -305,8 +323,15 @@ mod tests {
         let monitor_pk = PublicKey(monitor_pk_share.0);
         let threshold_pk = combine_public_keys(&pk1, &pk2);
         let vector_size = 12;
-        let monitor =
-            Monitor::new(Scalar::from(13u64), monitor_sk, monitor_pk, sk2, pk1, pk2, vector_size);
+        let monitor = Monitor::new(
+            Scalar::from(13u64),
+            monitor_sk,
+            monitor_pk,
+            sk2,
+            pk1,
+            pk2,
+            vector_size,
+        );
         let accum_ct = EncryptedPoly(vec![
             encrypt_one(&mut rng, &threshold_pk),
             encrypt_zero(&mut rng, &threshold_pk),
@@ -336,8 +361,15 @@ mod tests {
             monitor_pk,
             vector_size,
         );
-        let monitor =
-            Monitor::new(Scalar::from(7u64), monitor_sk, monitor_pk, sk2, pk1, pk2, vector_size);
+        let monitor = Monitor::new(
+            Scalar::from(7u64),
+            monitor_sk,
+            monitor_pk,
+            sk2,
+            pk1,
+            pk2,
+            vector_size,
+        );
         let accum_ct = target.build_accum_ctext(&mut rng);
         let msg = monitor.compute_round(&mut rng, &accum_ct).unwrap();
         let (next_accum, masked_distances, masked_distance_proofs) =
@@ -393,12 +425,8 @@ mod tests {
 
         let small_accum = small_target.build_accum_ctext(&mut rng);
         let large_accum = large_target.build_accum_ctext(&mut rng);
-        let small_msg = monitor
-            .compute_round(&mut rng, &small_accum)
-            .unwrap();
-        let large_msg = monitor
-            .compute_round(&mut rng, &large_accum)
-            .unwrap();
+        let small_msg = monitor.compute_round(&mut rng, &small_accum).unwrap();
+        let large_msg = monitor.compute_round(&mut rng, &large_accum).unwrap();
 
         assert_eq!(small_msg.encrypted_input_bits.len(), vector_size);
         assert_eq!(large_msg.encrypted_input_bits.len(), vector_size);

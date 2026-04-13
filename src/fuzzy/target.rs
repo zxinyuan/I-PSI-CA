@@ -1,11 +1,12 @@
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
+use bulletproofs::{BulletproofGens, PedersenGens};
+use curve25519_dalek_ng::scalar::Scalar;
 use curve25519_dalek_ng::{
     constants::RISTRETTO_BASEPOINT_TABLE,
     ristretto::{CompressedRistretto, RistrettoPoint},
 };
-use curve25519_dalek_ng::scalar::Scalar;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
@@ -57,7 +58,9 @@ impl WireEncryptedPoly {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum TargetToMonitor {
-    Outsource { accum: WireEncryptedPoly },
+    Outsource {
+        accum: WireEncryptedPoly,
+    },
     NextRound {
         masked_distances: Vec<WireCiphertext>,
         masked_distance_proofs: Vec<WireTargetHybridProof>,
@@ -112,6 +115,8 @@ pub struct Target {
     pk: PublicKey,
     monitor_pk: PublicKey,
     vector_size: usize,
+    pc_gens: PedersenGens,
+    bp_gens: BulletproofGens,
 }
 
 impl Target {
@@ -128,6 +133,7 @@ impl Target {
             .iter()
             .map(|item| encode_scalar_bits(item, vector_size))
             .collect();
+        let (pc_gens, bp_gens) = target_proof::default_gens(vector_size);
         Self {
             _t_set: t_set,
             _encoded_t_set: encoded_t_set,
@@ -138,6 +144,8 @@ impl Target {
             pk: combine_public_keys(&pk1, &pk2),
             monitor_pk,
             vector_size,
+            pc_gens,
+            bp_gens,
         }
     }
 
@@ -168,8 +176,11 @@ impl Target {
         if msg.encrypted_input_bits.len() != self.vector_size {
             return Err("encrypted_input_bits length mismatch".to_string());
         }
-        let encrypted_input_bits: Result<Vec<_>, _> =
-            msg.encrypted_input_bits.iter().map(|ct| ct.to_native()).collect();
+        let encrypted_input_bits: Result<Vec<_>, _> = msg
+            .encrypted_input_bits
+            .iter()
+            .map(|ct| ct.to_native())
+            .collect();
         let encrypted_input_bits = encrypted_input_bits?;
         proof::verify_round(
             &msg.proof,
@@ -193,6 +204,8 @@ impl Target {
                 masked_distance_with_proof_for_item(
                     rng,
                     &self.monitor_pk,
+                    &self.pc_gens,
+                    &self.bp_gens,
                     encoded_x,
                     &encrypted_input_bits,
                 )
@@ -224,7 +237,10 @@ impl Target {
         )?;
         let outsource_ms = t_outsource_start.elapsed().as_secs_f64() * 1000.0;
         eprintln!("[Target] Outsource Time (compute -> send): {outsource_ms:.3} ms");
-        eprintln!("[Target] Sent initial accum ciphertext (deg {})", self.accum_degree);
+        eprintln!(
+            "[Target] Sent initial accum ciphertext (deg {})",
+            self.accum_degree
+        );
 
         loop {
             let msg: MonitorToTarget = match recv_msg(&mut s) {
@@ -295,6 +311,8 @@ fn encode_scalar_bits(input: &Scalar, vector_size: usize) -> Vec<Scalar> {
 fn masked_distance_with_proof_for_item<R: rand::CryptoRng + rand::RngCore>(
     rng: &mut R,
     monitor_pk: &PublicKey,
+    pc_gens: &PedersenGens,
+    bp_gens: &BulletproofGens,
     encoded_x: &[Scalar],
     encrypted_y: &[Ciphertext],
 ) -> Result<(Ciphertext, WireTargetHybridProof), String> {
@@ -311,9 +329,15 @@ fn masked_distance_with_proof_for_item<R: rand::CryptoRng + rand::RngCore>(
         let x_r = Scalar::random(rng);
         bit_randomness.push(x_r);
         let enc_x = encrypt_with_randomness(monitor_pk, x_j, x_r);
-        let coeff = Scalar::one() - Scalar::from(2u64) * *x_j;
-        acc.c1 += enc_x.c1 + coeff * y_j.c1;
-        acc.c2 += enc_x.c2 + coeff * y_j.c2;
+        if *x_j == Scalar::zero() {
+            acc.c1 += enc_x.c1 + y_j.c1;
+            acc.c2 += enc_x.c2 + y_j.c2;
+        } else if *x_j == Scalar::one() {
+            acc.c1 += enc_x.c1 - y_j.c1;
+            acc.c2 += enc_x.c2 - y_j.c2;
+        } else {
+            return Err("encoded target bit is not binary".to_string());
+        }
     }
 
     let u = Scalar::random(rng);
@@ -325,11 +349,10 @@ fn masked_distance_with_proof_for_item<R: rand::CryptoRng + rand::RngCore>(
         c2: z * acc.c2 + enc_u.c2,
     };
 
-    let (pc_gens, bp_gens) = target_proof::default_gens(encoded_x.len());
     let proof = target_proof::prove(
         rng,
-        &pc_gens,
-        &bp_gens,
+        pc_gens,
+        bp_gens,
         monitor_pk,
         &ciphertext,
         encrypted_y,
@@ -344,10 +367,17 @@ fn masked_distance_with_proof_for_item<R: rand::CryptoRng + rand::RngCore>(
 }
 
 fn encrypt_with_randomness(pk: &PublicKey, msg: &Scalar, r: Scalar) -> Ciphertext {
-    Ciphertext {
-        c1: &r * &RISTRETTO_BASEPOINT_TABLE,
-        c2: msg * &RISTRETTO_BASEPOINT_TABLE + r * pk.0,
-    }
+    let c1 = &r * &RISTRETTO_BASEPOINT_TABLE;
+    let r_pk = r * pk.0;
+    let c2 = if *msg == Scalar::zero() {
+        r_pk
+    } else if *msg == Scalar::one() {
+        &Scalar::one() * &RISTRETTO_BASEPOINT_TABLE + r_pk
+    } else {
+        msg * &RISTRETTO_BASEPOINT_TABLE + r_pk
+    };
+
+    Ciphertext { c1, c2 }
 }
 
 #[cfg(test)]
@@ -460,7 +490,15 @@ mod tests {
         let (sk2, pk2) = generate_key_share(&mut rng);
         let (_monitor_sk, monitor_pk_share) = generate_key_share(&mut rng);
         let monitor_pk = PublicKey(monitor_pk_share.0);
-        let mut target = Target::new(vec![Scalar::from(11u64)], 5, sk1, pk1.clone(), pk2, monitor_pk, 8);
+        let mut target = Target::new(
+            vec![Scalar::from(11u64)],
+            5,
+            sk1,
+            pk1.clone(),
+            pk2,
+            monitor_pk,
+            8,
+        );
         let zero_accum = EncryptedPoly(vec![
             encrypt_zero(&mut rng, &target.pk),
             encrypt_zero(&mut rng, &target.pk),
@@ -510,7 +548,9 @@ mod tests {
             proof,
         };
 
-        let err = target.process_round(&mut rng, &zero_accum, &msg).unwrap_err();
+        let err = target
+            .process_round(&mut rng, &zero_accum, &msg)
+            .unwrap_err();
         assert!(
             err == "accum_eval decrypts to 0" || err.contains("sigma"),
             "unexpected rejection reason: {err}"
