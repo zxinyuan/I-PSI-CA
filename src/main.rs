@@ -20,7 +20,7 @@ use i_psi_ca::bf::bloom::{
     find_non_member_scalar, recommended_hash_count, sample_marked_positions, sample_query_scalar,
     BloomFilterConfig,
 };
-use i_psi_ca::crypto::elgamal::{generate_key_share, PublicKey};
+use i_psi_ca::crypto::elgamal::generate_key_share;
 
 const ADDR: &str = "127.0.0.1:7878";
 const DEGREE: usize = 1_000;
@@ -404,8 +404,6 @@ fn main() {
             );
         }
         ProtocolVersion::Fuzzy => {
-            let (monitor_only_sk, monitor_only_pk_share) = generate_key_share(&mut rng);
-            let monitor_only_pk = PublicKey(monitor_only_pk_share.0);
             let t_set: Vec<Scalar> = (0..config.size)
                 .map(|_| sample_fuzzy_scalar(&mut rng, config.fuzzy_vector_size))
                 .collect();
@@ -430,8 +428,6 @@ fn main() {
                 sk1,
                 pk1,
                 pk2_for_target,
-                monitor_only_sk,
-                monitor_only_pk,
                 sk2,
                 pk1_for_monitor,
                 pk2,
@@ -514,8 +510,6 @@ fn run_fuzzy(
     sk1: i_psi_ca::crypto::elgamal::SecretKeyShare,
     pk1: i_psi_ca::crypto::elgamal::PublicKeyShare,
     pk2_for_target: i_psi_ca::crypto::elgamal::PublicKeyShare,
-    monitor_only_sk: i_psi_ca::crypto::elgamal::SecretKeyShare,
-    monitor_only_pk: i_psi_ca::crypto::elgamal::PublicKey,
     sk2: i_psi_ca::crypto::elgamal::SecretKeyShare,
     pk1_for_monitor: i_psi_ca::crypto::elgamal::PublicKeyShare,
     pk2: i_psi_ca::crypto::elgamal::PublicKeyShare,
@@ -528,7 +522,6 @@ fn run_fuzzy(
             sk1,
             pk1,
             pk2_for_target,
-            monitor_only_pk,
             vector_size,
         );
         target.run(ADDR).expect("[Target] server error");
@@ -538,8 +531,6 @@ fn run_fuzzy(
 
     let monitor = i_psi_ca::fuzzy::monitor::Monitor::new(
         m_elmt,
-        monitor_only_sk,
-        monitor_only_pk,
         sk2,
         pk1_for_monitor,
         pk2,

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::elgamal::{
     Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare, SecretKeyShare,
 };
-use crate::crypto::sigma::{self, PartialDecryptProof, PolyScalarMulProof};
+use crate::crypto::sigma;
 use crate::fuzzy::target::WireCiphertext;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -68,55 +68,74 @@ impl WireMonitorBulletproof {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-struct WireBitEncryptionProof {
-    a1: [u8; 32],
-    a2: [u8; 32],
-    a3: [u8; 32],
-    z_bit: [u8; 32],
-    z_r: [u8; 32],
-    z_blind: [u8; 32],
+struct WireCBatchProof {
+    a_c1: [u8; 32],
+    a_c2: [u8; 32],
+    a_bits: [u8; 32],
+    z_y: Vec<[u8; 32]>,
+    z_r: Vec<Vec<[u8; 32]>>,
+    z_blind: Vec<[u8; 32]>,
 }
 
 #[derive(Clone, Debug)]
-struct BitEncryptionProof {
-    a1: CompressedRistretto,
-    a2: CompressedRistretto,
-    a3: CompressedRistretto,
-    z_bit: Scalar,
-    z_r: Scalar,
-    z_blind: Scalar,
+struct CBatchProof {
+    a_c1: CompressedRistretto,
+    a_c2: CompressedRistretto,
+    a_bits: CompressedRistretto,
+    z_y: Vec<Scalar>,
+    z_r: Vec<Vec<Scalar>>,
+    z_blind: Vec<Scalar>,
 }
 
-struct ParsedBitEncryptionProof {
-    a1: RistrettoPoint,
-    a2: RistrettoPoint,
-    a3: RistrettoPoint,
-    z_bit: Scalar,
-    z_r: Scalar,
-    z_blind: Scalar,
-}
-
-impl WireBitEncryptionProof {
-    fn from_native(proof: &BitEncryptionProof) -> Self {
+impl WireCBatchProof {
+    fn from_native(proof: &CBatchProof) -> Self {
         Self {
-            a1: proof.a1.to_bytes(),
-            a2: proof.a2.to_bytes(),
-            a3: proof.a3.to_bytes(),
-            z_bit: proof.z_bit.to_bytes(),
-            z_r: proof.z_r.to_bytes(),
-            z_blind: proof.z_blind.to_bytes(),
+            a_c1: proof.a_c1.to_bytes(),
+            a_c2: proof.a_c2.to_bytes(),
+            a_bits: proof.a_bits.to_bytes(),
+            z_y: proof.z_y.iter().map(Scalar::to_bytes).collect(),
+            z_r: proof
+                .z_r
+                .iter()
+                .map(|row| row.iter().map(Scalar::to_bytes).collect())
+                .collect(),
+            z_blind: proof.z_blind.iter().map(Scalar::to_bytes).collect(),
         }
     }
 
-    fn to_native(&self) -> Result<BitEncryptionProof, String> {
-        Ok(BitEncryptionProof {
-            a1: CompressedRistretto::from_slice(&self.a1),
-            a2: CompressedRistretto::from_slice(&self.a2),
-            a3: CompressedRistretto::from_slice(&self.a3),
-            z_bit: Scalar::from_canonical_bytes(self.z_bit).ok_or("z_bit: non-canonical scalar")?,
-            z_r: Scalar::from_canonical_bytes(self.z_r).ok_or("z_r: non-canonical scalar")?,
-            z_blind: Scalar::from_canonical_bytes(self.z_blind)
-                .ok_or("z_blind: non-canonical scalar")?,
+    fn to_native(&self) -> Result<CBatchProof, String> {
+        Ok(CBatchProof {
+            a_c1: CompressedRistretto::from_slice(&self.a_c1),
+            a_c2: CompressedRistretto::from_slice(&self.a_c2),
+            a_bits: CompressedRistretto::from_slice(&self.a_bits),
+            z_y: self
+                .z_y
+                .iter()
+                .map(|bytes| {
+                    Scalar::from_canonical_bytes(*bytes)
+                        .ok_or("c batch z_y: non-canonical scalar")
+                })
+                .collect::<Result<_, _>>()?,
+            z_r: self
+                .z_r
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|bytes| {
+                            Scalar::from_canonical_bytes(*bytes)
+                                .ok_or("c batch z_r: non-canonical scalar")
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<_, _>>()?,
+            z_blind: self
+                .z_blind
+                .iter()
+                .map(|bytes| {
+                    Scalar::from_canonical_bytes(*bytes)
+                        .ok_or("c batch z_blind: non-canonical scalar")
+                })
+                .collect::<Result<_, _>>()?,
         })
     }
 }
@@ -125,18 +144,18 @@ impl WireBitEncryptionProof {
 struct WireGlueProof {
     alpha_tag: [u8; 32],
     a_t: [u8; 32],
+    z_y: [u8; 32],
     z_e: Vec<[u8; 32]>,
-    z_alpha: [u8; 32],
-    z_y_blind: [u8; 32],
+    z_tau: [u8; 32],
 }
 
 #[derive(Clone, Debug)]
 struct GlueProof {
     alpha_tag: CompressedRistretto,
     a_t: CompressedRistretto,
+    z_y: Scalar,
     z_e: Vec<Scalar>,
-    z_alpha: Scalar,
-    z_y_blind: Scalar,
+    z_tau: Scalar,
 }
 
 impl WireGlueProof {
@@ -144,9 +163,9 @@ impl WireGlueProof {
         Self {
             alpha_tag: proof.alpha_tag.to_bytes(),
             a_t: proof.a_t.to_bytes(),
+            z_y: proof.z_y.to_bytes(),
             z_e: proof.z_e.iter().map(Scalar::to_bytes).collect(),
-            z_alpha: proof.z_alpha.to_bytes(),
-            z_y_blind: proof.z_y_blind.to_bytes(),
+            z_tau: proof.z_tau.to_bytes(),
         }
     }
 
@@ -154,17 +173,92 @@ impl WireGlueProof {
         Ok(GlueProof {
             alpha_tag: CompressedRistretto::from_slice(&self.alpha_tag),
             a_t: CompressedRistretto::from_slice(&self.a_t),
+            z_y: Scalar::from_canonical_bytes(self.z_y)
+                .ok_or("glue z_y: non-canonical scalar")?,
             z_e: self
                 .z_e
                 .iter()
                 .map(|bytes| {
                     Scalar::from_canonical_bytes(*bytes).ok_or("glue z_e: non-canonical scalar")
                 })
-                .collect::<Result<Vec<_>, _>>()?,
-            z_alpha: Scalar::from_canonical_bytes(self.z_alpha)
-                .ok_or("glue z_alpha: non-canonical scalar")?,
-            z_y_blind: Scalar::from_canonical_bytes(self.z_y_blind)
-                .ok_or("glue z_y_blind: non-canonical scalar")?,
+                .collect::<Result<_, _>>()?,
+            z_tau: Scalar::from_canonical_bytes(self.z_tau)
+                .ok_or("glue z_tau: non-canonical scalar")?,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct WirePartialDecryptProof {
+    a: [u8; 32],
+    z1: [u8; 32],
+    z2: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+struct PartialDecryptProof {
+    a: CompressedRistretto,
+    z1: Scalar,
+    z2: Scalar,
+}
+
+impl WirePartialDecryptProof {
+    fn from_native(proof: &PartialDecryptProof) -> Self {
+        Self {
+            a: proof.a.to_bytes(),
+            z1: proof.z1.to_bytes(),
+            z2: proof.z2.to_bytes(),
+        }
+    }
+
+    fn to_native(&self) -> Result<PartialDecryptProof, String> {
+        Ok(PartialDecryptProof {
+            a: CompressedRistretto::from_slice(&self.a),
+            z1: Scalar::from_canonical_bytes(self.z1)
+                .ok_or("partial decrypt z1: non-canonical scalar")?,
+            z2: Scalar::from_canonical_bytes(self.z2)
+                .ok_or("partial decrypt z2: non-canonical scalar")?,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct WirePolyScalarMulProof {
+    a1: [u8; 32],
+    a2: [u8; 32],
+    alpha_tag: [u8; 32],
+    a_m: [u8; 32],
+    s_y: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+struct PolyScalarMulProof {
+    a1: CompressedRistretto,
+    a2: CompressedRistretto,
+    alpha_tag: CompressedRistretto,
+    a_m: CompressedRistretto,
+    s_y: Scalar,
+}
+
+impl WirePolyScalarMulProof {
+    fn from_native(proof: &PolyScalarMulProof) -> Self {
+        Self {
+            a1: proof.a1.to_bytes(),
+            a2: proof.a2.to_bytes(),
+            alpha_tag: proof.alpha_tag.to_bytes(),
+            a_m: proof.a_m.to_bytes(),
+            s_y: proof.s_y.to_bytes(),
+        }
+    }
+
+    fn to_native(&self) -> Result<PolyScalarMulProof, String> {
+        Ok(PolyScalarMulProof {
+            a1: CompressedRistretto::from_slice(&self.a1),
+            a2: CompressedRistretto::from_slice(&self.a2),
+            alpha_tag: CompressedRistretto::from_slice(&self.alpha_tag),
+            a_m: CompressedRistretto::from_slice(&self.a_m),
+            s_y: Scalar::from_canonical_bytes(self.s_y)
+                .ok_or("poly scalar mul s_y: non-canonical scalar")?,
         })
     }
 }
@@ -172,21 +266,30 @@ impl WireGlueProof {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct FuzzyProofBundle {
     monitor_bulletproof: WireMonitorBulletproof,
-    bit_encryption_proofs: Vec<WireBitEncryptionProof>,
+    c_proof: WireCBatchProof,
     accum_scaled_eval: WireCiphertext,
-    accum_eval_proof: PartialDecryptProof,
-    next_accum_proof: PolyScalarMulProof,
     glue_proof: WireGlueProof,
+    accum_eval_proof: WirePartialDecryptProof,
+    next_accum_proof: WirePolyScalarMulProof,
 }
 
 struct MonitorBulletproofWitness {
     bit_blindings: Vec<Scalar>,
     y_blind: Scalar,
+    e_blindings: Vec<Scalar>,
 }
 
 #[inline]
 fn mul_g(s: &Scalar) -> RistrettoPoint {
     s * &RISTRETTO_BASEPOINT_TABLE
+}
+
+fn append_point(t: &mut Transcript, label: &'static [u8], p: &RistrettoPoint) {
+    t.append_message(label, p.compress().as_bytes());
+}
+
+fn append_compressed(t: &mut Transcript, label: &'static [u8], p: &CompressedRistretto) {
+    t.append_message(label, p.as_bytes());
 }
 
 fn challenge_scalar(transcript: &mut Transcript) -> Scalar {
@@ -195,33 +298,39 @@ fn challenge_scalar(transcript: &mut Transcript) -> Scalar {
     Scalar::from_bytes_mod_order_wide(&buf)
 }
 
-fn nontrivial_challenge(transcript: &mut Transcript) -> Scalar {
-    let challenge = challenge_scalar(transcript);
-    if challenge == -Scalar::one() {
-        Scalar::from(2u64)
-    } else {
-        challenge + Scalar::one()
-    }
+fn batch_scalar(transcript: &mut Transcript, label: &'static [u8]) -> Scalar {
+    let mut buf = [0u8; 64];
+    transcript.challenge_bytes(label, &mut buf);
+    Scalar::from_bytes_mod_order_wide(&buf)
 }
 
-fn fixed_batch_weights(count: usize) -> Vec<Scalar> {
-    let mut weights = Vec::with_capacity(count);
-    let mut weight = Scalar::one();
+fn powers(base: Scalar, count: usize) -> Vec<Scalar> {
+    let mut out = Vec::with_capacity(count);
+    let mut cur = Scalar::one();
     for _ in 0..count {
-        weights.push(weight);
-        weight += Scalar::one();
+        out.push(cur);
+        cur *= base;
+    }
+    out
+}
+
+fn fixed_weights(count: usize) -> Vec<Scalar> {
+    let mut weights = Vec::with_capacity(count);
+    let mut w = Scalar::one();
+    for _ in 0..count {
+        weights.push(w);
+        w += Scalar::one();
     }
     weights
 }
 
 fn make_monitor_bp_gens(vector_size: usize, coeff_len: usize) -> BulletproofGens {
-    let multipliers = (vector_size + coeff_len + 2).max(2);
-    let cap = 1usize << (usize::BITS - (multipliers - 1).leading_zeros()) as usize;
-    BulletproofGens::new(cap.max(64), 1)
+    let multipliers = (vector_size + coeff_len + 1).max(2);
+    BulletproofGens::new(multipliers.next_power_of_two().max(64), 1)
 }
 
 fn monitor_bulletproof_transcript(coeff_len: usize, vector_size: usize) -> Transcript {
-    let mut t = Transcript::new(b"I-PSI-CA::fuzzy_monitor_bulletproof_v1");
+    let mut t = Transcript::new(b"I-PSI-CA::fuzzy_monitor_bulletproof_v2");
     t.append_u64(b"coeff_len", coeff_len as u64);
     t.append_u64(b"vector_size", vector_size as u64);
     t
@@ -252,7 +361,7 @@ fn monitor_bulletproof_gadget<CS: ConstraintSystem>(
     let mut coeff = Scalar::one();
     for &bit_var in bit_vars {
         y_lc = y_lc + coeff * LinearCombination::from(bit_var);
-        coeff = coeff + coeff;
+        coeff += coeff;
     }
     cs.constrain(y_lc);
 
@@ -300,10 +409,13 @@ fn prove_monitor_bulletproof<R: CryptoRng + RngCore>(
 
     let mut e_comms = Vec::with_capacity(e_asc.len());
     let mut e_vars = Vec::with_capacity(e_asc.len());
+    let mut e_blindings = Vec::with_capacity(e_asc.len());
     for &e_d in e_asc {
-        let (comm, var) = prover.commit(e_d, Scalar::random(rng));
+        let blind = Scalar::random(rng);
+        let (comm, var) = prover.commit(e_d, blind);
         e_comms.push(comm);
         e_vars.push(var);
+        e_blindings.push(blind);
     }
 
     let inv_e0 = e_asc[0].invert();
@@ -323,6 +435,7 @@ fn prove_monitor_bulletproof<R: CryptoRng + RngCore>(
         MonitorBulletproofWitness {
             bit_blindings,
             y_blind,
+            e_blindings,
         },
     ))
 }
@@ -335,11 +448,7 @@ fn verify_monitor_bulletproof(
     let mut transcript = monitor_bulletproof_transcript(proof.e_comms.len(), proof.bit_comms.len());
     let mut verifier = Verifier::new(&mut transcript);
 
-    let bit_vars: Vec<Variable> = proof
-        .bit_comms
-        .iter()
-        .map(|&c| verifier.commit(c))
-        .collect();
+    let bit_vars: Vec<Variable> = proof.bit_comms.iter().map(|&c| verifier.commit(c)).collect();
     let y_var = verifier.commit(proof.y_comm);
     let e_vars: Vec<Variable> = proof.e_comms.iter().map(|&c| verifier.commit(c)).collect();
     let inv_e0_var = verifier.commit(proof.inv_e0_comm);
@@ -352,158 +461,145 @@ fn verify_monitor_bulletproof(
         .map_err(|e| format!("monitor bulletproof invalid: {e:?}"))
 }
 
-fn bit_encryption_transcript(
-    pk: &PublicKey,
-    ct: &Ciphertext,
-    bit_comm: &CompressedRistretto,
+fn c_relation_transcript(
+    pc_gens: &PedersenGens,
+    threshold_pk: &PublicKey,
+    encrypted_item_bits: &[Vec<Ciphertext>],
+    c: &[Ciphertext],
+    bit_comms: &[CompressedRistretto],
 ) -> Transcript {
-    let mut t = Transcript::new(b"I-PSI-CA::fuzzy_bit_encrypt_v1");
-    t.append_message(b"pk", pk.0.compress().as_bytes());
-    t.append_message(b"ct_c1", ct.c1.compress().as_bytes());
-    t.append_message(b"ct_c2", ct.c2.compress().as_bytes());
-    t.append_message(b"bit_comm", bit_comm.as_bytes());
+    let mut t = Transcript::new(b"I-PSI-CA::fuzzy_c_relation_v2");
+    append_point(&mut t, b"pc_b", &pc_gens.B);
+    append_point(&mut t, b"pc_b_blind", &pc_gens.B_blinding);
+    append_point(&mut t, b"threshold_pk", &threshold_pk.0);
+    for c_i in c {
+        append_point(&mut t, b"c_c1", &c_i.c1);
+        append_point(&mut t, b"c_c2", &c_i.c2);
+    }
+    for item_bits in encrypted_item_bits {
+        for x in item_bits {
+            append_point(&mut t, b"x_c1", &x.c1);
+            append_point(&mut t, b"x_c2", &x.c2);
+        }
+    }
+    for bit_comm in bit_comms {
+        append_compressed(&mut t, b"bit_comm", bit_comm);
+    }
     t
 }
 
-fn prove_bit_encryption<R: CryptoRng + RngCore>(
-    rng: &mut R,
+fn c_item_weights(
     pc_gens: &PedersenGens,
-    pk: &PublicKey,
-    ct: &Ciphertext,
-    bit_comm: &CompressedRistretto,
-    bit: Scalar,
-    enc_r: Scalar,
-    bit_blind: Scalar,
-) -> BitEncryptionProof {
-    let k_bit = Scalar::random(rng);
-    let k_r = Scalar::random(rng);
-    let k_blind = Scalar::random(rng);
-
-    let a1 = (k_r * G).compress();
-    let a2 = (k_bit * G + k_r * pk.0).compress();
-    let a3 = (k_bit * pc_gens.B + k_blind * pc_gens.B_blinding).compress();
-
-    let mut t = bit_encryption_transcript(pk, ct, bit_comm);
-    t.append_message(b"a1", a1.as_bytes());
-    t.append_message(b"a2", a2.as_bytes());
-    t.append_message(b"a3", a3.as_bytes());
-    let chal = nontrivial_challenge(&mut t);
-
-    BitEncryptionProof {
-        a1,
-        a2,
-        a3,
-        z_bit: k_bit + chal * bit,
-        z_r: k_r + chal * enc_r,
-        z_blind: k_blind + chal * bit_blind,
-    }
+    threshold_pk: &PublicKey,
+    encrypted_item_bits: &[Vec<Ciphertext>],
+    c: &[Ciphertext],
+    bit_comms: &[CompressedRistretto],
+) -> Vec<Scalar> {
+    let mut t = c_relation_transcript(pc_gens, threshold_pk, encrypted_item_bits, c, bit_comms);
+    let base = batch_scalar(&mut t, b"item_weight_base");
+    powers(base, c.len())
 }
 
-fn parse_bit_encryption_proof(
-    proof: &BitEncryptionProof,
-) -> Result<ParsedBitEncryptionProof, String> {
-    Ok(ParsedBitEncryptionProof {
-        a1: proof
-            .a1
-            .decompress()
-            .ok_or("bit encryption A1 invalid point")?,
-        a2: proof
-            .a2
-            .decompress()
-            .ok_or("bit encryption A2 invalid point")?,
-        a3: proof
-            .a3
-            .decompress()
-            .ok_or("bit encryption A3 invalid point")?,
-        z_bit: proof.z_bit,
-        z_r: proof.z_r,
-        z_blind: proof.z_blind,
+fn prove_c_relation<R: CryptoRng + RngCore>(
+    rng: &mut R,
+    pc_gens: &PedersenGens,
+    threshold_pk: &PublicKey,
+    encrypted_item_bits: &[Vec<Ciphertext>],
+    c: &[Ciphertext],
+    item_weights: &[Scalar],
+    input_bits: &[Scalar],
+    bit_blindings: &[Scalar],
+    c_randomness: &[Vec<Scalar>],
+    challenge: Scalar,
+) -> Result<CBatchProof, String> {
+    if encrypted_item_bits.len() != c.len() || encrypted_item_bits.len() != c_randomness.len() {
+        return Err("c relation witness length mismatch".to_string());
+    }
+    if input_bits.len() != bit_blindings.len() {
+        return Err("c relation witness length mismatch".to_string());
+    }
+    if !encrypted_item_bits.iter().all(|row| row.len() == input_bits.len())
+        || !c_randomness.iter().all(|row| row.len() == input_bits.len())
+    {
+        return Err("c relation witness length mismatch".to_string());
+    }
+
+    let bit_weights = fixed_weights(input_bits.len());
+    let sum_item_weights = item_weights.iter().copied().sum::<Scalar>();
+
+    let k_y: Vec<Scalar> = (0..input_bits.len()).map(|_| Scalar::random(rng)).collect();
+    let k_blind: Vec<Scalar> = (0..input_bits.len()).map(|_| Scalar::random(rng)).collect();
+    let k_r: Vec<Vec<Scalar>> = c_randomness
+        .iter()
+        .map(|row| (0..row.len()).map(|_| Scalar::random(rng)).collect())
+        .collect();
+
+    let mut a_c1 = RistrettoPoint::identity();
+    let mut a_c2 = RistrettoPoint::identity();
+    let mut sum_k_r_weighted = Scalar::zero();
+    let mut weighted_x_c1 = vec![RistrettoPoint::identity(); input_bits.len()];
+    let mut weighted_x_c2 = vec![RistrettoPoint::identity(); input_bits.len()];
+    for (item_idx, item_bits) in encrypted_item_bits.iter().enumerate() {
+        let w_item = item_weights[item_idx];
+        for (bit_idx, x) in item_bits.iter().enumerate() {
+            weighted_x_c1[bit_idx] += w_item * x.c1;
+            weighted_x_c2[bit_idx] += w_item * x.c2;
+            sum_k_r_weighted += w_item * k_r[item_idx][bit_idx];
+        }
+    }
+    a_c1 += mul_g(&sum_k_r_weighted);
+    a_c2 += sum_k_r_weighted * threshold_pk.0;
+    for bit_idx in 0..input_bits.len() {
+        a_c1 -= (Scalar::from(2u64) * k_y[bit_idx]) * weighted_x_c1[bit_idx];
+        a_c2 += k_y[bit_idx] * (sum_item_weights * G - Scalar::from(2u64) * weighted_x_c2[bit_idx]);
+    }
+
+    let a_bits = RistrettoPoint::multiscalar_mul(
+        bit_weights
+            .iter()
+            .zip(k_y.iter())
+            .map(|(w, k)| *w * *k)
+            .chain(bit_weights.iter().zip(k_blind.iter()).map(|(w, k)| *w * *k)),
+        std::iter::repeat(pc_gens.B)
+            .take(input_bits.len())
+            .chain(std::iter::repeat(pc_gens.B_blinding).take(input_bits.len())),
+    );
+
+    Ok(CBatchProof {
+        a_c1: a_c1.compress(),
+        a_c2: a_c2.compress(),
+        a_bits: a_bits.compress(),
+        z_y: k_y
+            .iter()
+            .zip(input_bits.iter())
+            .map(|(k, y)| k + challenge * y)
+            .collect(),
+        z_r: k_r
+            .iter()
+            .zip(c_randomness.iter())
+            .map(|(k_row, r_row)| {
+                k_row
+                    .iter()
+                    .zip(r_row.iter())
+                    .map(|(k, r)| k + challenge * r)
+                    .collect()
+            })
+            .collect(),
+        z_blind: k_blind
+            .iter()
+            .zip(bit_blindings.iter())
+            .map(|(k, b)| k + challenge * b)
+            .collect(),
     })
 }
 
-fn verify_bit_encryptions_batched(
-    pc_gens: &PedersenGens,
-    pk: &PublicKey,
-    encrypted_input_bits: &[Ciphertext],
-    bit_comms: &[CompressedRistretto],
-    proofs: &[BitEncryptionProof],
-) -> Result<(), String> {
-    if encrypted_input_bits.len() != bit_comms.len() || bit_comms.len() != proofs.len() {
-        return Err("bit encryption batch length mismatch".to_string());
-    }
-
-    let parsed_proofs: Vec<_> = proofs
-        .iter()
-        .map(parse_bit_encryption_proof)
-        .collect::<Result<_, _>>()?;
-    let bit_comm_pts: Vec<_> = bit_comms
-        .iter()
-        .map(|comm| comm.decompress().ok_or("bit commitment invalid point"))
-        .collect::<Result<_, _>>()?;
-
-    let batch_weights = fixed_batch_weights(3 * proofs.len());
-
-    let mut scalars = Vec::with_capacity(4 + 6 * proofs.len());
-    let mut points = Vec::with_capacity(4 + 6 * proofs.len());
-    let mut g_scalar = Scalar::zero();
-    let mut pk_scalar = Scalar::zero();
-    let mut b_scalar = Scalar::zero();
-    let mut b_blind_scalar = Scalar::zero();
-
-    for (idx, (((ct, bit_comm), proof), parsed)) in encrypted_input_bits
-        .iter()
-        .zip(bit_comms.iter())
-        .zip(proofs.iter())
-        .zip(parsed_proofs.iter())
-        .enumerate()
-    {
-        let mut t = bit_encryption_transcript(pk, ct, bit_comm);
-        t.append_message(b"a1", proof.a1.as_bytes());
-        t.append_message(b"a2", proof.a2.as_bytes());
-        t.append_message(b"a3", proof.a3.as_bytes());
-        let chal = nontrivial_challenge(&mut t);
-
-        let rho1 = batch_weights[3 * idx];
-        let rho2 = batch_weights[3 * idx + 1];
-        let rho3 = batch_weights[3 * idx + 2];
-
-        g_scalar += rho1 * parsed.z_r + rho2 * parsed.z_bit;
-        pk_scalar += rho2 * parsed.z_r;
-        b_scalar += rho3 * parsed.z_bit;
-        b_blind_scalar += rho3 * parsed.z_blind;
-
-        scalars.push(-rho1);
-        points.push(parsed.a1);
-        scalars.push(-rho1 * chal);
-        points.push(ct.c1);
-
-        scalars.push(-rho2);
-        points.push(parsed.a2);
-        scalars.push(-rho2 * chal);
-        points.push(ct.c2);
-
-        scalars.push(-rho3);
-        points.push(parsed.a3);
-        scalars.push(-rho3 * chal);
-        points.push(bit_comm_pts[idx]);
-    }
-
-    scalars.push(g_scalar);
-    points.push(G);
-    scalars.push(pk_scalar);
-    points.push(pk.0);
-    scalars.push(b_scalar);
-    points.push(pc_gens.B);
-    scalars.push(b_blind_scalar);
-    points.push(pc_gens.B_blinding);
-
-    let check =
-        RistrettoPoint::vartime_multiscalar_mul(scalars.iter().copied(), points.iter().copied());
-    if check != RistrettoPoint::identity() {
-        return Err("batched bit encryption proof verification failed".to_string());
-    }
-
-    Ok(())
+struct GlueWeights {
+    y_weight: Scalar,
+    e_weights: Vec<Scalar>,
+    commit_weight: Scalar,
+    eval_weight: Scalar,
+    c1_weight: Scalar,
+    c2_weight: Scalar,
 }
 
 fn glue_transcript(
@@ -512,173 +608,105 @@ fn glue_transcript(
     coeff_cts: &[Ciphertext],
     c_star: &Ciphertext,
 ) -> Transcript {
-    let mut t = Transcript::new(b"I-PSI-CA::fuzzy_sigma_bullet_glue_v1");
-    t.append_message(b"pk", pk.0.compress().as_bytes());
+    let mut t = Transcript::new(b"I-PSI-CA::fuzzy_sigma_bullet_glue_v2");
+    append_point(&mut t, b"pk", &pk.0);
     for c in coeff_cts {
-        t.append_message(b"coef_c1", c.c1.compress().as_bytes());
-        t.append_message(b"coef_c2", c.c2.compress().as_bytes());
+        append_point(&mut t, b"coef_c1", &c.c1);
+        append_point(&mut t, b"coef_c2", &c.c2);
     }
-    t.append_message(b"cstar_c1", c_star.c1.compress().as_bytes());
-    t.append_message(b"cstar_c2", c_star.c2.compress().as_bytes());
+    append_point(&mut t, b"cstar_c1", &c_star.c1);
+    append_point(&mut t, b"cstar_c2", &c_star.c2);
     for bit_comm in &monitor_bulletproof.bit_comms {
-        t.append_message(b"bit_comm", bit_comm.as_bytes());
+        append_compressed(&mut t, b"bit_comm", bit_comm);
     }
-    t.append_message(b"y_comm", monitor_bulletproof.y_comm.as_bytes());
+    append_compressed(&mut t, b"y_comm", &monitor_bulletproof.y_comm);
     for e_comm in &monitor_bulletproof.e_comms {
-        t.append_message(b"e_comm", e_comm.as_bytes());
+        append_compressed(&mut t, b"e_comm", e_comm);
     }
-    t.append_message(b"inv_e0_comm", monitor_bulletproof.inv_e0_comm.as_bytes());
+    append_compressed(&mut t, b"inv_e0_comm", &monitor_bulletproof.inv_e0_comm);
     t.append_message(b"r1cs", &monitor_bulletproof.proof.to_bytes());
     t
 }
 
-fn glue_relation_scalars(
-    _monitor_bulletproof: &MonitorBulletproof,
-    _pk: &PublicKey,
-    _coeff_cts: &[Ciphertext],
-    _c_star: &Ciphertext,
-) -> (Scalar, Scalar, Scalar) {
-    let weights = fixed_batch_weights(3);
-    (weights[0], weights[1], weights[2])
+fn glue_weights(
+    monitor_bulletproof: &MonitorBulletproof,
+    pk: &PublicKey,
+    coeff_cts: &[Ciphertext],
+    c_star: &Ciphertext,
+) -> GlueWeights {
+    let mut t = glue_transcript(monitor_bulletproof, pk, coeff_cts, c_star);
+    let e_weight_base = batch_scalar(&mut t, b"glue_e_weight_base");
+    GlueWeights {
+        y_weight: batch_scalar(&mut t, b"glue_y_weight"),
+        e_weights: powers(e_weight_base, coeff_cts.len()),
+        commit_weight: batch_scalar(&mut t, b"glue_commit_weight"),
+        eval_weight: batch_scalar(&mut t, b"glue_eval_weight"),
+        c1_weight: batch_scalar(&mut t, b"glue_c1_weight"),
+        c2_weight: batch_scalar(&mut t, b"glue_c2_weight"),
+    }
 }
 
 fn prove_glue<R: CryptoRng + RngCore>(
     rng: &mut R,
     pc_gens: &PedersenGens,
-    monitor_bulletproof: &MonitorBulletproof,
     witness: &MonitorBulletproofWitness,
     pk: &PublicKey,
     coeff_cts: &[Ciphertext],
-    c_star: &Ciphertext,
+    weights: &GlueWeights,
     y: Scalar,
     e_asc: &[Scalar],
-) -> GlueProof {
-    let (beta_y, beta_c1, beta_c2) =
-        glue_relation_scalars(monitor_bulletproof, pk, coeff_cts, c_star);
-
-    let k_e: Vec<Scalar> = (0..e_asc.len()).map(|_| Scalar::random(rng)).collect();
-    let k_alpha = Scalar::random(rng);
-    let k_y_blind = Scalar::random(rng);
+    challenge: Scalar,
+) -> Result<(GlueProof, Scalar), String> {
+    if e_asc.len() != coeff_cts.len() || e_asc.len() != witness.e_blindings.len() {
+        return Err("glue witness length mismatch".to_string());
+    }
     let alpha_tag = mul_g(&y).compress();
+    let k_y = Scalar::random(rng);
+    let k_tau = Scalar::random(rng);
+    let k_e: Vec<Scalar> = (0..e_asc.len()).map(|_| Scalar::random(rng)).collect();
 
-    let fixed_scalars = [k_alpha, beta_y * k_alpha, beta_y * k_y_blind];
-    let fixed_points = [G, pc_gens.B, pc_gens.B_blinding];
-    let (var_scalars, var_points): (Vec<_>, Vec<_>) = k_e
-        .iter()
-        .zip(coeff_cts.iter())
-        .enumerate()
-        .map(|(idx, (ke, ct))| {
-            let mut basis = beta_c1 * ct.c1 + beta_c2 * ct.c2;
-            if idx == 0 {
-                basis = basis + beta_c1 * G + beta_c2 * pk.0;
-            }
-            (*ke, basis)
-        })
-        .unzip();
-    let a_t = RistrettoPoint::multiscalar_mul(
-        fixed_scalars.iter().copied().chain(var_scalars),
-        fixed_points.iter().copied().chain(var_points),
-    );
+    let tau = weights.y_weight * witness.y_blind
+        + weights
+            .e_weights
+            .iter()
+            .zip(witness.e_blindings.iter())
+            .map(|(w, b)| *w * *b)
+            .sum::<Scalar>();
 
-    let mut t = glue_transcript(monitor_bulletproof, pk, coeff_cts, c_star);
-    t.append_message(b"beta_y", &beta_y.to_bytes());
-    t.append_message(b"beta_c1", &beta_c1.to_bytes());
-    t.append_message(b"beta_c2", &beta_c2.to_bytes());
-    t.append_message(b"alpha_tag", alpha_tag.as_bytes());
-    t.append_message(b"A_t", a_t.compress().as_bytes());
-    let chal = nontrivial_challenge(&mut t);
+    let mut basis_scalars = Vec::with_capacity(3 + e_asc.len() * 2);
+    let mut basis_points = Vec::with_capacity(3 + e_asc.len() * 2);
+    basis_scalars.push(k_y);
+    basis_points.push(G);
+    basis_scalars.push(weights.commit_weight * weights.y_weight * k_y);
+    basis_points.push(pc_gens.B);
+    basis_scalars.push(weights.commit_weight * k_tau);
+    basis_points.push(pc_gens.B_blinding);
 
-    GlueProof {
+    for (idx, (k, ct)) in k_e.iter().zip(coeff_cts.iter()).enumerate() {
+        basis_scalars.push(weights.commit_weight * weights.e_weights[idx] * *k);
+        basis_points.push(pc_gens.B);
+
+        let mut eval_basis = weights.c1_weight * ct.c1 + weights.c2_weight * ct.c2;
+        if idx == 0 {
+            eval_basis += weights.c1_weight * G + weights.c2_weight * pk.0;
+        }
+        basis_scalars.push(weights.eval_weight * *k);
+        basis_points.push(eval_basis);
+    }
+    let a_t =
+        RistrettoPoint::multiscalar_mul(basis_scalars.iter().copied(), basis_points.iter().copied());
+
+    Ok((GlueProof {
         alpha_tag,
         a_t: a_t.compress(),
+        z_y: k_y + challenge * y,
         z_e: k_e
             .iter()
             .zip(e_asc.iter())
-            .map(|(k, e_d)| k + chal * e_d)
+            .map(|(k, e)| k + challenge * e)
             .collect(),
-        z_alpha: k_alpha + chal * y,
-        z_y_blind: k_y_blind + chal * witness.y_blind,
-    }
-}
-
-fn verify_glue(
-    pc_gens: &PedersenGens,
-    monitor_bulletproof: &MonitorBulletproof,
-    pk: &PublicKey,
-    coeff_cts: &[Ciphertext],
-    c_star: &Ciphertext,
-    proof: &GlueProof,
-) -> Result<RistrettoPoint, String> {
-    if proof.z_e.len() != coeff_cts.len() || monitor_bulletproof.e_comms.len() != coeff_cts.len() {
-        return Err("glue vector length mismatch".to_string());
-    }
-
-    let alpha_tag = proof
-        .alpha_tag
-        .decompress()
-        .ok_or("invalid glue alpha_tag point")?;
-    let a_t = proof.a_t.decompress().ok_or("invalid glue A_t point")?;
-    let y_comm_pt = monitor_bulletproof
-        .y_comm
-        .decompress()
-        .ok_or("invalid y commitment point")?;
-
-    let (beta_y, beta_c1, beta_c2) =
-        glue_relation_scalars(monitor_bulletproof, pk, coeff_cts, c_star);
-
-    let mut t = glue_transcript(monitor_bulletproof, pk, coeff_cts, c_star);
-    t.append_message(b"beta_y", &beta_y.to_bytes());
-    t.append_message(b"beta_c1", &beta_c1.to_bytes());
-    t.append_message(b"beta_c2", &beta_c2.to_bytes());
-    t.append_message(b"alpha_tag", proof.alpha_tag.as_bytes());
-    t.append_message(b"A_t", proof.a_t.as_bytes());
-    let chal = nontrivial_challenge(&mut t);
-
-    let fixed_scalars = [
-        proof.z_alpha,
-        beta_y * proof.z_alpha,
-        beta_y * proof.z_y_blind,
-    ];
-    let fixed_points = [G, pc_gens.B, pc_gens.B_blinding];
-    let (var_scalars, var_points): (Vec<_>, Vec<_>) = proof
-        .z_e
-        .iter()
-        .zip(coeff_cts.iter())
-        .enumerate()
-        .map(|(idx, (z, ct))| {
-            let mut basis = beta_c1 * ct.c1 + beta_c2 * ct.c2;
-            if idx == 0 {
-                basis = basis + beta_c1 * G + beta_c2 * pk.0;
-            }
-            (*z, basis)
-        })
-        .unzip();
-    let lhs = RistrettoPoint::vartime_multiscalar_mul(
-        fixed_scalars.iter().copied().chain(var_scalars),
-        fixed_points.iter().copied().chain(var_points),
-    );
-
-    let mut rhs_points = Vec::with_capacity(4);
-    let mut rhs_scalars = Vec::with_capacity(4);
-    rhs_points.push(alpha_tag);
-    rhs_scalars.push(chal);
-    rhs_points.push(y_comm_pt);
-    rhs_scalars.push(chal * beta_y);
-    rhs_points.push(c_star.c1);
-    rhs_scalars.push(chal * beta_c1);
-    rhs_points.push(c_star.c2);
-    rhs_scalars.push(chal * beta_c2);
-    let rhs = a_t
-        + RistrettoPoint::vartime_multiscalar_mul(
-            rhs_scalars.iter().copied(),
-            rhs_points.iter().copied(),
-        );
-
-    if lhs != rhs {
-        return Err("sigma-bullet glue relation failed".to_string());
-    }
-
-    Ok(alpha_tag)
+        z_tau: k_tau + challenge * tau,
+    }, tau))
 }
 
 fn build_e_chain(y: Scalar, r: Scalar, coeff_len: usize) -> Vec<Scalar> {
@@ -690,10 +718,234 @@ fn build_e_chain(y: Scalar, r: Scalar, coeff_len: usize) -> Vec<Scalar> {
     e_asc
 }
 
+fn append_monitor_section(t: &mut Transcript, proof: &MonitorBulletproof) {
+    t.append_message(b"section", b"monitor_bulletproof");
+    for c in &proof.bit_comms {
+        append_compressed(t, b"bit_comm", c);
+    }
+    append_compressed(t, b"y_comm", &proof.y_comm);
+    for c in &proof.e_comms {
+        append_compressed(t, b"e_comm", c);
+    }
+    append_compressed(t, b"inv_e0_comm", &proof.inv_e0_comm);
+    t.append_message(b"r1cs", &proof.proof.to_bytes());
+}
+
+fn append_c_section(
+    t: &mut Transcript,
+    threshold_pk: &PublicKey,
+    item_weights: &[Scalar],
+    proof: &CBatchProof,
+) {
+    t.append_message(b"section", b"c_relation");
+    append_point(t, b"threshold_pk", &threshold_pk.0);
+    for w in item_weights {
+        t.append_message(b"item_weight", &w.to_bytes());
+    }
+    append_compressed(t, b"A_c1", &proof.a_c1);
+    append_compressed(t, b"A_c2", &proof.a_c2);
+    append_compressed(t, b"A_bits", &proof.a_bits);
+}
+
+fn append_glue_section(
+    t: &mut Transcript,
+    weights: &GlueWeights,
+    proof: &GlueProof,
+) {
+    t.append_message(b"section", b"glue_relation");
+    t.append_message(b"glue_y_weight", &weights.y_weight.to_bytes());
+    for w in &weights.e_weights {
+        t.append_message(b"glue_e_weight", &w.to_bytes());
+    }
+    t.append_message(b"glue_commit_weight", &weights.commit_weight.to_bytes());
+    t.append_message(b"glue_eval_weight", &weights.eval_weight.to_bytes());
+    t.append_message(b"glue_c1_weight", &weights.c1_weight.to_bytes());
+    t.append_message(b"glue_c2_weight", &weights.c2_weight.to_bytes());
+    append_compressed(t, b"alpha_tag", &proof.alpha_tag);
+    append_compressed(t, b"A_t", &proof.a_t);
+}
+
+fn append_partial_decrypt_section(
+    t: &mut Transcript,
+    pk1: &PublicKeyShare,
+    pk2: &PublicKeyShare,
+    in_ct: &Ciphertext,
+    out_ct: &Ciphertext,
+    proof: &PartialDecryptProof,
+) {
+    t.append_message(b"section", b"partial_decrypt");
+    let (beta, gamma) = sigma::partial_decrypt_relation_scalars(pk2, pk1, in_ct, out_ct);
+    t.append_message(b"beta", &beta.to_bytes());
+    t.append_message(b"gamma", &gamma.to_bytes());
+    append_compressed(t, b"A", &proof.a);
+}
+
+fn append_poly_scalar_mul_section(
+    t: &mut Transcript,
+    in_poly: &EncryptedPoly,
+    out_poly: &EncryptedPoly,
+    alpha_tag: &RistrettoPoint,
+    proof: &PolyScalarMulProof,
+) -> Result<(), String> {
+    t.append_message(b"section", b"poly_scalar_mul");
+    let temp = sigma::PolyScalarMulProof {
+        a1: proof.a1,
+        a2: proof.a2,
+        alpha_tag: proof.alpha_tag,
+        a_m: proof.a_m,
+        s_y: proof.s_y,
+    };
+    let (beta, gamma) =
+        sigma::poly_scalar_mul_batch_scalars(&temp, in_poly, out_poly, alpha_tag)
+            .map_err(str::to_string)?;
+    t.append_message(b"beta", &beta.to_bytes());
+    t.append_message(b"gamma", &gamma.to_bytes());
+    append_compressed(t, b"A1", &proof.a1);
+    append_compressed(t, b"A2", &proof.a2);
+    append_compressed(t, b"A_m", &proof.a_m);
+    Ok(())
+}
+
+fn combined_challenge(
+    threshold_pk: &PublicKey,
+    pk1: &PublicKeyShare,
+    pk2: &PublicKeyShare,
+    current_accum: &EncryptedPoly,
+    next_accum: &EncryptedPoly,
+    accum_scaled_eval: &Ciphertext,
+    accum_eval: &Ciphertext,
+    monitor_bulletproof: &MonitorBulletproof,
+    item_weights: &[Scalar],
+    glue_weights: &GlueWeights,
+    c_proof: &CBatchProof,
+    glue_proof: &GlueProof,
+    accum_eval_proof: &PartialDecryptProof,
+    next_accum_proof: &PolyScalarMulProof,
+) -> Result<(Scalar, RistrettoPoint), String> {
+    let mut t = Transcript::new(b"I-PSI-CA::fuzzy_round_combined_sigma_v1");
+    append_monitor_section(&mut t, monitor_bulletproof);
+    append_c_section(&mut t, threshold_pk, item_weights, c_proof);
+    append_point(&mut t, b"accum_scaled_eval_c1", &accum_scaled_eval.c1);
+    append_point(&mut t, b"accum_scaled_eval_c2", &accum_scaled_eval.c2);
+    append_glue_section(&mut t, glue_weights, glue_proof);
+    append_point(&mut t, b"accum_eval_c1", &accum_eval.c1);
+    append_point(&mut t, b"accum_eval_c2", &accum_eval.c2);
+    append_partial_decrypt_section(
+        &mut t,
+        pk1,
+        pk2,
+        accum_scaled_eval,
+        accum_eval,
+        accum_eval_proof,
+    );
+    let alpha_tag = glue_proof
+        .alpha_tag
+        .decompress()
+        .ok_or("combined challenge: invalid alpha tag")?;
+    append_poly_scalar_mul_section(
+        &mut t,
+        current_accum,
+        next_accum,
+        &alpha_tag,
+        next_accum_proof,
+    )?;
+    Ok((challenge_scalar(&mut t), alpha_tag))
+}
+
+fn prove_partial_decrypt_for_output<R: CryptoRng + RngCore>(
+    rng: &mut R,
+    sk2: &Scalar,
+    r_prime: Scalar,
+    pk2: &PublicKeyShare,
+    pk1: &PublicKeyShare,
+    in_ct: &Ciphertext,
+    out_ct: &Ciphertext,
+    challenge: Scalar,
+) -> PartialDecryptProof {
+    let (beta, gamma) = sigma::partial_decrypt_relation_scalars(pk2, pk1, in_ct, out_ct);
+    let k_sk2 = Scalar::random(rng);
+    let k_r_prime = Scalar::random(rng);
+    let beta_g = mul_g(&beta);
+    let a = (mul_g(&k_sk2) - k_sk2 * (gamma * in_ct.c1)
+        + k_r_prime * (gamma * (pk1.0 + beta_g)))
+        .compress();
+    PartialDecryptProof {
+        a,
+        z1: k_sk2 + challenge * sk2,
+        z2: k_r_prime + challenge * r_prime,
+    }
+}
+
+fn prove_poly_scalar_mul<R: CryptoRng + RngCore>(
+    rng: &mut R,
+    y: Scalar,
+    in_poly: &EncryptedPoly,
+    out_poly: &EncryptedPoly,
+    alpha_tag: &RistrettoPoint,
+    challenge: Scalar,
+) -> PolyScalarMulProof {
+    let (x_c1, x_c2, _, _, _) = sigma::poly_scalar_mul_relation_points(in_poly, out_poly, alpha_tag);
+    let k_y = Scalar::random(rng);
+    PolyScalarMulProof {
+        a1: (k_y * x_c1).compress(),
+        a2: (k_y * x_c2).compress(),
+        alpha_tag: alpha_tag.compress(),
+        a_m: mul_g(&k_y).compress(),
+        s_y: k_y + challenge * y,
+    }
+}
+
+fn finalize_c_relation(
+    proof: &mut CBatchProof,
+    challenge: Scalar,
+    input_bits: &[Scalar],
+    bit_blindings: &[Scalar],
+    c_randomness: &[Vec<Scalar>],
+) {
+    for (z, y) in proof.z_y.iter_mut().zip(input_bits.iter()) {
+        *z += challenge * *y;
+    }
+    for (z, b) in proof.z_blind.iter_mut().zip(bit_blindings.iter()) {
+        *z += challenge * *b;
+    }
+    for (z_row, r_row) in proof.z_r.iter_mut().zip(c_randomness.iter()) {
+        for (z, r) in z_row.iter_mut().zip(r_row.iter()) {
+            *z += challenge * *r;
+        }
+    }
+}
+
+fn finalize_glue(
+    proof: &mut GlueProof,
+    tau: Scalar,
+    y: Scalar,
+    e_asc: &[Scalar],
+    challenge: Scalar,
+) {
+    proof.z_y += challenge * y;
+    for (z, e) in proof.z_e.iter_mut().zip(e_asc.iter()) {
+        *z += challenge * *e;
+    }
+    proof.z_tau += challenge * tau;
+}
+
+fn finalize_partial_decrypt(
+    proof: &mut PartialDecryptProof,
+    sk2: &Scalar,
+    r_prime: Scalar,
+    challenge: Scalar,
+) {
+    proof.z1 += challenge * sk2;
+    proof.z2 += challenge * r_prime;
+}
+
+fn finalize_poly_scalar_mul(proof: &mut PolyScalarMulProof, y: Scalar, challenge: Scalar) {
+    proof.s_y += challenge * y;
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn prove_round<R: CryptoRng + RngCore>(
     rng: &mut R,
-    monitor_pk: &PublicKey,
     threshold_pk: &PublicKey,
     pk1: &PublicKeyShare,
     pk2: &PublicKeyShare,
@@ -703,16 +955,15 @@ pub fn prove_round<R: CryptoRng + RngCore>(
     accum_eval: &Ciphertext,
     y: Scalar,
     input_bits: &[Scalar],
-    input_bit_randomness: &[Scalar],
     accum_mask: Scalar,
     accum_r_prime: Scalar,
     sk2: &SecretKeyShare,
-    encrypted_input_bits: &[Ciphertext],
+    encrypted_item_bits: &[Vec<Ciphertext>],
+    c: &[Ciphertext],
+    c_randomness: &[Vec<Scalar>],
 ) -> Result<Vec<u8>, String> {
-    if input_bits.len() != input_bit_randomness.len()
-        || input_bits.len() != encrypted_input_bits.len()
-    {
-        return Err("bit witness length mismatch".to_string());
+    if encrypted_item_bits.len() != c.len() || encrypted_item_bits.len() != c_randomness.len() {
+        return Err("c witness length mismatch".to_string());
     }
     if current_accum.0.is_empty() {
         return Err("current_accum must not be empty".to_string());
@@ -725,19 +976,39 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         prove_monitor_bulletproof(rng, &pc_gens, &bp_gens, input_bits, y, &e_asc)
             .map_err(|e| format!("monitor bulletproof: {e:?}"))?;
 
-    let bit_encryption_proofs: Vec<_> = encrypted_input_bits
-        .iter()
-        .zip(monitor_bulletproof.bit_comms.iter())
-        .zip(input_bits.iter().zip(input_bit_randomness.iter()))
-        .zip(monitor_witness.bit_blindings.iter())
-        .map(|(((ct, bit_comm), (bit, enc_r)), bit_blind)| {
-            WireBitEncryptionProof::from_native(&prove_bit_encryption(
-                rng, &pc_gens, monitor_pk, ct, bit_comm, *bit, *enc_r, *bit_blind,
-            ))
-        })
-        .collect();
+    let item_weights = c_item_weights(
+        &pc_gens,
+        threshold_pk,
+        encrypted_item_bits,
+        c,
+        &monitor_bulletproof.bit_comms,
+    );
+    let glue_weights_val = glue_weights(&monitor_bulletproof, threshold_pk, &current_accum.0, accum_scaled_eval);
 
-    let accum_eval_proof = sigma::prove(
+    let mut c_proof = prove_c_relation(
+        rng,
+        &pc_gens,
+        threshold_pk,
+        encrypted_item_bits,
+        c,
+        &item_weights,
+        input_bits,
+        &monitor_witness.bit_blindings,
+        c_randomness,
+        Scalar::zero(),
+    )?;
+    let (mut glue_proof, glue_tau) = prove_glue(
+        rng,
+        &pc_gens,
+        &monitor_witness,
+        threshold_pk,
+        &current_accum.0,
+        &glue_weights_val,
+        y,
+        &e_asc,
+        Scalar::zero(),
+    )?;
+    let mut accum_eval_proof = prove_partial_decrypt_for_output(
         rng,
         sk2.as_scalar(),
         accum_r_prime,
@@ -745,51 +1016,296 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         pk1,
         accum_scaled_eval,
         accum_eval,
+        Scalar::zero(),
     );
-    let alpha_tag_pt = mul_g(&y);
-    let next_accum_proof =
-        sigma::prove_poly_scalar_mul(rng, &y, current_accum, next_accum, &alpha_tag_pt);
-    let glue_proof = prove_glue(
-        rng,
-        &pc_gens,
-        &monitor_bulletproof,
-        &monitor_witness,
+    let mut next_accum_proof =
+        prove_poly_scalar_mul(rng, y, current_accum, next_accum, &mul_g(&y), Scalar::zero());
+    let (challenge, _alpha_tag) = combined_challenge(
         threshold_pk,
-        &current_accum.0,
+        pk1,
+        pk2,
+        current_accum,
+        next_accum,
         accum_scaled_eval,
-        y,
-        &e_asc,
-    );
+        accum_eval,
+        &monitor_bulletproof,
+        &item_weights,
+        &glue_weights_val,
+        &c_proof,
+        &glue_proof,
+        &accum_eval_proof,
+        &next_accum_proof,
+    )?;
+    next_accum_proof.alpha_tag = glue_proof.alpha_tag;
 
+    finalize_c_relation(
+        &mut c_proof,
+        challenge,
+        input_bits,
+        &monitor_witness.bit_blindings,
+        c_randomness,
+    );
+    finalize_glue(&mut glue_proof, glue_tau, y, &e_asc, challenge);
+    finalize_partial_decrypt(&mut accum_eval_proof, sk2.as_scalar(), accum_r_prime, challenge);
+    finalize_poly_scalar_mul(&mut next_accum_proof, y, challenge);
     let bundle = FuzzyProofBundle {
         monitor_bulletproof: WireMonitorBulletproof::from_native(&monitor_bulletproof),
-        bit_encryption_proofs,
+        c_proof: WireCBatchProof::from_native(&c_proof),
         accum_scaled_eval: WireCiphertext::from_native(accum_scaled_eval),
-        accum_eval_proof,
-        next_accum_proof,
         glue_proof: WireGlueProof::from_native(&glue_proof),
+        accum_eval_proof: WirePartialDecryptProof::from_native(&accum_eval_proof),
+        next_accum_proof: WirePolyScalarMulProof::from_native(&next_accum_proof),
     };
 
     bincode::serialize(&bundle).map_err(|e| format!("serialize fuzzy proof bundle: {e}"))
 }
 
+fn verify_c_relation(
+    pc_gens: &PedersenGens,
+    threshold_pk: &PublicKey,
+    encrypted_item_bits: &[Vec<Ciphertext>],
+    c: &[Ciphertext],
+    bit_comms: &[CompressedRistretto],
+    item_weights: &[Scalar],
+    proof: &CBatchProof,
+    challenge: Scalar,
+) -> Result<(), String> {
+    if encrypted_item_bits.len() != c.len() || encrypted_item_bits.len() != proof.z_r.len() {
+        return Err("c relation proof length mismatch".to_string());
+    }
+    if bit_comms.len() != proof.z_y.len() || proof.z_blind.len() != proof.z_y.len() {
+        return Err("c relation proof length mismatch".to_string());
+    }
+    if !encrypted_item_bits.iter().all(|row| row.len() == proof.z_y.len())
+        || !proof.z_r.iter().all(|row| row.len() == proof.z_y.len())
+    {
+        return Err("c relation proof length mismatch".to_string());
+    }
+
+    let a_c1 = proof.a_c1.decompress().ok_or("c proof a_c1 invalid point")?;
+    let a_c2 = proof.a_c2.decompress().ok_or("c proof a_c2 invalid point")?;
+    let a_bits = proof.a_bits.decompress().ok_or("c proof a_bits invalid point")?;
+    let bit_comm_pts: Vec<_> = bit_comms
+        .iter()
+        .map(|comm| comm.decompress().ok_or("bit commitment invalid point"))
+        .collect::<Result<_, _>>()?;
+    let bit_weights = fixed_weights(proof.z_y.len());
+    let sum_item_weights = item_weights.iter().copied().sum::<Scalar>();
+
+    let mut weighted_x_c1 = vec![RistrettoPoint::identity(); proof.z_y.len()];
+    let mut weighted_x_c2 = vec![RistrettoPoint::identity(); proof.z_y.len()];
+    let mut weighted_c1 = RistrettoPoint::identity();
+    let mut weighted_c2 = RistrettoPoint::identity();
+    for (item_idx, item_bits) in encrypted_item_bits.iter().enumerate() {
+        let w_item = item_weights[item_idx];
+        weighted_c1 += w_item * c[item_idx].c1;
+        weighted_c2 += w_item * c[item_idx].c2;
+        for (bit_idx, x) in item_bits.iter().enumerate() {
+            weighted_x_c1[bit_idx] += w_item * x.c1;
+            weighted_x_c2[bit_idx] += w_item * x.c2;
+        }
+    }
+    let delta_c1 = weighted_c1 - weighted_x_c1.iter().copied().sum::<RistrettoPoint>();
+    let delta_c2 = weighted_c2 - weighted_x_c2.iter().copied().sum::<RistrettoPoint>();
+
+    let sum_z_r = proof
+        .z_r
+        .iter()
+        .zip(item_weights.iter())
+        .map(|(row, w_item)| row.iter().map(|z| *w_item * *z).sum::<Scalar>())
+        .sum::<Scalar>();
+
+    let lhs_c1 = mul_g(&sum_z_r)
+        - RistrettoPoint::vartime_multiscalar_mul(
+            proof.z_y.iter().map(|z| Scalar::from(2u64) * *z),
+            weighted_x_c1.iter().copied(),
+        );
+    if lhs_c1 != a_c1 + challenge * delta_c1 {
+        return Err("c relation c1 check failed".to_string());
+    }
+
+    let lhs_c2 = sum_z_r * threshold_pk.0
+        + RistrettoPoint::vartime_multiscalar_mul(
+            proof.z_y.iter().copied(),
+            weighted_x_c2
+                .iter()
+                .map(|pt| sum_item_weights * G - Scalar::from(2u64) * *pt),
+        );
+    if lhs_c2 != a_c2 + challenge * delta_c2 {
+        return Err("c relation c2 check failed".to_string());
+    }
+
+    let lhs_bits = RistrettoPoint::vartime_multiscalar_mul(
+        bit_weights
+            .iter()
+            .zip(proof.z_y.iter())
+            .map(|(w, z)| *w * *z)
+            .chain(bit_weights.iter().zip(proof.z_blind.iter()).map(|(w, z)| *w * *z)),
+        std::iter::repeat(pc_gens.B)
+            .take(proof.z_y.len())
+            .chain(std::iter::repeat(pc_gens.B_blinding).take(proof.z_blind.len())),
+    );
+    let weighted_bit_comm_sum =
+        RistrettoPoint::vartime_multiscalar_mul(bit_weights.iter().copied(), bit_comm_pts.iter().copied());
+    if lhs_bits != a_bits + challenge * weighted_bit_comm_sum {
+        return Err("c relation bit commitment check failed".to_string());
+    }
+
+    Ok(())
+}
+
+fn verify_glue(
+    pc_gens: &PedersenGens,
+    monitor_bulletproof: &MonitorBulletproof,
+    pk: &PublicKey,
+    coeff_cts: &[Ciphertext],
+    c_star: &Ciphertext,
+    weights: &GlueWeights,
+    alpha_tag: &RistrettoPoint,
+    proof: &GlueProof,
+    challenge: Scalar,
+) -> Result<(), String> {
+    if proof.z_e.len() != coeff_cts.len() || monitor_bulletproof.e_comms.len() != coeff_cts.len() {
+        return Err("glue vector length mismatch".to_string());
+    }
+
+    let a_t = proof.a_t.decompress().ok_or("invalid glue A_t point")?;
+    let y_comm_pt = monitor_bulletproof
+        .y_comm
+        .decompress()
+        .ok_or("invalid y commitment point")?;
+    let e_comm_pts: Vec<_> = monitor_bulletproof
+        .e_comms
+        .iter()
+        .map(|comm| comm.decompress().ok_or("invalid e commitment point"))
+        .collect::<Result<_, _>>()?;
+
+    let commitment_sum = weights.y_weight * y_comm_pt
+        + RistrettoPoint::vartime_multiscalar_mul(weights.e_weights.iter().copied(), e_comm_pts.iter().copied());
+    let eval_public = weights.c1_weight * c_star.c1 + weights.c2_weight * c_star.c2;
+
+    let mut lhs_scalars = Vec::with_capacity(3 + proof.z_e.len() * 2);
+    let mut lhs_points = Vec::with_capacity(3 + proof.z_e.len() * 2);
+    lhs_scalars.push(proof.z_y);
+    lhs_points.push(G);
+    lhs_scalars.push(weights.commit_weight * weights.y_weight * proof.z_y);
+    lhs_points.push(pc_gens.B);
+    lhs_scalars.push(weights.commit_weight * proof.z_tau);
+    lhs_points.push(pc_gens.B_blinding);
+    for (idx, (z, ct)) in proof.z_e.iter().zip(coeff_cts.iter()).enumerate() {
+        lhs_scalars.push(weights.commit_weight * weights.e_weights[idx] * *z);
+        lhs_points.push(pc_gens.B);
+        let mut eval_basis = weights.c1_weight * ct.c1 + weights.c2_weight * ct.c2;
+        if idx == 0 {
+            eval_basis += weights.c1_weight * G + weights.c2_weight * pk.0;
+        }
+        lhs_scalars.push(weights.eval_weight * *z);
+        lhs_points.push(eval_basis);
+    }
+    let lhs = RistrettoPoint::vartime_multiscalar_mul(
+        lhs_scalars.iter().copied(),
+        lhs_points.iter().copied(),
+    );
+    let rhs = a_t + challenge * (*alpha_tag + weights.commit_weight * commitment_sum + weights.eval_weight * eval_public);
+    if lhs != rhs {
+        return Err("sigma-bullet glue relation failed".to_string());
+    }
+
+    Ok(())
+}
+
+fn verify_partial_decrypt(
+    pk1: &PublicKeyShare,
+    pk2: &PublicKeyShare,
+    in_ct: &Ciphertext,
+    out_ct: &Ciphertext,
+    proof: &PartialDecryptProof,
+    challenge: Scalar,
+) -> Result<(), String> {
+    let a = proof.a.decompress().ok_or("partial decrypt A invalid point")?;
+    let (beta, gamma) = sigma::partial_decrypt_relation_scalars(pk2, pk1, in_ct, out_ct);
+    let beta_g = mul_g(&beta);
+    let delta_c1 = out_ct.c1 - in_ct.c1;
+    let delta_c2 = out_ct.c2 - in_ct.c2;
+    let lhs =
+        mul_g(&proof.z1) - proof.z1 * (gamma * in_ct.c1) + proof.z2 * (gamma * (pk1.0 + beta_g));
+    let rhs = a + challenge * (pk2.0 + gamma * (delta_c2 + beta * delta_c1));
+    if lhs != rhs {
+        return Err("partial decrypt relation failed".to_string());
+    }
+    Ok(())
+}
+
+fn verify_poly_scalar_mul(
+    proof: &PolyScalarMulProof,
+    in_poly: &EncryptedPoly,
+    out_poly: &EncryptedPoly,
+    expected_alpha_tag: &RistrettoPoint,
+    challenge: Scalar,
+) -> Result<(), String> {
+    let alpha_tag = proof
+        .alpha_tag
+        .decompress()
+        .ok_or("poly alpha_tag is not a valid Ristretto point")?;
+    if alpha_tag != *expected_alpha_tag {
+        return Err("alpha_tag mismatch across proofs".to_string());
+    }
+
+    let a1 = proof.a1.decompress().ok_or("poly A1 invalid point")?;
+    let a2 = proof.a2.decompress().ok_or("poly A2 invalid point")?;
+    let a_m = proof.a_m.decompress().ok_or("poly A_m invalid point")?;
+    let temp = sigma::PolyScalarMulProof {
+        a1: proof.a1,
+        a2: proof.a2,
+        alpha_tag: proof.alpha_tag,
+        a_m: proof.a_m,
+        s_y: proof.s_y,
+    };
+    let (beta, gamma) =
+        sigma::poly_scalar_mul_batch_scalars(&temp, in_poly, out_poly, expected_alpha_tag)
+            .map_err(str::to_string)?;
+    let (x_c1, x_c2, y_c1, y_c2, _) =
+        sigma::poly_scalar_mul_relation_points(in_poly, out_poly, expected_alpha_tag);
+    let lhs = RistrettoPoint::vartime_multiscalar_mul(
+        [proof.s_y, beta * proof.s_y, gamma * proof.s_y],
+        [x_c1, x_c2, G],
+    );
+    let rhs = a1 + beta * a2 + gamma * a_m + challenge * (y_c1 + beta * y_c2 + gamma * alpha_tag);
+    if lhs != rhs {
+        return Err("poly scalar mul relation failed".to_string());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn verify_round(
     proof_bytes: &[u8],
-    monitor_pk: &PublicKey,
     threshold_pk: &PublicKey,
     pk1: &PublicKeyShare,
     pk2: &PublicKeyShare,
     current_accum: &EncryptedPoly,
     next_accum: &EncryptedPoly,
     accum_eval: &Ciphertext,
-    encrypted_input_bits: &[Ciphertext],
+    encrypted_item_bits: &[Vec<Ciphertext>],
+    c: &[Ciphertext],
 ) -> Result<(), String> {
     let bundle: FuzzyProofBundle =
         bincode::deserialize(proof_bytes).map_err(|e| format!("decode fuzzy proof bundle: {e}"))?;
 
     let monitor_bulletproof = bundle.monitor_bulletproof.to_native()?;
-    if monitor_bulletproof.bit_comms.len() != encrypted_input_bits.len() {
+    if current_accum.0.is_empty() {
+        return Err("current_accum must not be empty".to_string());
+    }
+    if monitor_bulletproof.bit_comms.is_empty() {
+        return Err("bit commitment length mismatch".to_string());
+    }
+    if encrypted_item_bits.len() != c.len() {
+        return Err("c vector length mismatch".to_string());
+    }
+    if !encrypted_item_bits
+        .iter()
+        .all(|item_bits| item_bits.len() == monitor_bulletproof.bit_comms.len())
+    {
         return Err("bit commitment length mismatch".to_string());
     }
     if monitor_bulletproof.e_comms.len() != current_accum.0.len() {
@@ -797,50 +1313,78 @@ pub fn verify_round(
     }
 
     let pc_gens = PedersenGens::default();
-    let bp_gens = make_monitor_bp_gens(encrypted_input_bits.len(), current_accum.0.len());
+    let bp_gens = make_monitor_bp_gens(monitor_bulletproof.bit_comms.len(), current_accum.0.len());
     verify_monitor_bulletproof(&pc_gens, &bp_gens, &monitor_bulletproof)?;
 
-    if bundle.bit_encryption_proofs.len() != encrypted_input_bits.len() {
-        return Err("bit encryption proof vector length mismatch".to_string());
-    }
-    let bit_encryption_proofs: Vec<_> = bundle
-        .bit_encryption_proofs
-        .iter()
-        .map(WireBitEncryptionProof::to_native)
-        .collect::<Result<_, _>>()?;
-    verify_bit_encryptions_batched(
-        &pc_gens,
-        monitor_pk,
-        encrypted_input_bits,
-        &monitor_bulletproof.bit_comms,
-        &bit_encryption_proofs,
-    )?;
-
+    let c_proof = bundle.c_proof.to_native()?;
     let accum_scaled_eval = bundle.accum_scaled_eval.to_native()?;
     let glue_proof = bundle.glue_proof.to_native()?;
-    let alpha_tag = verify_glue(
+    let accum_eval_proof = bundle.accum_eval_proof.to_native()?;
+    let next_accum_proof = bundle.next_accum_proof.to_native()?;
+
+    let item_weights = c_item_weights(
+        &pc_gens,
+        threshold_pk,
+        encrypted_item_bits,
+        c,
+        &monitor_bulletproof.bit_comms,
+    );
+    let glue_weights_val = glue_weights(&monitor_bulletproof, threshold_pk, &current_accum.0, &accum_scaled_eval);
+    let (challenge, alpha_tag) = combined_challenge(
+        threshold_pk,
+        pk1,
+        pk2,
+        current_accum,
+        next_accum,
+        &accum_scaled_eval,
+        accum_eval,
+        &monitor_bulletproof,
+        &item_weights,
+        &glue_weights_val,
+        &c_proof,
+        &glue_proof,
+        &accum_eval_proof,
+        &next_accum_proof,
+    )?;
+
+    verify_c_relation(
+        &pc_gens,
+        threshold_pk,
+        encrypted_item_bits,
+        c,
+        &monitor_bulletproof.bit_comms,
+        &item_weights,
+        &c_proof,
+        challenge,
+    )?;
+
+    verify_glue(
         &pc_gens,
         &monitor_bulletproof,
         threshold_pk,
         &current_accum.0,
         &accum_scaled_eval,
+        &glue_weights_val,
+        &alpha_tag,
         &glue_proof,
+        challenge,
     )?;
 
-    sigma::verify(
-        &bundle.accum_eval_proof,
-        pk2,
+    verify_partial_decrypt(
         pk1,
+        pk2,
         &accum_scaled_eval,
         accum_eval,
-    )
-    .map_err(|e| format!("accum_eval sigma invalid: {e}"))?;
+        &accum_eval_proof,
+        challenge,
+    )?;
 
-    sigma::verify_poly_scalar_mul(
-        &bundle.next_accum_proof,
+    verify_poly_scalar_mul(
+        &next_accum_proof,
         current_accum,
         next_accum,
         &alpha_tag,
+        challenge,
     )
     .map_err(|e| format!("next_accum sigma invalid: {e}"))?;
 
