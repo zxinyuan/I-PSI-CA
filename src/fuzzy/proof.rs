@@ -77,6 +77,60 @@ struct WireCBatchProof {
     z_blind: Vec<[u8; 32]>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct WireThresholdBatchProof {
+    a_c1: [u8; 32],
+    a_c2: [u8; 32],
+    a_masks: [u8; 32],
+    z_mask: Vec<[u8; 32]>,
+    z_blind: Vec<[u8; 32]>,
+}
+
+#[derive(Clone, Debug)]
+struct ThresholdBatchProof {
+    a_c1: CompressedRistretto,
+    a_c2: CompressedRistretto,
+    a_masks: CompressedRistretto,
+    z_mask: Vec<Scalar>,
+    z_blind: Vec<Scalar>,
+}
+
+impl WireThresholdBatchProof {
+    fn from_native(proof: &ThresholdBatchProof) -> Self {
+        Self {
+            a_c1: proof.a_c1.to_bytes(),
+            a_c2: proof.a_c2.to_bytes(),
+            a_masks: proof.a_masks.to_bytes(),
+            z_mask: proof.z_mask.iter().map(Scalar::to_bytes).collect(),
+            z_blind: proof.z_blind.iter().map(Scalar::to_bytes).collect(),
+        }
+    }
+
+    fn to_native(&self) -> Result<ThresholdBatchProof, String> {
+        Ok(ThresholdBatchProof {
+            a_c1: CompressedRistretto::from_slice(&self.a_c1),
+            a_c2: CompressedRistretto::from_slice(&self.a_c2),
+            a_masks: CompressedRistretto::from_slice(&self.a_masks),
+            z_mask: self
+                .z_mask
+                .iter()
+                .map(|bytes| {
+                    Scalar::from_canonical_bytes(*bytes)
+                        .ok_or("threshold z_mask: non-canonical scalar")
+                })
+                .collect::<Result<_, _>>()?,
+            z_blind: self
+                .z_blind
+                .iter()
+                .map(|bytes| {
+                    Scalar::from_canonical_bytes(*bytes)
+                        .ok_or("threshold z_blind: non-canonical scalar")
+                })
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CBatchProof {
     a_c1: CompressedRistretto,
@@ -267,6 +321,11 @@ impl WirePolyScalarMulProof {
 struct FuzzyProofBundle {
     monitor_bulletproof: WireMonitorBulletproof,
     c_proof: WireCBatchProof,
+    c: Vec<WireCiphertext>,
+    threshold_alpha_tags: Vec<[u8; 32]>,
+    raw_threshold_distances: Vec<WireCiphertext>,
+    threshold_proof: WireThresholdBatchProof,
+    threshold_partial_decrypt_proofs: Vec<WirePartialDecryptProof>,
     accum_scaled_eval: WireCiphertext,
     glue_proof: WireGlueProof,
     accum_eval_proof: WirePartialDecryptProof,
@@ -593,6 +652,100 @@ fn prove_c_relation<R: CryptoRng + RngCore>(
     })
 }
 
+fn threshold_relation_transcript(
+    c: &[Ciphertext],
+    raw_threshold_distances: &[Ciphertext],
+    alpha_tags: &[CompressedRistretto],
+    threshold: usize,
+) -> Transcript {
+    let mut t = Transcript::new(b"I-PSI-CA::fuzzy_threshold_relation_v1");
+    t.append_u64(b"threshold", threshold as u64);
+    for c_i in c {
+        append_point(&mut t, b"c_c1", &c_i.c1);
+        append_point(&mut t, b"c_c2", &c_i.c2);
+    }
+    for ct in raw_threshold_distances {
+        append_point(&mut t, b"raw_threshold_c1", &ct.c1);
+        append_point(&mut t, b"raw_threshold_c2", &ct.c2);
+    }
+    for alpha_tag in alpha_tags {
+        append_compressed(&mut t, b"threshold_alpha_tag", alpha_tag);
+    }
+    t
+}
+
+fn threshold_item_weights(
+    c: &[Ciphertext],
+    raw_threshold_distances: &[Ciphertext],
+    alpha_tags: &[CompressedRistretto],
+    threshold: usize,
+) -> Vec<Scalar> {
+    let mut t = threshold_relation_transcript(
+        c,
+        raw_threshold_distances,
+        alpha_tags,
+        threshold,
+    );
+    let base = batch_scalar(&mut t, b"threshold_weight_base");
+    powers(base, raw_threshold_distances.len())
+}
+
+fn threshold_base_ciphertext(c: &[Ciphertext], flat_idx: usize, threshold: usize) -> Ciphertext {
+    let thresholds_per_item = threshold + 1;
+    let item_idx = flat_idx / thresholds_per_item;
+    let threshold_value = flat_idx % thresholds_per_item;
+    let threshold_scalar = Scalar::from(threshold_value as u64);
+    Ciphertext {
+        c1: c[item_idx].c1,
+        c2: c[item_idx].c2 - mul_g(&threshold_scalar),
+    }
+}
+
+fn prove_threshold_relation<R: CryptoRng + RngCore>(
+    rng: &mut R,
+    c: &[Ciphertext],
+    raw_threshold_distances: &[Ciphertext],
+    alpha_tags: &[CompressedRistretto],
+    item_weights: &[Scalar],
+    threshold_masks: &[Scalar],
+    threshold: usize,
+    challenge: Scalar,
+) -> Result<ThresholdBatchProof, String> {
+    if raw_threshold_distances.len() != threshold_masks.len()
+        || threshold_masks.len() != item_weights.len()
+        || threshold_masks.len() != alpha_tags.len()
+    {
+        return Err("threshold relation witness length mismatch".to_string());
+    }
+    if c.is_empty() {
+        return Err("threshold relation requires at least one c ciphertext".to_string());
+    }
+
+    let k_mask: Vec<Scalar> = (0..threshold_masks.len()).map(|_| Scalar::random(rng)).collect();
+
+    let mut a_c1 = RistrettoPoint::identity();
+    let mut a_c2 = RistrettoPoint::identity();
+    let mut a_alpha = RistrettoPoint::identity();
+    for (idx, k) in k_mask.iter().enumerate() {
+        let base = threshold_base_ciphertext(c, idx, threshold);
+        a_c1 += item_weights[idx] * *k * base.c1;
+        a_c2 += item_weights[idx] * *k * base.c2;
+        a_alpha += item_weights[idx] * mul_g(k);
+    }
+
+    Ok(ThresholdBatchProof {
+        a_c1: a_c1.compress(),
+        a_c2: a_c2.compress(),
+        a_masks: a_alpha.compress(),
+        z_mask: k_mask
+            .iter()
+            .zip(threshold_masks.iter())
+            .map(|(k, z)| k + challenge * z)
+            .collect(),
+        z_blind: Vec::new(),
+    })
+}
+
 struct GlueWeights {
     y_weight: Scalar,
     e_weights: Vec<Scalar>,
@@ -747,6 +900,25 @@ fn append_c_section(
     append_compressed(t, b"A_bits", &proof.a_bits);
 }
 
+fn append_threshold_section(
+    t: &mut Transcript,
+    threshold_alpha_tags: &[CompressedRistretto],
+    raw_threshold_distances: &[Ciphertext],
+    proof: &ThresholdBatchProof,
+) {
+    t.append_message(b"section", b"threshold_relation");
+    for alpha_tag in threshold_alpha_tags {
+        append_compressed(t, b"threshold_alpha_tag", alpha_tag);
+    }
+    for ct in raw_threshold_distances {
+        append_point(t, b"raw_threshold_c1", &ct.c1);
+        append_point(t, b"raw_threshold_c2", &ct.c2);
+    }
+    append_compressed(t, b"A_threshold_c1", &proof.a_c1);
+    append_compressed(t, b"A_threshold_c2", &proof.a_c2);
+    append_compressed(t, b"A_threshold_alpha", &proof.a_masks);
+}
+
 fn append_glue_section(
     t: &mut Transcript,
     weights: &GlueWeights,
@@ -778,6 +950,19 @@ fn append_partial_decrypt_section(
     t.append_message(b"beta", &beta.to_bytes());
     t.append_message(b"gamma", &gamma.to_bytes());
     append_compressed(t, b"A", &proof.a);
+}
+
+fn append_threshold_partial_decrypt_sections(
+    t: &mut Transcript,
+    pk1: &PublicKeyShare,
+    pk2: &PublicKeyShare,
+    in_cts: &[Ciphertext],
+    out_cts: &[Ciphertext],
+    proofs: &[PartialDecryptProof],
+) {
+    for ((in_ct, out_ct), proof) in in_cts.iter().zip(out_cts.iter()).zip(proofs.iter()) {
+        append_partial_decrypt_section(t, pk1, pk2, in_ct, out_ct, proof);
+    }
 }
 
 fn append_poly_scalar_mul_section(
@@ -816,15 +1001,26 @@ fn combined_challenge(
     accum_eval: &Ciphertext,
     monitor_bulletproof: &MonitorBulletproof,
     item_weights: &[Scalar],
+    threshold_alpha_tags: &[CompressedRistretto],
+    raw_threshold_distances: &[Ciphertext],
+    threshold_distances: &[Ciphertext],
     glue_weights: &GlueWeights,
     c_proof: &CBatchProof,
+    threshold_proof: &ThresholdBatchProof,
     glue_proof: &GlueProof,
     accum_eval_proof: &PartialDecryptProof,
+    threshold_partial_decrypt_proofs: &[PartialDecryptProof],
     next_accum_proof: &PolyScalarMulProof,
 ) -> Result<(Scalar, RistrettoPoint), String> {
     let mut t = Transcript::new(b"I-PSI-CA::fuzzy_round_combined_sigma_v1");
     append_monitor_section(&mut t, monitor_bulletproof);
     append_c_section(&mut t, threshold_pk, item_weights, c_proof);
+    append_threshold_section(
+        &mut t,
+        threshold_alpha_tags,
+        raw_threshold_distances,
+        threshold_proof,
+    );
     append_point(&mut t, b"accum_scaled_eval_c1", &accum_scaled_eval.c1);
     append_point(&mut t, b"accum_scaled_eval_c2", &accum_scaled_eval.c2);
     append_glue_section(&mut t, glue_weights, glue_proof);
@@ -837,6 +1033,14 @@ fn combined_challenge(
         accum_scaled_eval,
         accum_eval,
         accum_eval_proof,
+    );
+    append_threshold_partial_decrypt_sections(
+        &mut t,
+        pk1,
+        pk2,
+        raw_threshold_distances,
+        threshold_distances,
+        threshold_partial_decrypt_proofs,
     );
     let alpha_tag = glue_proof
         .alpha_tag
@@ -961,9 +1165,15 @@ pub fn prove_round<R: CryptoRng + RngCore>(
     encrypted_item_bits: &[Vec<Ciphertext>],
     c: &[Ciphertext],
     c_randomness: &[Vec<Scalar>],
+    threshold_distances: &[Ciphertext],
+    threshold_distance_witnesses: &[(Ciphertext, Scalar, Scalar)],
+    _threshold: usize,
 ) -> Result<Vec<u8>, String> {
     if encrypted_item_bits.len() != c.len() || encrypted_item_bits.len() != c_randomness.len() {
         return Err("c witness length mismatch".to_string());
+    }
+    if threshold_distances.len() != threshold_distance_witnesses.len() {
+        return Err("threshold witness length mismatch".to_string());
     }
     if current_accum.0.is_empty() {
         return Err("current_accum must not be empty".to_string());
@@ -975,13 +1185,29 @@ pub fn prove_round<R: CryptoRng + RngCore>(
     let (monitor_bulletproof, monitor_witness) =
         prove_monitor_bulletproof(rng, &pc_gens, &bp_gens, input_bits, y, &e_asc)
             .map_err(|e| format!("monitor bulletproof: {e:?}"))?;
+    let threshold_masks: Vec<_> = threshold_distance_witnesses.iter().map(|(_, z, _)| *z).collect();
+    let threshold_alpha_tags: Vec<_> = threshold_masks.iter().map(|z| mul_g(z).compress()).collect();
+    let raw_threshold_distances: Vec<_> = threshold_distance_witnesses
+        .iter()
+        .map(|(ct, _, _)| ct.clone())
+        .collect();
+    let threshold_r_primes: Vec<_> = threshold_distance_witnesses
+        .iter()
+        .map(|(_, _, r_prime)| *r_prime)
+        .collect();
 
     let item_weights = c_item_weights(
         &pc_gens,
         threshold_pk,
         encrypted_item_bits,
-        c,
+        &c,
         &monitor_bulletproof.bit_comms,
+    );
+    let threshold_weights = threshold_item_weights(
+        c,
+        &raw_threshold_distances,
+        &threshold_alpha_tags,
+        _threshold,
     );
     let glue_weights_val = glue_weights(&monitor_bulletproof, threshold_pk, &current_accum.0, accum_scaled_eval);
 
@@ -995,6 +1221,16 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         input_bits,
         &monitor_witness.bit_blindings,
         c_randomness,
+        Scalar::zero(),
+    )?;
+    let mut threshold_proof = prove_threshold_relation(
+        rng,
+        c,
+        &raw_threshold_distances,
+        &threshold_alpha_tags,
+        &threshold_weights,
+        &threshold_masks,
+        _threshold,
         Scalar::zero(),
     )?;
     let (mut glue_proof, glue_tau) = prove_glue(
@@ -1018,6 +1254,23 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         accum_eval,
         Scalar::zero(),
     );
+    let mut threshold_partial_decrypt_proofs = raw_threshold_distances
+        .iter()
+        .zip(threshold_distances.iter())
+        .zip(threshold_r_primes.iter())
+        .map(|((in_ct, out_ct), r_prime)| {
+            prove_partial_decrypt_for_output(
+                rng,
+                sk2.as_scalar(),
+                *r_prime,
+                pk2,
+                pk1,
+                in_ct,
+                out_ct,
+                Scalar::zero(),
+            )
+        })
+        .collect::<Vec<_>>();
     let mut next_accum_proof =
         prove_poly_scalar_mul(rng, y, current_accum, next_accum, &mul_g(&y), Scalar::zero());
     let (challenge, _alpha_tag) = combined_challenge(
@@ -1030,10 +1283,15 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         accum_eval,
         &monitor_bulletproof,
         &item_weights,
+        &threshold_alpha_tags,
+        &raw_threshold_distances,
+        threshold_distances,
         &glue_weights_val,
         &c_proof,
+        &threshold_proof,
         &glue_proof,
         &accum_eval_proof,
+        &threshold_partial_decrypt_proofs,
         &next_accum_proof,
     )?;
     next_accum_proof.alpha_tag = glue_proof.alpha_tag;
@@ -1045,12 +1303,32 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         &monitor_witness.bit_blindings,
         c_randomness,
     );
+    for (z, mask) in threshold_proof.z_mask.iter_mut().zip(threshold_masks.iter()) {
+        *z += challenge * *mask;
+    }
+    for (proof, r_prime) in threshold_partial_decrypt_proofs
+        .iter_mut()
+        .zip(threshold_r_primes.iter())
+    {
+        finalize_partial_decrypt(proof, sk2.as_scalar(), *r_prime, challenge);
+    }
     finalize_glue(&mut glue_proof, glue_tau, y, &e_asc, challenge);
     finalize_partial_decrypt(&mut accum_eval_proof, sk2.as_scalar(), accum_r_prime, challenge);
     finalize_poly_scalar_mul(&mut next_accum_proof, y, challenge);
     let bundle = FuzzyProofBundle {
         monitor_bulletproof: WireMonitorBulletproof::from_native(&monitor_bulletproof),
         c_proof: WireCBatchProof::from_native(&c_proof),
+        c: c.iter().map(WireCiphertext::from_native).collect(),
+        threshold_alpha_tags: threshold_alpha_tags.iter().map(CompressedRistretto::to_bytes).collect(),
+        raw_threshold_distances: raw_threshold_distances
+            .iter()
+            .map(WireCiphertext::from_native)
+            .collect(),
+        threshold_proof: WireThresholdBatchProof::from_native(&threshold_proof),
+        threshold_partial_decrypt_proofs: threshold_partial_decrypt_proofs
+            .iter()
+            .map(WirePartialDecryptProof::from_native)
+            .collect(),
         accum_scaled_eval: WireCiphertext::from_native(accum_scaled_eval),
         glue_proof: WireGlueProof::from_native(&glue_proof),
         accum_eval_proof: WirePartialDecryptProof::from_native(&accum_eval_proof),
@@ -1092,19 +1370,30 @@ fn verify_c_relation(
     let bit_weights = fixed_weights(proof.z_y.len());
     let sum_item_weights = item_weights.iter().copied().sum::<Scalar>();
 
-    let mut weighted_x_c1 = vec![RistrettoPoint::identity(); proof.z_y.len()];
-    let mut weighted_x_c2 = vec![RistrettoPoint::identity(); proof.z_y.len()];
-    let mut weighted_c1 = RistrettoPoint::identity();
-    let mut weighted_c2 = RistrettoPoint::identity();
-    for (item_idx, item_bits) in encrypted_item_bits.iter().enumerate() {
-        let w_item = item_weights[item_idx];
-        weighted_c1 += w_item * c[item_idx].c1;
-        weighted_c2 += w_item * c[item_idx].c2;
-        for (bit_idx, x) in item_bits.iter().enumerate() {
-            weighted_x_c1[bit_idx] += w_item * x.c1;
-            weighted_x_c2[bit_idx] += w_item * x.c2;
-        }
-    }
+    let weighted_c1 = RistrettoPoint::vartime_multiscalar_mul(
+        item_weights.iter().copied(),
+        c.iter().map(|ct| ct.c1),
+    );
+    let weighted_c2 = RistrettoPoint::vartime_multiscalar_mul(
+        item_weights.iter().copied(),
+        c.iter().map(|ct| ct.c2),
+    );
+    let weighted_x_c1: Vec<_> = (0..proof.z_y.len())
+        .map(|bit_idx| {
+            RistrettoPoint::vartime_multiscalar_mul(
+                item_weights.iter().copied(),
+                encrypted_item_bits.iter().map(|item_bits| item_bits[bit_idx].c1),
+            )
+        })
+        .collect();
+    let weighted_x_c2: Vec<_> = (0..proof.z_y.len())
+        .map(|bit_idx| {
+            RistrettoPoint::vartime_multiscalar_mul(
+                item_weights.iter().copied(),
+                encrypted_item_bits.iter().map(|item_bits| item_bits[bit_idx].c2),
+            )
+        })
+        .collect();
     let delta_c1 = weighted_c1 - weighted_x_c1.iter().copied().sum::<RistrettoPoint>();
     let delta_c2 = weighted_c2 - weighted_x_c2.iter().copied().sum::<RistrettoPoint>();
 
@@ -1149,6 +1438,98 @@ fn verify_c_relation(
         RistrettoPoint::vartime_multiscalar_mul(bit_weights.iter().copied(), bit_comm_pts.iter().copied());
     if lhs_bits != a_bits + challenge * weighted_bit_comm_sum {
         return Err("c relation bit commitment check failed".to_string());
+    }
+
+    Ok(())
+}
+
+fn verify_threshold_relation(
+    c: &[Ciphertext],
+    raw_threshold_distances: &[Ciphertext],
+    alpha_tags: &[CompressedRistretto],
+    item_weights: &[Scalar],
+    threshold: usize,
+    proof: &ThresholdBatchProof,
+    challenge: Scalar,
+) -> Result<(), String> {
+    if raw_threshold_distances.len() != item_weights.len()
+        || raw_threshold_distances.len() != alpha_tags.len()
+        || proof.z_mask.len() != raw_threshold_distances.len()
+        || !proof.z_blind.is_empty()
+    {
+        return Err("threshold relation proof length mismatch".to_string());
+    }
+
+    let a_c1 = proof
+        .a_c1
+        .decompress()
+        .ok_or("threshold proof a_c1 invalid point")?;
+    let a_c2 = proof
+        .a_c2
+        .decompress()
+        .ok_or("threshold proof a_c2 invalid point")?;
+    let a_masks = proof
+        .a_masks
+        .decompress()
+        .ok_or("threshold proof a_masks invalid point")?;
+    let alpha_tag_pts: Vec<_> = alpha_tags
+        .iter()
+        .map(|comm| comm.decompress().ok_or("alpha tag invalid point"))
+        .collect::<Result<_, _>>()?;
+
+    let base_cts: Vec<_> = (0..raw_threshold_distances.len())
+        .map(|idx| threshold_base_ciphertext(c, idx, threshold))
+        .collect();
+    let weighted_masks: Vec<_> = proof
+        .z_mask
+        .iter()
+        .enumerate()
+        .map(|(idx, z)| item_weights[idx] * *z)
+        .collect();
+
+    let lhs_c1 = RistrettoPoint::vartime_multiscalar_mul(
+        weighted_masks.iter().copied(),
+        base_cts.iter().map(|b| b.c1),
+    );
+    let rhs_c1 = a_c1
+        + challenge
+            * RistrettoPoint::vartime_multiscalar_mul(
+                item_weights.iter().copied(),
+                raw_threshold_distances.iter().map(|ct| ct.c1),
+            );
+    if lhs_c1 != rhs_c1 {
+        return Err("threshold relation c1 check failed".to_string());
+    }
+
+    let lhs_c2 = RistrettoPoint::vartime_multiscalar_mul(
+        weighted_masks.iter().copied(),
+        base_cts.iter().map(|b| b.c2),
+    );
+    let rhs_c2 = a_c2
+        + challenge
+            * RistrettoPoint::vartime_multiscalar_mul(
+                item_weights.iter().copied(),
+                raw_threshold_distances.iter().map(|ct| ct.c2),
+            );
+    if lhs_c2 != rhs_c2 {
+        return Err("threshold relation c2 check failed".to_string());
+    }
+
+    let lhs_masks = mul_g(
+        &item_weights
+            .iter()
+            .zip(proof.z_mask.iter())
+            .map(|(w, z)| *w * *z)
+            .sum::<Scalar>(),
+    );
+    let rhs_masks = a_masks
+        + challenge
+            * RistrettoPoint::vartime_multiscalar_mul(
+                item_weights.iter().copied(),
+                alpha_tag_pts.iter().copied(),
+            );
+    if lhs_masks != rhs_masks {
+        return Err("threshold relation alpha-tag check failed".to_string());
     }
 
     Ok(())
@@ -1287,12 +1668,27 @@ pub fn verify_round(
     next_accum: &EncryptedPoly,
     accum_eval: &Ciphertext,
     encrypted_item_bits: &[Vec<Ciphertext>],
-    c: &[Ciphertext],
+    threshold_distances: &[Ciphertext],
 ) -> Result<(), String> {
     let bundle: FuzzyProofBundle =
         bincode::deserialize(proof_bytes).map_err(|e| format!("decode fuzzy proof bundle: {e}"))?;
 
     let monitor_bulletproof = bundle.monitor_bulletproof.to_native()?;
+    let c: Vec<_> = bundle
+        .c
+        .iter()
+        .map(WireCiphertext::to_native)
+        .collect::<Result<_, _>>()?;
+    let threshold_alpha_tags: Vec<_> = bundle
+        .threshold_alpha_tags
+        .iter()
+        .map(|bytes| CompressedRistretto::from_slice(bytes))
+        .collect();
+    let raw_threshold_distances: Vec<_> = bundle
+        .raw_threshold_distances
+        .iter()
+        .map(WireCiphertext::to_native)
+        .collect::<Result<_, _>>()?;
     if current_accum.0.is_empty() {
         return Err("current_accum must not be empty".to_string());
     }
@@ -1311,23 +1707,45 @@ pub fn verify_round(
     if monitor_bulletproof.e_comms.len() != current_accum.0.len() {
         return Err("e commitment length mismatch".to_string());
     }
+    if raw_threshold_distances.len() != threshold_distances.len() {
+        return Err("threshold vector length mismatch".to_string());
+    }
+    if threshold_alpha_tags.len() != threshold_distances.len() {
+        return Err("threshold alpha-tag length mismatch".to_string());
+    }
 
     let pc_gens = PedersenGens::default();
     let bp_gens = make_monitor_bp_gens(monitor_bulletproof.bit_comms.len(), current_accum.0.len());
     verify_monitor_bulletproof(&pc_gens, &bp_gens, &monitor_bulletproof)?;
 
     let c_proof = bundle.c_proof.to_native()?;
+    let threshold_proof = bundle.threshold_proof.to_native()?;
     let accum_scaled_eval = bundle.accum_scaled_eval.to_native()?;
     let glue_proof = bundle.glue_proof.to_native()?;
     let accum_eval_proof = bundle.accum_eval_proof.to_native()?;
+    let threshold_partial_decrypt_proofs = bundle
+        .threshold_partial_decrypt_proofs
+        .iter()
+        .map(WirePartialDecryptProof::to_native)
+        .collect::<Result<Vec<_>, _>>()?;
     let next_accum_proof = bundle.next_accum_proof.to_native()?;
 
     let item_weights = c_item_weights(
         &pc_gens,
         threshold_pk,
         encrypted_item_bits,
-        c,
+        &c,
         &monitor_bulletproof.bit_comms,
+    );
+    if c.is_empty() || raw_threshold_distances.len() % c.len() != 0 {
+        return Err("invalid threshold shape".to_string());
+    }
+    let threshold = raw_threshold_distances.len() / c.len() - 1;
+    let threshold_weights = threshold_item_weights(
+        &c,
+        &raw_threshold_distances,
+        &threshold_alpha_tags,
+        threshold,
     );
     let glue_weights_val = glue_weights(&monitor_bulletproof, threshold_pk, &current_accum.0, &accum_scaled_eval);
     let (challenge, alpha_tag) = combined_challenge(
@@ -1340,10 +1758,15 @@ pub fn verify_round(
         accum_eval,
         &monitor_bulletproof,
         &item_weights,
+        &threshold_alpha_tags,
+        &raw_threshold_distances,
+        threshold_distances,
         &glue_weights_val,
         &c_proof,
+        &threshold_proof,
         &glue_proof,
         &accum_eval_proof,
+        &threshold_partial_decrypt_proofs,
         &next_accum_proof,
     )?;
 
@@ -1351,12 +1774,29 @@ pub fn verify_round(
         &pc_gens,
         threshold_pk,
         encrypted_item_bits,
-        c,
+        &c,
         &monitor_bulletproof.bit_comms,
         &item_weights,
         &c_proof,
         challenge,
     )?;
+    verify_threshold_relation(
+        &c,
+        &raw_threshold_distances,
+        &threshold_alpha_tags,
+        &threshold_weights,
+        threshold,
+        &threshold_proof,
+        challenge,
+    )?;
+    for alpha_tag in &threshold_alpha_tags {
+        let pt = alpha_tag
+            .decompress()
+            .ok_or("threshold alpha tag invalid point")?;
+        if pt == RistrettoPoint::identity() {
+            return Err("threshold mask must be non-zero".to_string());
+        }
+    }
 
     verify_glue(
         &pc_gens,
@@ -1378,6 +1818,13 @@ pub fn verify_round(
         &accum_eval_proof,
         challenge,
     )?;
+    for ((in_ct, out_ct), proof) in raw_threshold_distances
+        .iter()
+        .zip(threshold_distances.iter())
+        .zip(threshold_partial_decrypt_proofs.iter())
+    {
+        verify_partial_decrypt(pk1, pk2, in_ct, out_ct, proof, challenge)?;
+    }
 
     verify_poly_scalar_mul(
         &next_accum_proof,

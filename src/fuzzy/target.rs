@@ -2,19 +2,16 @@ use std::io::{self, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use curve25519_dalek_ng::scalar::Scalar;
-use curve25519_dalek_ng::{
-    constants::RISTRETTO_BASEPOINT_TABLE,
-    ristretto::CompressedRistretto,
-};
+use curve25519_dalek_ng::ristretto::CompressedRistretto;
 use rand::rngs::OsRng;
-use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::elgamal::{
-    combine_public_keys, ct_scalar_mul, encrypt_one, encrypt_zero, partial_decrypt, test_zero,
+    combine_public_keys, encrypt_one, encrypt_zero, rerandomize_poly_with_witness, test_zero,
     Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare, SecretKeyShare,
 };
 use crate::fuzzy::proof;
+use crate::fuzzy::utils::{encode_scalar_bits, encrypt_with_randomness};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireCiphertext {
@@ -62,8 +59,7 @@ pub enum TargetToMonitor {
         encrypted_item_bits: Vec<Vec<WireCiphertext>>,
     },
     NextRound {
-        masked_distances: Vec<WireCiphertext>,
-        target_compute_proof_ms: f64,
+        accum: WireEncryptedPoly,
     },
     Reject {
         reason: String,
@@ -76,7 +72,7 @@ pub struct MonitorToTarget {
     pub next_accum: WireEncryptedPoly,
     /// Threshold-partially-decrypted accumulated evaluation in `THCtextSpace[pk1]`.
     pub accum_eval: WireCiphertext,
-    pub c: Vec<WireCiphertext>,
+    pub threshold_distances: Vec<WireCiphertext>,
     pub proof: Vec<u8>,
 }
 
@@ -112,7 +108,7 @@ pub struct Target {
     _pk1: PublicKeyShare,
     pk2: PublicKeyShare,
     pk: PublicKey,
-    _vector_size: usize,
+    threshold: usize,
 }
 
 impl Target {
@@ -123,6 +119,7 @@ impl Target {
         pk1: PublicKeyShare,
         pk2: PublicKeyShare,
         vector_size: usize,
+        threshold: usize,
     ) -> Self {
         let encoded_t_set = t_set
             .iter()
@@ -139,7 +136,7 @@ impl Target {
             _pk1: pk1,
             pk2,
             pk,
-            _vector_size: vector_size,
+            threshold,
         }
     }
 
@@ -180,22 +177,23 @@ impl Target {
         rng: &mut OsRng,
         current_accum: &EncryptedPoly,
         msg: &MonitorToTarget,
-    ) -> Result<(EncryptedPoly, Vec<Ciphertext>), String> {
+    ) -> Result<EncryptedPoly, String> {
         let next_accum = msg.next_accum.to_native()?;
         let accum_eval = msg.accum_eval.to_native()?;
 
         if next_accum.0.len() != current_accum.0.len() {
             return Err("next_accum length mismatch".to_string());
         }
-        if msg.c.len() != self._t_set.len() {
-            return Err("c length mismatch".to_string());
+        let expected_threshold_distances = self._t_set.len() * (self.threshold + 1);
+        if msg.threshold_distances.len() != expected_threshold_distances {
+            return Err("threshold_distances length mismatch".to_string());
         }
-        let c: Result<Vec<_>, _> = msg
-            .c
+        let threshold_distances: Result<Vec<_>, _> = msg
+            .threshold_distances
             .iter()
             .map(|ct| ct.to_native())
             .collect();
-        let c = c?;
+        let threshold_distances = threshold_distances?;
         proof::verify_round(
             &msg.proof,
             &self.pk,
@@ -205,19 +203,21 @@ impl Target {
             &next_accum,
             &accum_eval,
             &self.encrypted_item_bits,
-            &c,
+            &threshold_distances,
         )?;
-        if test_zero(&self.sk1, &accum_eval) {
-            return Err("accum_eval decrypts to 0".to_string());
+        let accum_is_nonzero = !test_zero(&self.sk1, &accum_eval);
+        let threshold_match = threshold_distances.iter().any(|ct| test_zero(&self.sk1, ct));
+        let base_accum = if accum_is_nonzero && threshold_match {
+            &next_accum
+        } else {
+            current_accum
+        };
+        let (rerand_accum, _) = rerandomize_poly_with_witness(rng, &self.pk, base_accum);
+        if rerand_accum.0.len() != current_accum.0.len() {
+            return Err("rerandomized accum length mismatch".to_string());
         }
 
-        let mut masked_distances = c
-            .iter()
-            .map(|ct| self.mask_and_partial_decrypt_distance(rng, ct))
-            .collect::<Vec<_>>();
-        masked_distances.shuffle(rng);
-
-        Ok((next_accum, masked_distances))
+        Ok(rerand_accum)
     }
 
     pub fn run(&mut self, addr: &str) -> io::Result<()> {
@@ -268,23 +268,18 @@ impl Target {
 
             let target_round_start = std::time::Instant::now();
             match self.process_round(&mut rng, &current_accum, &msg) {
-                Ok((next_accum, masked_distances)) => {
+                Ok(next_accum) => {
                     let target_compute_proof_ms =
                         target_round_start.elapsed().as_secs_f64() * 1000.0;
                     current_accum = next_accum;
                     eprintln!(
-                        "[Target] Accepted fuzzy round update, masked {} ciphertexts in {:.3} ms",
-                        masked_distances.len(),
+                        "[Target] Accepted fuzzy round update and rerandomized accum in {:.3} ms",
                         target_compute_proof_ms
                     );
                     send_msg(
                         &mut s,
                         &TargetToMonitor::NextRound {
-                            masked_distances: masked_distances
-                                .iter()
-                                .map(WireCiphertext::from_native)
-                                .collect(),
-                            target_compute_proof_ms,
+                            accum: WireEncryptedPoly::from_native(&current_accum),
                         },
                     )?;
                 }
@@ -305,60 +300,6 @@ impl Target {
         }
     }
 
-    fn mask_and_partial_decrypt_distance<R: rand::CryptoRng + rand::RngCore>(
-        &self,
-        rng: &mut R,
-        c: &Ciphertext,
-    ) -> Ciphertext {
-        let z = non_zero_scalar(rng);
-        let u = Scalar::random(rng);
-        let u_r = Scalar::random(rng);
-        let enc_u = encrypt_with_randomness(&self.pk, &u, u_r);
-        let cz = ct_scalar_mul(c, &z);
-        let masked = Ciphertext {
-            c1: cz.c1 + enc_u.c1,
-            c2: cz.c2 + enc_u.c2,
-        };
-        partial_decrypt(rng, &self.sk1, &self.pk2, &masked)
-    }
-}
-
-fn encode_scalar_bits(input: &Scalar, vector_size: usize) -> Vec<Scalar> {
-    let bytes = input.to_bytes();
-    let mut bits = Vec::with_capacity(vector_size);
-    for bit_idx in 0..vector_size {
-        let bit = if bit_idx < bytes.len() * 8 {
-            let byte = bytes[bit_idx / 8];
-            ((byte >> (bit_idx % 8)) & 1) as u64
-        } else {
-            0
-        };
-        bits.push(Scalar::from(bit));
-    }
-    bits
-}
-
-fn non_zero_scalar<R: rand::CryptoRng + rand::RngCore>(rng: &mut R) -> Scalar {
-    loop {
-        let s = Scalar::random(rng);
-        if s != Scalar::zero() {
-            return s;
-        }
-    }
-}
-
-fn encrypt_with_randomness(pk: &PublicKey, msg: &Scalar, r: Scalar) -> Ciphertext {
-    let c1 = &r * &RISTRETTO_BASEPOINT_TABLE;
-    let r_pk = r * pk.0;
-    let c2 = if *msg == Scalar::zero() {
-        r_pk
-    } else if *msg == Scalar::one() {
-        &Scalar::one() * &RISTRETTO_BASEPOINT_TABLE + r_pk
-    } else {
-        msg * &RISTRETTO_BASEPOINT_TABLE + r_pk
-    };
-
-    Ciphertext { c1, c2 }
 }
 
 #[cfg(test)]
@@ -366,6 +307,7 @@ mod tests {
     use super::*;
     use crate::crypto::elgamal::generate_key_share;
     use crate::fuzzy::monitor::Monitor;
+    use crate::fuzzy::utils::encode_scalar_bits;
 
     fn build_monitor_message_for_target(
         rng: &mut OsRng,
@@ -377,7 +319,14 @@ mod tests {
         accum: &EncryptedPoly,
         encrypted_item_bits: &[Vec<Ciphertext>],
     ) -> MonitorToTarget {
-        let monitor = Monitor::new(m, sk2, pk1, pk2, target._vector_size);
+        let monitor = Monitor::new(
+            m,
+            sk2,
+            pk1,
+            pk2,
+            target._encoded_t_set[0].len(),
+            target.threshold,
+        );
         monitor
             .build_round_message(rng, accum, encrypted_item_bits)
             .expect("monitor should build a valid round message")
@@ -395,6 +344,7 @@ mod tests {
             pk1.clone(),
             pk2,
             12,
+            2,
         );
         let accum_ct = target.build_accum_ctext(&mut rng);
         let m = Scalar::from(7u64);
@@ -410,14 +360,12 @@ mod tests {
             &target.encrypted_item_bits,
         );
 
-        let (next_accum_out, masked_distances) =
-            target.process_round(&mut rng, &accum_ct, &msg).unwrap();
+        let next_accum_out = target.process_round(&mut rng, &accum_ct, &msg).unwrap();
         assert_eq!(next_accum_out.0.len(), accum_ct.0.len());
-        assert_eq!(masked_distances.len(), 2);
     }
 
     #[test]
-    fn test_process_round_rejects_zero_accum_eval() {
+    fn test_process_round_keeps_accum_when_accum_eval_is_zero() {
         let mut rng = OsRng;
         let (sk1, pk1) = generate_key_share(&mut rng);
         let (sk2, pk2) = generate_key_share(&mut rng);
@@ -428,6 +376,7 @@ mod tests {
             pk1.clone(),
             pk2,
             8,
+            1,
         );
         let zero_accum = EncryptedPoly(vec![
             encrypt_zero(&mut rng, &target.pk),
@@ -447,11 +396,8 @@ mod tests {
             &target.encrypted_item_bits,
         );
 
-        let err = target.process_round(&mut rng, &zero_accum, &msg).unwrap_err();
-        assert!(
-            err == "accum_eval decrypts to 0" || err.contains("sigma"),
-            "unexpected rejection reason: {err}"
-        );
+        let next_accum = target.process_round(&mut rng, &zero_accum, &msg).unwrap();
+        assert_eq!(next_accum.0.len(), zero_accum.0.len());
     }
 
     #[test]
@@ -460,7 +406,7 @@ mod tests {
         let (sk1, pk1) = generate_key_share(&mut rng);
         let (_sk2, pk2) = generate_key_share(&mut rng);
         let t_set = vec![Scalar::from(5u64), Scalar::from(9u64), Scalar::from(12u64)];
-        let target = Target::new(t_set.clone(), 5, sk1, pk1, pk2, 10);
+        let target = Target::new(t_set.clone(), 5, sk1, pk1, pk2, 10, 3);
 
         assert_eq!(target._t_set.len(), t_set.len());
         assert_eq!(target._encoded_t_set.len(), t_set.len());
@@ -477,7 +423,7 @@ mod tests {
         let (_sk2, pk2) = generate_key_share(&mut rng);
         let t_set = vec![Scalar::from(5u64), Scalar::from(9u64), Scalar::from(12u64)];
         let vector_size = 10;
-        let target = Target::new(t_set.clone(), 5, sk1, pk1, pk2, vector_size);
+        let target = Target::new(t_set.clone(), 5, sk1, pk1, pk2, vector_size, 3);
 
         let encrypted_item_bits = target.encrypt_encoded_item_bits(&mut rng);
 

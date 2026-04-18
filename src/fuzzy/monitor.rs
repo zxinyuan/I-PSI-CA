@@ -3,7 +3,7 @@ use std::net::TcpStream;
 
 use curve25519_dalek_ng::{
     constants::RISTRETTO_BASEPOINT_TABLE,
-    ristretto::{CompressedRistretto, RistrettoPoint},
+    ristretto::RistrettoPoint,
     scalar::Scalar,
 };
 use rand::rngs::OsRng;
@@ -13,6 +13,7 @@ use crate::crypto::elgamal::{
     poly_scalar_mul, Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare, SecretKeyShare,
 };
 use crate::fuzzy::proof;
+use crate::fuzzy::utils::{encode_scalar_bits, encrypt_with_randomness};
 use crate::fuzzy::target::{
     recv_msg, send_msg, MonitorToTarget, TargetToMonitor, WireCiphertext, WireEncryptedPoly,
 };
@@ -24,6 +25,7 @@ pub struct Monitor {
     _pk2: PublicKeyShare,
     pk: PublicKey,
     vector_size: usize,
+    threshold: usize,
 }
 
 impl Monitor {
@@ -33,6 +35,7 @@ impl Monitor {
         pk1: PublicKeyShare,
         pk2: PublicKeyShare,
         vector_size: usize,
+        threshold: usize,
     ) -> Self {
         let pk = combine_public_keys(&pk1, &pk2);
         Self {
@@ -42,6 +45,7 @@ impl Monitor {
             _pk2: pk2,
             pk,
             vector_size,
+            threshold,
         }
     }
 
@@ -58,11 +62,28 @@ impl Monitor {
             partial_decrypt_with_witness(rng, &self.sk2, &self.pk1, &accum_scaled_eval);
         let next_accum = poly_scalar_mul(accum, &self.m_elmt);
         let input_bits = encode_scalar_bits(&self.m_elmt, self.vector_size);
-        let (c, c_randomness): (Vec<_>, Vec<_>) = encrypted_item_bits
+        let mut c = Vec::with_capacity(encrypted_item_bits.len());
+        let mut c_randomness = Vec::with_capacity(encrypted_item_bits.len());
+        for item_bits in encrypted_item_bits.iter() {
+            let (c_i, r_i) = compute_c_for_item(rng, &self.pk, item_bits, &input_bits)?;
+            c.push(c_i);
+            c_randomness.push(r_i);
+        }
+        let (threshold_distances, threshold_distance_witnesses): (Vec<_>, Vec<_>) = c
             .iter()
-            .map(|item_bits| compute_c_for_item(rng, &self.pk, item_bits, &input_bits))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
+            .flat_map(|distance| {
+                (0..=self.threshold)
+                    .map(|threshold| {
+                        partial_decrypt_threshold_distance(
+                            rng,
+                            &self.sk2,
+                            &self.pk1,
+                            distance,
+                            threshold,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
             .unzip();
         let proof = proof::prove_round(
             rng,
@@ -81,12 +102,18 @@ impl Monitor {
             encrypted_item_bits,
             &c,
             &c_randomness,
+            &threshold_distances,
+            &threshold_distance_witnesses,
+            self.threshold,
         )?;
 
         Ok(MonitorToTarget {
             next_accum: WireEncryptedPoly::from_native(&next_accum),
             accum_eval: WireCiphertext::from_native(&accum_eval),
-            c: c.iter().map(WireCiphertext::from_native).collect(),
+            threshold_distances: threshold_distances
+                .iter()
+                .map(WireCiphertext::from_native)
+                .collect(),
             proof,
         })
     }
@@ -129,7 +156,7 @@ impl Monitor {
             "[Monitor] Received threshold-encrypted target item bits for {} item(s)",
             encrypted_item_bits.len()
         );
-        let current_accum = current_accum_wire
+        let mut current_accum = current_accum_wire
             .to_native()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let encrypted_item_bits: Vec<Vec<Ciphertext>> = encrypted_item_bits
@@ -142,17 +169,17 @@ impl Monitor {
             })
             .collect::<Result<_, _>>()
             .map_err(|e: String| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let latency_start = std::time::Instant::now();
 
         let mut rng = OsRng;
 
         for round in 1..=rounds {
             eprintln!("[Monitor] Round {round}/{rounds}");
-            let latency_start = std::time::Instant::now();
-
+            let round_compute_start = std::time::Instant::now();
             let msg = self
                 .compute_round(&mut rng, &current_accum, &encrypted_item_bits)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            let monitor_compute_proof_ms = latency_start.elapsed().as_secs_f64() * 1000.0;
+            let monitor_compute_proof_ms = round_compute_start.elapsed().as_secs_f64() * 1000.0;
 
             let monitor_to_target_bytes = bincode::serialized_size(&msg)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
@@ -167,33 +194,23 @@ impl Monitor {
 
             match reply {
                 TargetToMonitor::NextRound {
-                    masked_distances,
-                    target_compute_proof_ms,
+                    accum,
                 } => {
-                    let decrypted_masked_distances = masked_distances
-                        .iter()
-                        .map(WireCiphertext::to_native)
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-                        .iter()
-                        .map(|ct| finish_decrypt(&self.sk2, ct))
-                        .collect::<Vec<_>>();
+                    current_accum = accum
+                        .to_native()
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     let latency_ms = latency_start.elapsed().as_secs_f64() * 1000.0;
                     eprintln!(
-                        "[Monitor] Latency (recv accum -> monitor decrypt): {latency_ms:.3} ms"
+                        "[Monitor] Latency (recv encrypted_item_bits -> recv new accum): {latency_ms:.3} ms"
                     );
                     eprintln!(
-                        "[Monitor] Compute Time: monitor compute+proof={monitor_compute_proof_ms:.3} ms  target compute+proof={target_compute_proof_ms:.3} ms"
+                        "[Monitor] Compute Time: monitor compute+proof={monitor_compute_proof_ms:.3} ms"
                     );
                     eprintln!(
                         "[Monitor] Network Traffic: outsource={:.2} KB  monitor->target={:.2} KB  target->monitor={:.2} KB",
                         outsource_bytes as f64 / 1024.0,
                         monitor_to_target_bytes as f64 / 1024.0,
                         target_to_monitor_bytes as f64 / 1024.0,
-                    );
-                    eprintln!(
-                        "[Monitor] Decrypted {} masked distances",
-                        decrypted_masked_distances.len()
                     );
                     eprintln!("[Monitor] Round {round}: accepted");
                 }
@@ -203,7 +220,7 @@ impl Monitor {
                 } => {
                     let latency_ms = latency_start.elapsed().as_secs_f64() * 1000.0;
                     eprintln!(
-                        "[Monitor] Latency (recv accum -> monitor decrypt): {latency_ms:.3} ms"
+                        "[Monitor] Latency (recv encrypted_item_bits -> recv new accum): {latency_ms:.3} ms"
                     );
                     eprintln!(
                         "[Monitor] Compute Time: monitor compute+proof={monitor_compute_proof_ms:.3} ms  target compute+proof={target_compute_proof_ms:.3} ms"
@@ -240,46 +257,13 @@ impl Monitor {
     }
 }
 
-fn finish_decrypt(sk: &SecretKeyShare, ct: &Ciphertext) -> CompressedRistretto {
-    (ct.c2 - sk.as_scalar() * ct.c1).compress()
-}
-
-fn encode_scalar_bits(input: &Scalar, vector_size: usize) -> Vec<Scalar> {
-    let bytes = input.to_bytes();
-    let mut bits = Vec::with_capacity(vector_size);
-    for bit_idx in 0..vector_size {
-        let bit = if bit_idx < bytes.len() * 8 {
-            let byte = bytes[bit_idx / 8];
-            ((byte >> (bit_idx % 8)) & 1) as u64
-        } else {
-            0
-        };
-        bits.push(Scalar::from(bit));
-    }
-    bits
-}
-
-fn non_zero_scalar(rng: &mut OsRng) -> Scalar {
+fn non_zero_scalar<R: rand::CryptoRng + rand::RngCore>(rng: &mut R) -> Scalar {
     loop {
         let s = Scalar::random(rng);
         if s != Scalar::zero() {
             return s;
         }
     }
-}
-
-fn encrypt_with_randomness(pk: &PublicKey, msg: &Scalar, r: Scalar) -> Ciphertext {
-    let c1 = &r * &RISTRETTO_BASEPOINT_TABLE;
-    let r_pk = r * pk.0;
-    let c2 = if *msg == Scalar::zero() {
-        r_pk
-    } else if *msg == Scalar::one() {
-        &Scalar::one() * &RISTRETTO_BASEPOINT_TABLE + r_pk
-    } else {
-        msg * &RISTRETTO_BASEPOINT_TABLE + r_pk
-    };
-
-    Ciphertext { c1, c2 }
 }
 
 fn compute_c_for_item<R: rand::CryptoRng + rand::RngCore>(
@@ -313,6 +297,33 @@ fn compute_c_for_item<R: rand::CryptoRng + rand::RngCore>(
     Ok((acc, randomness))
 }
 
+fn mask_distance_difference_with_scalar(
+    distance: &Ciphertext,
+    threshold: usize,
+    mask: Scalar,
+) -> Ciphertext {
+    let threshold_scalar = Scalar::from(threshold as u64);
+    let threshold_offset = Ciphertext {
+        c1: RistrettoPoint::default(),
+        c2: -(&threshold_scalar * &RISTRETTO_BASEPOINT_TABLE),
+    };
+    let shifted_distance = ct_add(distance, &threshold_offset);
+    ct_scalar_mul(&shifted_distance, &mask)
+}
+
+fn partial_decrypt_threshold_distance<R: rand::CryptoRng + rand::RngCore>(
+    rng: &mut R,
+    sk2: &SecretKeyShare,
+    pk1: &PublicKeyShare,
+    distance: &Ciphertext,
+    threshold: usize,
+) -> (Ciphertext, (Ciphertext, Scalar, Scalar)) {
+    let mask = non_zero_scalar(rng);
+    let masked = mask_distance_difference_with_scalar(distance, threshold, mask);
+    let (partial, rerand) = partial_decrypt_with_witness(rng, sk2, pk1, &masked);
+    (partial, (masked, mask, rerand))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +331,7 @@ mod tests {
         combine_public_keys, encrypt_one, encrypt_zero, generate_key_share, EncryptedPoly,
     };
     use crate::fuzzy::target::Target;
+    use crate::fuzzy::utils::encode_scalar_bits;
 
     #[test]
     fn test_encode_scalar_bits_padding() {
@@ -352,6 +364,7 @@ mod tests {
             pk1.clone(),
             pk2,
             vector_size,
+            3,
         );
         let accum_ct = EncryptedPoly(vec![
             encrypt_one(&mut rng, &threshold_pk),
@@ -365,12 +378,13 @@ mod tests {
             pk1,
             pk2,
             vector_size,
+            3,
         );
         let encrypted_item_bits = target.encrypt_encoded_item_bits(&mut rng);
         let msg = monitor
             .compute_round(&mut rng, &accum_ct, &encrypted_item_bits)
             .unwrap();
-        assert_eq!(msg.c.len(), 2);
+        assert_eq!(msg.threshold_distances.len(), 8);
         assert_eq!(msg.next_accum.0.len(), accum_ct.0.len());
     }
 
@@ -388,6 +402,7 @@ mod tests {
             pk1.clone(),
             pk2,
             vector_size,
+            2,
         );
         let monitor = Monitor::new(
             Scalar::from(7u64),
@@ -395,6 +410,7 @@ mod tests {
             pk1,
             pk2,
             vector_size,
+            2,
         );
         let accum_ct = target.build_accum_ctext(&mut rng);
         let encrypted_item_bits = target.encrypt_encoded_item_bits(&mut rng);
@@ -402,13 +418,8 @@ mod tests {
         let msg = monitor
             .compute_round(&mut rng, &accum_ct, &encrypted_item_bits)
             .unwrap();
-        let (next_accum, masked_distances) = target.process_round(&mut rng, &accum_ct, &msg).unwrap();
+        let next_accum = target.process_round(&mut rng, &accum_ct, &msg).unwrap();
         assert_eq!(next_accum.0.len(), accum_ct.0.len());
-        assert_eq!(masked_distances.len(), 2);
-        let _opened = masked_distances
-            .iter()
-            .map(|ct| finish_decrypt(&monitor.sk2, ct))
-            .collect::<Vec<_>>();
     }
 
     #[test]
@@ -423,6 +434,7 @@ mod tests {
             pk1.clone(),
             pk2.clone(),
             vector_size,
+            1,
         );
 
         let small_target = Target::new(
@@ -432,6 +444,7 @@ mod tests {
             pk1.clone(),
             pk2.clone(),
             vector_size,
+            1,
         );
         let large_target = Target::new(
             vec![
@@ -446,6 +459,7 @@ mod tests {
             pk1,
             pk2,
             vector_size,
+            1,
         );
 
         let small_accum = small_target.build_accum_ctext(&mut rng);
@@ -459,8 +473,8 @@ mod tests {
             .compute_round(&mut rng, &large_accum, &large_item_bits)
             .unwrap();
 
-        assert_eq!(small_msg.c.len(), 1);
-        assert_eq!(large_msg.c.len(), 5);
+        assert_eq!(small_msg.threshold_distances.len(), 2);
+        assert_eq!(large_msg.threshold_distances.len(), 10);
         assert_eq!(small_msg.next_accum.0.len(), large_msg.next_accum.0.len());
     }
 }

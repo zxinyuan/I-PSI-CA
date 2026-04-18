@@ -8,7 +8,7 @@
 //!   cargo run --release -- exact 1000 false   # exact with custom degree, no match
 //!   cargo run --release -- bf 1000 3 158 true # bf with size, k, marked positions, match
 //!   cargo run --release -- bf 1000 3 158 false
-//!   cargo run --release -- fuzzy 1000 128 false    # fuzzy with set size and vector size
+//!   cargo run --release -- fuzzy 1000 128 3 false  # fuzzy with set size, vector size, threshold
 
 use std::thread;
 use std::time::Duration;
@@ -28,6 +28,7 @@ const BLOOM_FILTER_SIZE: usize = 1_000;
 const BF_HONEYWORD_PROBABILITY: f64 = 0.004;
 const ACCUM_DEGREE: usize = 5;
 const FUZZY_VECTOR_SIZE: usize = 128;
+const FUZZY_THRESHOLD: usize = 3;
 
 #[derive(Clone, Copy, Debug)]
 enum ProtocolVersion {
@@ -56,6 +57,7 @@ struct RunConfig {
     bf_hash_count: usize,
     bf_marked_count: usize,
     fuzzy_vector_size: usize,
+    fuzzy_threshold: usize,
     in_set: bool,
 }
 
@@ -91,6 +93,7 @@ impl RunConfig {
                         recommended_hash_count(BF_HONEYWORD_PROBABILITY),
                     ),
                     fuzzy_vector_size: FUZZY_VECTOR_SIZE,
+                    fuzzy_threshold: FUZZY_THRESHOLD,
                     in_set,
                 })
             }
@@ -189,55 +192,87 @@ impl RunConfig {
                     bf_hash_count,
                     bf_marked_count,
                     fuzzy_vector_size: FUZZY_VECTOR_SIZE,
+                    fuzzy_threshold: FUZZY_THRESHOLD,
                     in_set,
                 })
             }
             ProtocolVersion::Fuzzy => {
-                let (set_size, fuzzy_vector_size, in_set) = match (
+                let (set_size, fuzzy_vector_size, fuzzy_threshold, in_set) = match (
                     args.get(2),
                     args.get(3),
                     args.get(4),
+                    args.get(5),
                 ) {
-                    (None, None, None) => (DEGREE, FUZZY_VECTOR_SIZE, true),
-                    (Some(second), None, None) => match second.parse::<bool>() {
-                        Ok(in_set) => (DEGREE, FUZZY_VECTOR_SIZE, in_set),
+                    (None, None, None, None) => (DEGREE, FUZZY_VECTOR_SIZE, FUZZY_THRESHOLD, true),
+                    (Some(second), None, None, None) => match second.parse::<bool>() {
+                        Ok(in_set) => (DEGREE, FUZZY_VECTOR_SIZE, FUZZY_THRESHOLD, in_set),
                         Err(_) => {
                             let set_size = second.parse::<usize>().map_err(|_| {
                                 "for fuzzy, second arg must be true/false or a positive integer set size"
                                     .to_string()
                             })?;
-                            (set_size, FUZZY_VECTOR_SIZE, true)
+                            (set_size, FUZZY_VECTOR_SIZE, FUZZY_THRESHOLD, true)
                         }
                     },
-                    (Some(second), Some(third), None) => {
+                    (Some(second), Some(third), None, None) => {
                         let set_size = second.parse::<usize>().map_err(|_| {
                             "for fuzzy, second arg must be a positive integer set size when a third arg is provided"
                                 .to_string()
                         })?;
                         match third.parse::<bool>() {
-                            Ok(in_set) => (set_size, FUZZY_VECTOR_SIZE, in_set),
+                            Ok(in_set) => (set_size, FUZZY_VECTOR_SIZE, FUZZY_THRESHOLD, in_set),
                             Err(_) => {
                                 let vector_size = third.parse::<usize>().map_err(|_| {
                                     "for fuzzy, third arg must be true/false or a positive integer vector size"
                                         .to_string()
                                 })?;
-                                (set_size, vector_size, true)
+                                (set_size, vector_size, FUZZY_THRESHOLD, true)
                             }
                         }
                     }
-                    (Some(second), Some(third), Some(fourth)) => {
+                    (Some(second), Some(third), Some(fourth), None) => {
                         let set_size = second.parse::<usize>().map_err(|_| {
                             "for fuzzy, second arg must be a positive integer set size when a fourth arg is provided"
                                 .to_string()
                         })?;
-                        let vector_size = third.parse::<usize>().map_err(|_| {
-                            "for fuzzy, third arg must be a positive integer vector size when a fourth arg is provided"
+                        match fourth.parse::<bool>() {
+                            Ok(in_set) => {
+                                let vector_size = third.parse::<usize>().map_err(|_| {
+                                    "for fuzzy, third arg must be a positive integer vector size when a fourth arg is provided"
+                                        .to_string()
+                                })?;
+                                (set_size, vector_size, FUZZY_THRESHOLD, in_set)
+                            }
+                            Err(_) => {
+                                let vector_size = third.parse::<usize>().map_err(|_| {
+                                    "for fuzzy, third arg must be a positive integer vector size when a fourth arg is provided"
+                                        .to_string()
+                                })?;
+                                let threshold = fourth.parse::<usize>().map_err(|_| {
+                                    "for fuzzy, fourth arg must be true/false or a non-negative integer threshold"
+                                        .to_string()
+                                })?;
+                                (set_size, vector_size, threshold, true)
+                            }
+                        }
+                    }
+                    (Some(second), Some(third), Some(fourth), Some(fifth)) => {
+                        let set_size = second.parse::<usize>().map_err(|_| {
+                            "for fuzzy, second arg must be a positive integer set size when a fifth arg is provided"
                                 .to_string()
                         })?;
-                        let in_set = fourth
+                        let vector_size = third.parse::<usize>().map_err(|_| {
+                            "for fuzzy, third arg must be a positive integer vector size when a fifth arg is provided"
+                                .to_string()
+                        })?;
+                        let threshold = fourth.parse::<usize>().map_err(|_| {
+                            "for fuzzy, fourth arg must be a non-negative integer threshold when a fifth arg is provided"
+                                .to_string()
+                        })?;
+                        let in_set = fifth
                             .parse::<bool>()
-                            .map_err(|_| "for fuzzy, fourth arg must be true/false".to_string())?;
-                        (set_size, vector_size, in_set)
+                            .map_err(|_| "for fuzzy, fifth arg must be true/false".to_string())?;
+                        (set_size, vector_size, threshold, in_set)
                     }
                     _ => unreachable!("fuzzy arguments are positional"),
                 };
@@ -257,6 +292,7 @@ impl RunConfig {
                         recommended_hash_count(BF_HONEYWORD_PROBABILITY),
                     ),
                     fuzzy_vector_size,
+                    fuzzy_threshold,
                     in_set,
                 })
             }
@@ -301,7 +337,7 @@ fn main() {
     // Parse optional CLI args
     let args: Vec<String> = std::env::args().collect();
     let config = RunConfig::parse(&args).expect(
-        "usage: exact [degree] [true|false], bf [bloom_filter_size] [k] [marked_positions] [true|false], or fuzzy [set_size] [vector_size] [true|false]",
+        "usage: exact [degree] [true|false], bf [bloom_filter_size] [k] [marked_positions] [true|false], or fuzzy [set_size] [vector_size] [threshold] [true|false]",
     );
 
     let mut rng = OsRng;
@@ -416,6 +452,7 @@ fn main() {
             println!("Protocol    = {:?}", config.protocol);
             println!("Set size    = {}", config.size);
             println!("Vector size = {}", config.fuzzy_vector_size);
+            println!("Threshold   = {}", config.fuzzy_threshold);
             println!(
                 "MElmt       = uniform random 𝔽_ℓ element  (in_set={})",
                 config.in_set
@@ -432,6 +469,7 @@ fn main() {
                 pk1_for_monitor,
                 pk2,
                 config.fuzzy_vector_size,
+                config.fuzzy_threshold,
             );
         }
     }
@@ -514,6 +552,7 @@ fn run_fuzzy(
     pk1_for_monitor: i_psi_ca::crypto::elgamal::PublicKeyShare,
     pk2: i_psi_ca::crypto::elgamal::PublicKeyShare,
     vector_size: usize,
+    threshold: usize,
 ) {
     let target_handle = thread::spawn(move || {
         let mut target = i_psi_ca::fuzzy::target::Target::new(
@@ -523,6 +562,7 @@ fn run_fuzzy(
             pk1,
             pk2_for_target,
             vector_size,
+            threshold,
         );
         target.run(ADDR).expect("[Target] server error");
     });
@@ -535,6 +575,7 @@ fn run_fuzzy(
         pk1_for_monitor,
         pk2,
         vector_size,
+        threshold,
     );
     monitor.run(ADDR, 1).expect("[Monitor] client error");
 
