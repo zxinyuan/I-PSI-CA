@@ -324,12 +324,54 @@ struct FuzzyProofBundle {
     c: Vec<WireCiphertext>,
     threshold_alpha_tags: Vec<[u8; 32]>,
     raw_threshold_distances: Vec<WireCiphertext>,
+    ordered_threshold_distances: Vec<WireCiphertext>,
     threshold_proof: WireThresholdBatchProof,
     threshold_partial_decrypt_proofs: Vec<WirePartialDecryptProof>,
+    threshold_shuffle: WireThresholdShuffle,
     accum_scaled_eval: WireCiphertext,
     glue_proof: WireGlueProof,
     accum_eval_proof: WirePartialDecryptProof,
     next_accum_proof: WirePolyScalarMulProof,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct WireThresholdShuffle {
+    permutation: Vec<u32>,
+    rerandomizers: Vec<[u8; 32]>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EngineeringThresholdShuffle {
+    pub(crate) permutation: Vec<usize>,
+    pub(crate) rerandomizers: Vec<Scalar>,
+}
+
+impl WireThresholdShuffle {
+    fn from_native(shuffle: &EngineeringThresholdShuffle) -> Result<Self, String> {
+        let permutation = shuffle
+            .permutation
+            .iter()
+            .map(|idx| u32::try_from(*idx).map_err(|_| "threshold shuffle permutation index overflow"))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            permutation,
+            rerandomizers: shuffle.rerandomizers.iter().map(Scalar::to_bytes).collect(),
+        })
+    }
+
+    fn to_native(&self) -> Result<EngineeringThresholdShuffle, String> {
+        Ok(EngineeringThresholdShuffle {
+            permutation: self.permutation.iter().map(|idx| *idx as usize).collect(),
+            rerandomizers: self
+                .rerandomizers
+                .iter()
+                .map(|bytes| {
+                    Scalar::from_canonical_bytes(*bytes)
+                        .ok_or("threshold shuffle rerandomizer: non-canonical scalar")
+                })
+                .collect::<Result<_, _>>()?,
+        })
+    }
 }
 
 struct MonitorBulletproofWitness {
@@ -965,6 +1007,24 @@ fn append_threshold_partial_decrypt_sections(
     }
 }
 
+fn append_threshold_shuffle_section(
+    t: &mut Transcript,
+    published_threshold_distances: &[Ciphertext],
+    shuffle: &EngineeringThresholdShuffle,
+) {
+    t.append_message(b"section", b"threshold_shuffle_engineering_v1");
+    for ct in published_threshold_distances {
+        append_point(t, b"published_threshold_c1", &ct.c1);
+        append_point(t, b"published_threshold_c2", &ct.c2);
+    }
+    for idx in &shuffle.permutation {
+        t.append_u64(b"threshold_shuffle_perm", *idx as u64);
+    }
+    for r in &shuffle.rerandomizers {
+        t.append_message(b"threshold_shuffle_r", &r.to_bytes());
+    }
+}
+
 fn append_poly_scalar_mul_section(
     t: &mut Transcript,
     in_poly: &EncryptedPoly,
@@ -1003,7 +1063,9 @@ fn combined_challenge(
     item_weights: &[Scalar],
     threshold_alpha_tags: &[CompressedRistretto],
     raw_threshold_distances: &[Ciphertext],
-    threshold_distances: &[Ciphertext],
+    ordered_threshold_distances: &[Ciphertext],
+    published_threshold_distances: &[Ciphertext],
+    threshold_shuffle: &EngineeringThresholdShuffle,
     glue_weights: &GlueWeights,
     c_proof: &CBatchProof,
     threshold_proof: &ThresholdBatchProof,
@@ -1039,9 +1101,10 @@ fn combined_challenge(
         pk1,
         pk2,
         raw_threshold_distances,
-        threshold_distances,
+        ordered_threshold_distances,
         threshold_partial_decrypt_proofs,
     );
+    append_threshold_shuffle_section(&mut t, published_threshold_distances, threshold_shuffle);
     let alpha_tag = glue_proof
         .alpha_tag
         .decompress()
@@ -1148,7 +1211,7 @@ fn finalize_poly_scalar_mul(proof: &mut PolyScalarMulProof, y: Scalar, challenge
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn prove_round<R: CryptoRng + RngCore>(
+pub(crate) fn prove_round<R: CryptoRng + RngCore>(
     rng: &mut R,
     threshold_pk: &PublicKey,
     pk1: &PublicKeyShare,
@@ -1165,15 +1228,20 @@ pub fn prove_round<R: CryptoRng + RngCore>(
     encrypted_item_bits: &[Vec<Ciphertext>],
     c: &[Ciphertext],
     c_randomness: &[Vec<Scalar>],
-    threshold_distances: &[Ciphertext],
+    ordered_threshold_distances: &[Ciphertext],
+    published_threshold_distances: &[Ciphertext],
+    threshold_shuffle: &EngineeringThresholdShuffle,
     threshold_distance_witnesses: &[(Ciphertext, Scalar, Scalar)],
     _threshold: usize,
 ) -> Result<Vec<u8>, String> {
     if encrypted_item_bits.len() != c.len() || encrypted_item_bits.len() != c_randomness.len() {
         return Err("c witness length mismatch".to_string());
     }
-    if threshold_distances.len() != threshold_distance_witnesses.len() {
+    if ordered_threshold_distances.len() != threshold_distance_witnesses.len() {
         return Err("threshold witness length mismatch".to_string());
+    }
+    if published_threshold_distances.len() != ordered_threshold_distances.len() {
+        return Err("published threshold vector length mismatch".to_string());
     }
     if current_accum.0.is_empty() {
         return Err("current_accum must not be empty".to_string());
@@ -1256,7 +1324,7 @@ pub fn prove_round<R: CryptoRng + RngCore>(
     );
     let mut threshold_partial_decrypt_proofs = raw_threshold_distances
         .iter()
-        .zip(threshold_distances.iter())
+        .zip(ordered_threshold_distances.iter())
         .zip(threshold_r_primes.iter())
         .map(|((in_ct, out_ct), r_prime)| {
             prove_partial_decrypt_for_output(
@@ -1285,7 +1353,9 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         &item_weights,
         &threshold_alpha_tags,
         &raw_threshold_distances,
-        threshold_distances,
+        ordered_threshold_distances,
+        published_threshold_distances,
+        threshold_shuffle,
         &glue_weights_val,
         &c_proof,
         &threshold_proof,
@@ -1324,11 +1394,16 @@ pub fn prove_round<R: CryptoRng + RngCore>(
             .iter()
             .map(WireCiphertext::from_native)
             .collect(),
+        ordered_threshold_distances: ordered_threshold_distances
+            .iter()
+            .map(WireCiphertext::from_native)
+            .collect(),
         threshold_proof: WireThresholdBatchProof::from_native(&threshold_proof),
         threshold_partial_decrypt_proofs: threshold_partial_decrypt_proofs
             .iter()
             .map(WirePartialDecryptProof::from_native)
             .collect(),
+        threshold_shuffle: WireThresholdShuffle::from_native(threshold_shuffle)?,
         accum_scaled_eval: WireCiphertext::from_native(accum_scaled_eval),
         glue_proof: WireGlueProof::from_native(&glue_proof),
         accum_eval_proof: WirePartialDecryptProof::from_native(&accum_eval_proof),
@@ -1535,6 +1610,55 @@ fn verify_threshold_relation(
     Ok(())
 }
 
+fn rerandomize_threshold_ciphertext(
+    pk1: &PublicKeyShare,
+    ct: &Ciphertext,
+    rerandomizer: Scalar,
+) -> Ciphertext {
+    Ciphertext {
+        c1: ct.c1 + mul_g(&rerandomizer),
+        c2: ct.c2 + rerandomizer * pk1.0,
+    }
+}
+
+fn verify_threshold_shuffle(
+    pk1: &PublicKeyShare,
+    ordered_threshold_distances: &[Ciphertext],
+    published_threshold_distances: &[Ciphertext],
+    shuffle: &EngineeringThresholdShuffle,
+) -> Result<(), String> {
+    if ordered_threshold_distances.len() != published_threshold_distances.len()
+        || ordered_threshold_distances.len() != shuffle.permutation.len()
+        || ordered_threshold_distances.len() != shuffle.rerandomizers.len()
+    {
+        return Err("threshold shuffle length mismatch".to_string());
+    }
+
+    let mut seen = vec![false; ordered_threshold_distances.len()];
+    for (out_idx, (&src_idx, rerand)) in shuffle
+        .permutation
+        .iter()
+        .zip(shuffle.rerandomizers.iter())
+        .enumerate()
+    {
+        if src_idx >= ordered_threshold_distances.len() {
+            return Err("threshold shuffle permutation index out of range".to_string());
+        }
+        if std::mem::replace(&mut seen[src_idx], true) {
+            return Err("threshold shuffle permutation repeats an index".to_string());
+        }
+        let expected = rerandomize_threshold_ciphertext(pk1, &ordered_threshold_distances[src_idx], *rerand);
+        let published = &published_threshold_distances[out_idx];
+        if expected.c1 != published.c1 || expected.c2 != published.c2 {
+            return Err("threshold shuffle rerandomization check failed".to_string());
+        }
+    }
+    if seen.iter().any(|used| !used) {
+        return Err("threshold shuffle permutation omitted an index".to_string());
+    }
+    Ok(())
+}
+
 fn verify_glue(
     pc_gens: &PedersenGens,
     monitor_bulletproof: &MonitorBulletproof,
@@ -1659,7 +1783,7 @@ fn verify_poly_scalar_mul(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn verify_round(
+pub(crate) fn verify_round(
     proof_bytes: &[u8],
     threshold_pk: &PublicKey,
     pk1: &PublicKeyShare,
@@ -1689,6 +1813,12 @@ pub fn verify_round(
         .iter()
         .map(WireCiphertext::to_native)
         .collect::<Result<_, _>>()?;
+    let ordered_threshold_distances: Vec<_> = bundle
+        .ordered_threshold_distances
+        .iter()
+        .map(WireCiphertext::to_native)
+        .collect::<Result<_, _>>()?;
+    let threshold_shuffle = bundle.threshold_shuffle.to_native()?;
     if current_accum.0.is_empty() {
         return Err("current_accum must not be empty".to_string());
     }
@@ -1707,7 +1837,9 @@ pub fn verify_round(
     if monitor_bulletproof.e_comms.len() != current_accum.0.len() {
         return Err("e commitment length mismatch".to_string());
     }
-    if raw_threshold_distances.len() != threshold_distances.len() {
+    if raw_threshold_distances.len() != ordered_threshold_distances.len()
+        || ordered_threshold_distances.len() != threshold_distances.len()
+    {
         return Err("threshold vector length mismatch".to_string());
     }
     if threshold_alpha_tags.len() != threshold_distances.len() {
@@ -1760,7 +1892,9 @@ pub fn verify_round(
         &item_weights,
         &threshold_alpha_tags,
         &raw_threshold_distances,
+        &ordered_threshold_distances,
         threshold_distances,
+        &threshold_shuffle,
         &glue_weights_val,
         &c_proof,
         &threshold_proof,
@@ -1797,6 +1931,12 @@ pub fn verify_round(
             return Err("threshold mask must be non-zero".to_string());
         }
     }
+    verify_threshold_shuffle(
+        pk1,
+        &ordered_threshold_distances,
+        threshold_distances,
+        &threshold_shuffle,
+    )?;
 
     verify_glue(
         &pc_gens,
@@ -1820,7 +1960,7 @@ pub fn verify_round(
     )?;
     for ((in_ct, out_ct), proof) in raw_threshold_distances
         .iter()
-        .zip(threshold_distances.iter())
+        .zip(ordered_threshold_distances.iter())
         .zip(threshold_partial_decrypt_proofs.iter())
     {
         verify_partial_decrypt(pk1, pk2, in_ct, out_ct, proof, challenge)?;

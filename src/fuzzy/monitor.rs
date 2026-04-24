@@ -6,6 +6,7 @@ use curve25519_dalek_ng::{
     ristretto::RistrettoPoint,
     scalar::Scalar,
 };
+use rand::seq::SliceRandom;
 use rand::rngs::OsRng;
 
 use crate::crypto::elgamal::{
@@ -85,6 +86,8 @@ impl Monitor {
                     .collect::<Vec<_>>()
             })
             .unzip();
+        let (published_threshold_distances, threshold_shuffle) =
+            shuffle_threshold_distances(rng, &self.pk1, &threshold_distances);
         let proof = proof::prove_round(
             rng,
             &self.pk,
@@ -103,6 +106,8 @@ impl Monitor {
             &c,
             &c_randomness,
             &threshold_distances,
+            &published_threshold_distances,
+            &threshold_shuffle,
             &threshold_distance_witnesses,
             self.threshold,
         )?;
@@ -110,7 +115,7 @@ impl Monitor {
         Ok(MonitorToTarget {
             next_accum: WireEncryptedPoly::from_native(&next_accum),
             accum_eval: WireCiphertext::from_native(&accum_eval),
-            threshold_distances: threshold_distances
+            threshold_distances: published_threshold_distances
                 .iter()
                 .map(WireCiphertext::from_native)
                 .collect(),
@@ -255,6 +260,35 @@ impl Monitor {
         };
         ct_add(&scaled_no_blind, &enc_zero_mask)
     }
+}
+
+fn shuffle_threshold_distances<R: rand::CryptoRng + rand::RngCore>(
+    rng: &mut R,
+    pk1: &PublicKeyShare,
+    ordered_threshold_distances: &[Ciphertext],
+) -> (Vec<Ciphertext>, proof::EngineeringThresholdShuffle) {
+    let mut permutation: Vec<usize> = (0..ordered_threshold_distances.len()).collect();
+    permutation.shuffle(rng);
+
+    let mut published = Vec::with_capacity(ordered_threshold_distances.len());
+    let mut rerandomizers = Vec::with_capacity(ordered_threshold_distances.len());
+    for &src_idx in &permutation {
+        let rerandomizer = Scalar::random(rng);
+        let src = &ordered_threshold_distances[src_idx];
+        published.push(Ciphertext {
+            c1: src.c1 + &rerandomizer * &RISTRETTO_BASEPOINT_TABLE,
+            c2: src.c2 + rerandomizer * pk1.0,
+        });
+        rerandomizers.push(rerandomizer);
+    }
+
+    (
+        published,
+        proof::EngineeringThresholdShuffle {
+            permutation,
+            rerandomizers,
+        },
+    )
 }
 
 fn non_zero_scalar<R: rand::CryptoRng + rand::RngCore>(rng: &mut R) -> Scalar {

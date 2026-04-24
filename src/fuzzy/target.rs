@@ -401,6 +401,45 @@ mod tests {
     }
 
     #[test]
+    fn test_process_round_rejects_tampered_shuffled_threshold_distances() {
+        let mut rng = OsRng;
+        let (sk1, pk1) = generate_key_share(&mut rng);
+        let (sk2, pk2) = generate_key_share(&mut rng);
+        let mut target = Target::new(
+            vec![Scalar::from(11u64), Scalar::from(13u64)],
+            5,
+            sk1,
+            pk1.clone(),
+            pk2,
+            12,
+            2,
+        );
+        let accum_ct = target.build_accum_ctext(&mut rng);
+        let m = Scalar::from(7u64);
+        target.encrypted_item_bits = target.encrypt_encoded_item_bits(&mut rng);
+        let mut msg = build_monitor_message_for_target(
+            &mut rng,
+            &target,
+            sk2,
+            pk1,
+            target.pk2.clone(),
+            m,
+            &accum_ct,
+            &target.encrypted_item_bits,
+        );
+
+        msg.threshold_distances.rotate_left(1);
+
+        let err = target
+            .process_round(&mut rng, &accum_ct, &msg)
+            .expect_err("tampered shuffled threshold list must be rejected");
+        assert!(
+            err.contains("failed") || err.contains("invalid"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn test_target_encodes_each_set_item() {
         let mut rng = OsRng;
         let (sk1, pk1) = generate_key_share(&mut rng);
