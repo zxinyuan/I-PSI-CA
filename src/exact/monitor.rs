@@ -154,93 +154,47 @@ impl Monitor {
 
     // ── TCP client ────────────────────────────────────────────────────────────
 
-    /// Connect to `addr`, run `rounds` protocol interactions, then disconnect.
+    /// Connect to `addr` and react to up to `rounds` protocol interactions,
+    /// then disconnect.
+    ///
+    /// The monitor is purely reactive: for each round it waits for the
+    /// target's `{t_poly_ct, accum}`, computes the full reply, and sends it
+    /// back. It keeps no accumulator state of its own between rounds beyond
+    /// what the target sends — the target is responsible for re-randomizing
+    /// and retaining `next_accum` locally.
     ///
     /// Set `rounds = 1` for a single check.
     pub fn run(&self, addr: &str, rounds: usize) -> io::Result<()> {
         let mut stream = TcpStream::connect(addr)?;
         eprintln!("[Monitor] Connected to {addr}");
 
-        // Receive the initial T-polynomial ciphertext from the target.
-        let first: TargetToMonitor = recv_msg(&mut stream)?;
-        let outsource_bytes = bincode::serialized_size(&first)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-            + 4;
-        let (current_poly_ct, mut current_accum_ct) = match first {
-            TargetToMonitor::Outsource { t_poly_ct, accum } => (t_poly_ct, accum),
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("expected Outsource, got {other:?}"),
-                ))
-            }
-        };
-        eprintln!(
-            "[Monitor] Received TPolyCtext (len={})",
-            current_poly_ct.0.len()
-        );
-
         let mut rng = OsRng;
 
         for round in 1..=rounds {
-            eprintln!("[Monitor] Round {round}/{rounds}");
-            let t_received_current = std::time::Instant::now();
-
-            // Compute this round's message.
-            let msg = self
-                .compute_round(&mut rng, &current_poly_ct, &current_accum_ct)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            let compute_ms = t_received_current.elapsed().as_secs_f64() * 1000.0;
-
-            // Measure sent bytes (4-byte length prefix + payload).
-            let sent_bytes = bincode::serialized_size(&msg)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-                + 4;
-
-            let t_send = std::time::Instant::now();
-            send_msg(&mut stream, &msg)?;
-
-            // Receive the target's response.
-            let reply: TargetToMonitor = recv_msg(&mut stream)?;
-
-            let latency_ms = t_received_current.elapsed().as_secs_f64() * 1000.0;
-            let rtt_ms = t_send.elapsed().as_secs_f64() * 1000.0;
-
-            // Measure received bytes (4-byte length prefix + payload).
-            let recv_bytes = bincode::serialized_size(&reply)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-                + 4;
-
-            eprintln!("[Monitor] Latency (recv outsource/prev -> recv next): {latency_ms:.3} ms");
-            eprintln!("[Monitor] Compute Time (recv outsource/prev -> send): {compute_ms:.3} ms");
-            eprintln!("[Monitor] RTT (send -> recv next): {rtt_ms:.3} ms");
+            // Wait for the target to kick off this round.
+            let incoming: TargetToMonitor = match recv_msg(&mut stream) {
+                Ok(m) => m,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    eprintln!("[Monitor] Target disconnected after {} round(s).", round - 1);
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
             eprintln!(
-                "[Monitor] Network Traffic: outsource={:.2} KB  send={:.2} KB  recv={:.2} KB",
-                outsource_bytes as f64 / 1024.0,
-                sent_bytes as f64 / 1024.0,
-                recv_bytes as f64 / 1024.0,
+                "[Monitor] Round {round}/{rounds}: received TPolyCtext (len={}) + Accum",
+                incoming.t_poly_ct.0.len()
             );
 
-            match reply {
-                TargetToMonitor::NextRound { accum } => {
-                    eprintln!("[Monitor] Round {round}: accepted");
-                    current_accum_ct = accum;
-                }
-                TargetToMonitor::Reject { reason } => {
-                    eprintln!("[Monitor] Round {round}: proof rejected — {reason}");
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
-                }
-                TargetToMonitor::Outsource { .. } => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unexpected Outsource mid-protocol",
-                    ));
-                }
-            }
+            let t_compute_start = std::time::Instant::now();
+            let reply = self
+                .compute_round(&mut rng, &incoming.t_poly_ct, &incoming.accum)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let compute_ms = t_compute_start.elapsed().as_secs_f64() * 1000.0;
+
+            send_msg(&mut stream, &reply)?;
+            eprintln!("[Monitor] Round {round}: Compute Time: {compute_ms:.3} ms; reply sent");
         }
 
-        // Graceful close: just drop the stream.
-        let _ = current_accum_ct;
         eprintln!("[Monitor] Done after {rounds} round(s).");
         Ok(())
     }

@@ -52,19 +52,16 @@ impl WireEncryptedPoly {
     }
 }
 
+/// Target → Monitor message: sent once per round to kick it off.
+///
+/// The target is the protocol initiator: it sends the (unchanging)
+/// threshold-encrypted target item bits together with its current, locally
+/// re-randomized accumulator ciphertext, then waits for the monitor's full
+/// reply.
 #[derive(Serialize, Deserialize, Debug)]
-pub enum TargetToMonitor {
-    Outsource {
-        accum: WireEncryptedPoly,
-        encrypted_item_bits: Vec<Vec<WireCiphertext>>,
-    },
-    NextRound {
-        accum: WireEncryptedPoly,
-    },
-    Reject {
-        reason: String,
-        target_compute_proof_ms: f64,
-    },
+pub struct TargetToMonitor {
+    pub accum: WireEncryptedPoly,
+    pub encrypted_item_bits: Vec<Vec<WireCiphertext>>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -172,12 +169,19 @@ impl Target {
         self.encrypted_item_bits = encrypted_item_bits;
     }
 
+    /// One complete round: verify proof, test match, produce next accumulated ciphertext.
+    ///
+    /// The accumulator always advances to the monitor's `next_accum`
+    /// (re-randomized locally) — advancement is no longer conditioned on
+    /// the threshold-match result.
+    ///
+    /// Returns `(next_accum, is_match)`.
     pub(crate) fn process_round(
         &mut self,
         rng: &mut OsRng,
         current_accum: &EncryptedPoly,
         msg: &MonitorToTarget,
-    ) -> Result<EncryptedPoly, String> {
+    ) -> Result<(EncryptedPoly, bool), String> {
         let next_accum = msg.next_accum.to_native()?;
         let accum_eval = msg.accum_eval.to_native()?;
 
@@ -205,101 +209,108 @@ impl Target {
             &self.encrypted_item_bits,
             &threshold_distances,
         )?;
-        let accum_is_nonzero = !test_zero(&self.sk1, &accum_eval);
-        let threshold_match = threshold_distances.iter().any(|ct| test_zero(&self.sk1, ct));
-        let base_accum = if accum_is_nonzero && threshold_match {
-            &next_accum
-        } else {
-            current_accum
-        };
-        let (rerand_accum, _) = rerandomize_poly_with_witness(rng, &self.pk, base_accum);
+
+        // Kept only for the match indicator; no longer gates advancement.
+        let is_match = threshold_distances.iter().any(|ct| test_zero(&self.sk1, ct));
+
+        // Always advance to the monitor's next_accum, re-randomized locally
+        // and kept without sending it back to the monitor.
+        let (rerand_accum, _) = rerandomize_poly_with_witness(rng, &self.pk, &next_accum);
         if rerand_accum.0.len() != current_accum.0.len() {
             return Err("rerandomized accum length mismatch".to_string());
         }
 
-        Ok(rerand_accum)
+        Ok((rerand_accum, is_match))
     }
 
-    pub fn run(&mut self, addr: &str) -> io::Result<()> {
+    /// Bind to `addr`, accept one monitor, and run `rounds` protocol
+    /// interactions.  The target is the initiator of each round.
+    pub fn run(&mut self, addr: &str, rounds: usize) -> io::Result<()> {
         let listener = TcpListener::bind(addr)?;
         eprintln!("[Target] Listening on {addr}");
         let (stream, peer) = listener.accept()?;
         eprintln!("[Target] Monitor connected from {peer}");
-        self.handle(stream)
+        self.handle(stream, rounds)
     }
 
-    fn handle(&mut self, mut s: TcpStream) -> io::Result<()> {
+    fn handle(&mut self, mut s: TcpStream, rounds: usize) -> io::Result<()> {
         let mut rng = OsRng;
-        let t_outsource_start = std::time::Instant::now();
+
+        // Build the (unchanging) threshold-encrypted item bits and the
+        // initial accumulator ciphertext once, up front.
         let mut current_accum = self.build_accum_ctext(&mut rng);
         self.encrypted_item_bits = self.encrypt_encoded_item_bits(&mut rng);
-        send_msg(
-            &mut s,
-            &TargetToMonitor::Outsource {
-                accum: WireEncryptedPoly::from_native(&current_accum),
-                encrypted_item_bits: self
-                    .encrypted_item_bits
+        let wire_item_bits: Vec<Vec<WireCiphertext>> = self
+            .encrypted_item_bits
+            .iter()
+            .map(|encrypted_bits| {
+                encrypted_bits
                     .iter()
-                    .map(|encrypted_bits| {
-                        encrypted_bits
-                            .iter()
-                            .map(WireCiphertext::from_native)
-                            .collect()
-                    })
-                    .collect(),
-            },
-        )?;
-        let outsource_ms = t_outsource_start.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("[Target] Outsource Time (compute -> send): {outsource_ms:.3} ms");
+                    .map(WireCiphertext::from_native)
+                    .collect()
+            })
+            .collect();
         eprintln!(
-            "[Target] Sent initial accum ciphertext (deg {})",
+            "[Target] Built encrypted_item_bits for {} item(s), Accum (deg {})",
+            self.encrypted_item_bits.len(),
             self.accum_degree
         );
 
-        loop {
+        for round in 1..=rounds {
+            eprintln!("[Target] Round {round}/{rounds}");
+
+            // Kick off the round: send the encrypted item bits and the
+            // current (already re-randomized) accumulator to the monitor.
+            let outgoing = TargetToMonitor {
+                accum: WireEncryptedPoly::from_native(&current_accum),
+                encrypted_item_bits: wire_item_bits.clone(),
+            };
+            let sent_bytes = bincode::serialized_size(&outgoing)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                + 4;
+
+            let t_send = std::time::Instant::now();
+            send_msg(&mut s, &outgoing)?;
+
+            // Wait for the monitor's full reply (messages + proof).
             let msg: MonitorToTarget = match recv_msg(&mut s) {
                 Ok(m) => m,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    eprintln!("[Target] Done.");
+                    eprintln!("[Target] Monitor disconnected.");
                     return Ok(());
                 }
                 Err(e) => return Err(e),
             };
+            let latency_ms = t_send.elapsed().as_secs_f64() * 1000.0;
 
-            let target_round_start = std::time::Instant::now();
+            let recv_bytes = bincode::serialized_size(&msg)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                + 4;
+
+            eprintln!(
+                "[Target] Latency (send encrypted_item_bits+accum -> recv monitor reply): {latency_ms:.3} ms"
+            );
+            eprintln!(
+                "[Target] Network Traffic: sent={:.2} KB  recv={:.2} KB",
+                sent_bytes as f64 / 1024.0,
+                recv_bytes as f64 / 1024.0,
+            );
+
             match self.process_round(&mut rng, &current_accum, &msg) {
-                Ok(next_accum) => {
-                    let target_compute_proof_ms =
-                        target_round_start.elapsed().as_secs_f64() * 1000.0;
+                Ok((next_accum, matched)) => {
+                    eprintln!("[Target] match={matched}");
                     current_accum = next_accum;
-                    eprintln!(
-                        "[Target] Accepted fuzzy round update and rerandomized accum in {:.3} ms",
-                        target_compute_proof_ms
-                    );
-                    send_msg(
-                        &mut s,
-                        &TargetToMonitor::NextRound {
-                            accum: WireEncryptedPoly::from_native(&current_accum),
-                        },
-                    )?;
                 }
                 Err(reason) => {
-                    let target_compute_proof_ms =
-                        target_round_start.elapsed().as_secs_f64() * 1000.0;
                     eprintln!("[Target] Reject: {reason}");
-                    send_msg(
-                        &mut s,
-                        &TargetToMonitor::Reject {
-                            reason,
-                            target_compute_proof_ms,
-                        },
-                    )?;
                     return Ok(());
                 }
             }
         }
-    }
 
+        eprintln!("[Target] Done after {rounds} round(s).");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -360,12 +371,15 @@ mod tests {
             &target.encrypted_item_bits,
         );
 
-        let next_accum_out = target.process_round(&mut rng, &accum_ct, &msg).unwrap();
+        let (next_accum_out, _matched) = target.process_round(&mut rng, &accum_ct, &msg).unwrap();
         assert_eq!(next_accum_out.0.len(), accum_ct.0.len());
     }
 
+    /// Advancement is unconditional now: even when the accum evaluation is
+    /// zero (previously used to keep the old accum), the target still
+    /// advances to the monitor's `next_accum`.
     #[test]
-    fn test_process_round_keeps_accum_when_accum_eval_is_zero() {
+    fn test_process_round_advances_even_when_accum_eval_is_zero() {
         let mut rng = OsRng;
         let (sk1, pk1) = generate_key_share(&mut rng);
         let (sk2, pk2) = generate_key_share(&mut rng);
@@ -396,7 +410,7 @@ mod tests {
             &target.encrypted_item_bits,
         );
 
-        let next_accum = target.process_round(&mut rng, &zero_accum, &msg).unwrap();
+        let (next_accum, _matched) = target.process_round(&mut rng, &zero_accum, &msg).unwrap();
         assert_eq!(next_accum.0.len(), zero_accum.0.len());
     }
 

@@ -133,119 +133,57 @@ impl Monitor {
         self.compute_round(rng, accum, encrypted_item_bits)
     }
 
+    /// Connect to `addr` and react to up to `rounds` protocol interactions,
+    /// then disconnect.
+    ///
+    /// The monitor is purely reactive: for each round it waits for the
+    /// target's `{encrypted_item_bits, accum}`, computes the full reply, and
+    /// sends it back. The target is responsible for re-randomizing and
+    /// retaining `next_accum` locally.
     pub fn run(&self, addr: &str, rounds: usize) -> io::Result<()> {
         let mut stream = TcpStream::connect(addr)?;
         eprintln!("[Monitor] Connected to {addr}");
 
-        let first: TargetToMonitor = recv_msg(&mut stream)?;
-        let outsource_bytes = bincode::serialized_size(&first)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-            + 4;
-        let (current_accum_wire, encrypted_item_bits) = match first {
-            TargetToMonitor::Outsource {
-                accum,
-                encrypted_item_bits,
-            } => (accum, encrypted_item_bits),
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("expected Outsource, got {other:?}"),
-                ))
-            }
-        };
-        eprintln!(
-            "[Monitor] Received Accum ciphertext (len={})",
-            current_accum_wire.0.len()
-        );
-        eprintln!(
-            "[Monitor] Received threshold-encrypted target item bits for {} item(s)",
-            encrypted_item_bits.len()
-        );
-        let mut current_accum = current_accum_wire
-            .to_native()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let encrypted_item_bits: Vec<Vec<Ciphertext>> = encrypted_item_bits
-            .iter()
-            .map(|item_bits| {
-                item_bits
-                    .iter()
-                    .map(WireCiphertext::to_native)
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<_, _>>()
-            .map_err(|e: String| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let latency_start = std::time::Instant::now();
-
         let mut rng = OsRng;
 
         for round in 1..=rounds {
-            eprintln!("[Monitor] Round {round}/{rounds}");
-            let round_compute_start = std::time::Instant::now();
-            let msg = self
+            let incoming: TargetToMonitor = match recv_msg(&mut stream) {
+                Ok(m) => m,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    eprintln!("[Monitor] Target disconnected after {} round(s).", round - 1);
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
+            let current_accum = incoming
+                .accum
+                .to_native()
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let encrypted_item_bits: Vec<Vec<Ciphertext>> = incoming
+                .encrypted_item_bits
+                .iter()
+                .map(|item_bits| {
+                    item_bits
+                        .iter()
+                        .map(WireCiphertext::to_native)
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<_, _>>()
+                .map_err(|e: String| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            eprintln!(
+                "[Monitor] Round {round}/{rounds}: received Accum (len={}) + encrypted_item_bits for {} item(s)",
+                current_accum.0.len(),
+                encrypted_item_bits.len()
+            );
+
+            let t_compute_start = std::time::Instant::now();
+            let reply = self
                 .compute_round(&mut rng, &current_accum, &encrypted_item_bits)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            let monitor_compute_proof_ms = round_compute_start.elapsed().as_secs_f64() * 1000.0;
+            let compute_ms = t_compute_start.elapsed().as_secs_f64() * 1000.0;
 
-            let monitor_to_target_bytes = bincode::serialized_size(&msg)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-                + 4;
-
-            send_msg(&mut stream, &msg)?;
-
-            let reply: TargetToMonitor = recv_msg(&mut stream)?;
-            let target_to_monitor_bytes = bincode::serialized_size(&reply)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-                + 4;
-
-            match reply {
-                TargetToMonitor::NextRound {
-                    accum,
-                } => {
-                    current_accum = accum
-                        .to_native()
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                    let latency_ms = latency_start.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!(
-                        "[Monitor] Latency (recv encrypted_item_bits -> recv new accum): {latency_ms:.3} ms"
-                    );
-                    eprintln!(
-                        "[Monitor] Compute Time: monitor compute+proof={monitor_compute_proof_ms:.3} ms"
-                    );
-                    eprintln!(
-                        "[Monitor] Network Traffic: outsource={:.2} KB  monitor->target={:.2} KB  target->monitor={:.2} KB",
-                        outsource_bytes as f64 / 1024.0,
-                        monitor_to_target_bytes as f64 / 1024.0,
-                        target_to_monitor_bytes as f64 / 1024.0,
-                    );
-                    eprintln!("[Monitor] Round {round}: accepted");
-                }
-                TargetToMonitor::Reject {
-                    reason,
-                    target_compute_proof_ms,
-                } => {
-                    let latency_ms = latency_start.elapsed().as_secs_f64() * 1000.0;
-                    eprintln!(
-                        "[Monitor] Latency (recv encrypted_item_bits -> recv new accum): {latency_ms:.3} ms"
-                    );
-                    eprintln!(
-                        "[Monitor] Compute Time: monitor compute+proof={monitor_compute_proof_ms:.3} ms  target compute+proof={target_compute_proof_ms:.3} ms"
-                    );
-                    eprintln!(
-                        "[Monitor] Network Traffic: outsource={:.2} KB  monitor->target={:.2} KB  target->monitor={:.2} KB",
-                        outsource_bytes as f64 / 1024.0,
-                        monitor_to_target_bytes as f64 / 1024.0,
-                        target_to_monitor_bytes as f64 / 1024.0,
-                    );
-                    eprintln!("[Monitor] Round {round}: rejected — {reason}");
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
-                }
-                TargetToMonitor::Outsource { .. } => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unexpected Outsource mid-protocol",
-                    ));
-                }
-            }
+            send_msg(&mut stream, &reply)?;
+            eprintln!("[Monitor] Round {round}: Compute Time: {compute_ms:.3} ms; reply sent");
         }
 
         eprintln!("[Monitor] Done after {rounds} round(s).");
@@ -452,7 +390,7 @@ mod tests {
         let msg = monitor
             .compute_round(&mut rng, &accum_ct, &encrypted_item_bits)
             .unwrap();
-        let next_accum = target.process_round(&mut rng, &accum_ct, &msg).unwrap();
+        let (next_accum, _matched) = target.process_round(&mut rng, &accum_ct, &msg).unwrap();
         assert_eq!(next_accum.0.len(), accum_ct.0.len());
     }
 

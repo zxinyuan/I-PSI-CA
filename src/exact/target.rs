@@ -276,18 +276,15 @@ impl WireCombinedSigmaProof {
 
 // ── Protocol messages ─────────────────────────────────────────────────────────
 
-/// Target → Monitor messages.
+/// Target → Monitor message: sent once per round to kick it off.
+///
+/// The target is the protocol initiator: it sends the (unchanging)
+/// encrypted T-polynomial together with its current, locally re-randomized
+/// accumulator ciphertext, then waits for the monitor's full reply.
 #[derive(Serialize, Deserialize, Debug)]
-pub enum TargetToMonitor {
-    /// Initial outsource: the encrypted T-polynomial ciphertext.
-    Outsource {
-        t_poly_ct: WireEncryptedPoly,
-        accum: WireEncryptedPoly,
-    },
-    /// Next-round ciphertext (re-randomised; either updated or the same poly).
-    NextRound { accum: WireEncryptedPoly },
-    /// Monitor's proof was rejected; contains a debug reason string.
-    Reject { reason: String },
+pub struct TargetToMonitor {
+    pub t_poly_ct: WireEncryptedPoly,
+    pub accum: WireEncryptedPoly,
 }
 
 /// Monitor → Target message (one per round).
@@ -427,6 +424,10 @@ impl Target {
 
     /// One complete round: verify proof, test match, produce next accumulated ciphertext.
     ///
+    /// The accumulator always advances to the monitor's `next_accum`
+    /// (re-randomized locally) — advancement is no longer conditioned on
+    /// the membership test result.
+    ///
     /// Returns `(next_accum, is_match)`.
     pub(crate) fn process_round(
         &mut self,
@@ -436,7 +437,7 @@ impl Target {
         msg: &MonitorToTarget,
     ) -> Result<(EncryptedPoly, bool), String> {
         let next_accum = msg.next_accum.to_native()?;
-        let _accum_scaled_eval = msg.accum_scaled_eval.to_native()?;
+        let accum_scaled_eval = msg.accum_scaled_eval.to_native()?;
         let accum_m_poly_ct = msg.accum_m_poly_ctext.to_native()?;
         let scaled_eval = msg.scaled_eval.to_native()?;
         let m_poly_ct = msg.m_poly_ctext.to_native()?;
@@ -456,7 +457,7 @@ impl Target {
             &current.0,
             &scaled_eval,
             &m_poly_ct,
-            &_accum_scaled_eval,
+            &accum_scaled_eval,
             &accum_m_poly_ct,
             current_accum,
             &next_accum,
@@ -467,19 +468,15 @@ impl Target {
         // T.2  THTest[sk1]{0}{MPolyCtext}:
         //      MPolyCtext was partially decrypted by the monitor (THDec[sk2]),
         //      so it lives in THCtextSpace[pk1].  test_zero finishes the job.
+        //      Kept only for the match counter; no longer gates advancement.
         let is_match = test_zero(&self.sk1, &m_poly_ct);
-        let accum_is_nonzero = !test_zero(&self.sk1, &accum_m_poly_ct);
-        let should_advance = is_match && accum_is_nonzero;
-
-        // T.3  Advance the accumulated polynomial only when the accum witness
-        //      stays non-zero and the membership test matched.
-        let base_accum = if should_advance {
+        if is_match {
             self.state += 1;
-            &next_accum
-        } else {
-            current_accum
-        };
-        let (rerand_accum, _) = rerandomize_poly_with_witness(rng, &self.pk, base_accum);
+        }
+
+        // T.3  Always advance to the monitor's next_accum, re-randomized
+        //      locally and kept without sending it back to the monitor.
+        let (rerand_accum, _) = rerandomize_poly_with_witness(rng, &self.pk, &next_accum);
         if rerand_accum.0.len() != current_accum.0.len() {
             return Err("rerandomized accum length mismatch".to_string());
         }
@@ -489,62 +486,83 @@ impl Target {
 
     // ── TCP server ────────────────────────────────────────────────────────────
 
-    /// Bind to `addr`, accept one monitor, and run the protocol.
-    pub fn run(&mut self, addr: &str) -> io::Result<()> {
+    /// Bind to `addr`, accept one monitor, and run `rounds` protocol
+    /// interactions.  The target is the initiator of each round.
+    pub fn run(&mut self, addr: &str, rounds: usize) -> io::Result<()> {
         let listener = TcpListener::bind(addr)?;
         eprintln!("[Target] Listening on {addr}");
         let (stream, peer) = listener.accept()?;
         eprintln!("[Target] Monitor connected from {peer}");
-        self.handle(stream)
+        self.handle(stream, rounds)
     }
 
-    fn handle(&mut self, mut s: TcpStream) -> io::Result<()> {
+    fn handle(&mut self, mut s: TcpStream, rounds: usize) -> io::Result<()> {
         let mut rng = OsRng;
 
-        // Outsource: encrypt the T-polynomial and send it to the monitor.
-        let t_outsource_start = std::time::Instant::now();
+        // Build the (unchanging) encrypted T-polynomial and the initial
+        // accumulator ciphertext once, up front.
         let current = self.build_poly_ctext(&mut rng);
         let mut current_accum = self.build_accum_ctext(&mut rng);
-        send_msg(
-            &mut s,
-            &TargetToMonitor::Outsource {
+        eprintln!(
+            "[Target] Built TPolyCtext (deg {}), Accum (deg {})",
+            self.t_set.len(),
+            self.accum_degree
+        );
+
+        for round in 1..=rounds {
+            eprintln!("[Target] Round {round}/{rounds}");
+
+            // Kick off the round: send the T-polynomial and the current
+            // (already re-randomized) accumulator to the monitor.
+            let outgoing = TargetToMonitor {
                 t_poly_ct: WireEncryptedPoly::from_native(&current),
                 accum: WireEncryptedPoly::from_native(&current_accum),
-            },
-        )?;
-        let outsource_ms = t_outsource_start.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("[Target] Outsource Time (compute -> send): {outsource_ms:.3} ms");
-        eprintln!("[Target] Sent TPolyCtext (deg {})", self.t_set.len());
+            };
+            let sent_bytes = bincode::serialized_size(&outgoing)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                + 4;
 
-        // Main loop: one iteration per monitor submission.
-        loop {
+            let t_send = std::time::Instant::now();
+            send_msg(&mut s, &outgoing)?;
+
+            // Wait for the monitor's full reply (messages + proof).
             let msg: MonitorToTarget = match recv_msg(&mut s) {
                 Ok(m) => m,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    eprintln!("[Target] Done. state = {}", self.state);
+                    eprintln!("[Target] Monitor disconnected. state = {}", self.state);
                     return Ok(());
                 }
                 Err(e) => return Err(e),
             };
+            let latency_ms = t_send.elapsed().as_secs_f64() * 1000.0;
+
+            let recv_bytes = bincode::serialized_size(&msg)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                + 4;
+
+            eprintln!(
+                "[Target] Latency (send t_poly_ct+accum -> recv monitor reply): {latency_ms:.3} ms"
+            );
+            eprintln!(
+                "[Target] Network Traffic: sent={:.2} KB  recv={:.2} KB",
+                sent_bytes as f64 / 1024.0,
+                recv_bytes as f64 / 1024.0,
+            );
 
             match self.process_round(&mut rng, &current, &current_accum, &msg) {
                 Ok((next_accum, matched)) => {
                     eprintln!("[Target] match={matched}  state={}", self.state);
                     current_accum = next_accum;
-                    send_msg(
-                        &mut s,
-                        &TargetToMonitor::NextRound {
-                            accum: WireEncryptedPoly::from_native(&current_accum),
-                        },
-                    )?;
                 }
                 Err(reason) => {
                     eprintln!("[Target] Reject: {reason}");
-                    send_msg(&mut s, &TargetToMonitor::Reject { reason })?;
                     return Ok(());
                 }
             }
         }
+
+        eprintln!("[Target] Done after {rounds} round(s). state = {}", self.state);
+        Ok(())
     }
 }
 

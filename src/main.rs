@@ -6,9 +6,12 @@
 //! Usage:
 //!   cargo run --release -- exact 1000 true    # exact with custom degree, match
 //!   cargo run --release -- exact 1000 false   # exact with custom degree, no match
+//!   cargo run --release -- exact 1000 true 8  # exact with custom degree, match, accum_degree=8
 //!   cargo run --release -- bf 1000 3 158 true # bf with size, k, marked positions, match
 //!   cargo run --release -- bf 1000 3 158 false
+//!   cargo run --release -- bf 1000 3 158 true 8    # bf with match, accum_degree=8
 //!   cargo run --release -- fuzzy 1000 128 3 false  # fuzzy with set size, vector size, threshold
+//!   cargo run --release -- fuzzy 1000 128 3 false 8  # fuzzy with accum_degree=8
 
 use std::thread;
 use std::time::Duration;
@@ -59,6 +62,7 @@ struct RunConfig {
     fuzzy_vector_size: usize,
     fuzzy_threshold: usize,
     in_set: bool,
+    accum_degree: usize,
 }
 
 impl RunConfig {
@@ -84,6 +88,17 @@ impl RunConfig {
                     None => true,
                 };
 
+                let accum_degree = match args.get(4) {
+                    Some(raw) => raw.parse::<usize>().map_err(|_| {
+                        "for exact, fourth arg must be a positive integer accum degree"
+                            .to_string()
+                    })?,
+                    None => ACCUM_DEGREE,
+                };
+                if accum_degree == 0 {
+                    return Err("accum degree must be greater than zero".to_string());
+                }
+
                 Ok(Self {
                     protocol,
                     size: degree,
@@ -95,6 +110,7 @@ impl RunConfig {
                     fuzzy_vector_size: FUZZY_VECTOR_SIZE,
                     fuzzy_threshold: FUZZY_THRESHOLD,
                     in_set,
+                    accum_degree,
                 })
             }
             ProtocolVersion::Bf => {
@@ -186,6 +202,16 @@ impl RunConfig {
                     );
                 };
 
+                let accum_degree = match args.get(6) {
+                    Some(raw) => raw.parse::<usize>().map_err(|_| {
+                        "for bf, sixth arg must be a positive integer accum degree".to_string()
+                    })?,
+                    None => ACCUM_DEGREE,
+                };
+                if accum_degree == 0 {
+                    return Err("accum degree must be greater than zero".to_string());
+                }
+
                 Ok(Self {
                     protocol,
                     size: bloom_filter_size,
@@ -194,6 +220,7 @@ impl RunConfig {
                     fuzzy_vector_size: FUZZY_VECTOR_SIZE,
                     fuzzy_threshold: FUZZY_THRESHOLD,
                     in_set,
+                    accum_degree,
                 })
             }
             ProtocolVersion::Fuzzy => {
@@ -283,6 +310,17 @@ impl RunConfig {
                     return Err("fuzzy vector size must be greater than zero".to_string());
                 }
 
+                let accum_degree = match args.get(6) {
+                    Some(raw) => raw.parse::<usize>().map_err(|_| {
+                        "for fuzzy, sixth arg must be a positive integer accum degree"
+                            .to_string()
+                    })?,
+                    None => ACCUM_DEGREE,
+                };
+                if accum_degree == 0 {
+                    return Err("accum degree must be greater than zero".to_string());
+                }
+
                 Ok(Self {
                     protocol,
                     size: set_size,
@@ -294,6 +332,7 @@ impl RunConfig {
                     fuzzy_vector_size,
                     fuzzy_threshold,
                     in_set,
+                    accum_degree,
                 })
             }
         }
@@ -337,7 +376,7 @@ fn main() {
     // Parse optional CLI args
     let args: Vec<String> = std::env::args().collect();
     let config = RunConfig::parse(&args).expect(
-        "usage: exact [degree] [true|false], bf [bloom_filter_size] [k] [marked_positions] [true|false], or fuzzy [set_size] [vector_size] [threshold] [true|false]",
+        "usage: exact [degree] [true|false] [accum_degree], bf [bloom_filter_size] [k] [marked_positions] [true|false], or fuzzy [set_size] [vector_size] [threshold] [true|false]",
     );
 
     let mut rng = OsRng;
@@ -383,6 +422,7 @@ fn main() {
                 pk1_for_monitor,
                 pk2,
                 config.size,
+                config.accum_degree,
             );
         }
         ProtocolVersion::Bf => {
@@ -437,6 +477,7 @@ fn main() {
                 sk2,
                 pk1_for_monitor,
                 pk2,
+                config.accum_degree,
             );
         }
         ProtocolVersion::Fuzzy => {
@@ -470,6 +511,7 @@ fn main() {
                 pk2,
                 config.fuzzy_vector_size,
                 config.fuzzy_threshold,
+                config.accum_degree,
             );
         }
     }
@@ -485,11 +527,12 @@ fn run_exact(
     pk1_for_monitor: i_psi_ca::crypto::elgamal::PublicKeyShare,
     pk2: i_psi_ca::crypto::elgamal::PublicKeyShare,
     set_size: usize,
+    accum_degree: usize,
 ) {
     let target_handle = thread::spawn(move || {
         let mut target =
-            i_psi_ca::exact::target::Target::new(t_set, ACCUM_DEGREE, sk1, pk1, pk2_for_target);
-        target.run(ADDR).expect("[Target] server error");
+            i_psi_ca::exact::target::Target::new(t_set, accum_degree, sk1, pk1, pk2_for_target);
+        target.run(ADDR, 1).expect("[Target] server error");
         println!("[Target] Final match count: {}", target.state);
     });
 
@@ -512,18 +555,19 @@ fn run_bf(
     sk2: i_psi_ca::crypto::elgamal::SecretKeyShare,
     pk1_for_monitor: i_psi_ca::crypto::elgamal::PublicKeyShare,
     pk2: i_psi_ca::crypto::elgamal::PublicKeyShare,
+    accum_degree: usize,
 ) {
     let outsourced_degree = marked_positions.len();
     let target_handle = thread::spawn(move || {
         let mut target = i_psi_ca::bf::target::Target::new(
             marked_positions,
             bf_config,
-            ACCUM_DEGREE,
+            accum_degree,
             sk1,
             pk1,
             pk2_for_target,
         );
-        target.run(ADDR).expect("[Target] server error");
+        target.run(ADDR, 1).expect("[Target] server error");
         println!("[Target] Final match count: {}", target.state);
     });
 
@@ -537,7 +581,7 @@ fn run_bf(
         pk2,
         outsourced_degree,
     );
-    monitor.run(ADDR).expect("[Monitor] client error");
+    monitor.run(ADDR, 1).expect("[Monitor] client error");
 
     target_handle.join().expect("Target thread panicked");
 }
@@ -553,18 +597,19 @@ fn run_fuzzy(
     pk2: i_psi_ca::crypto::elgamal::PublicKeyShare,
     vector_size: usize,
     threshold: usize,
+    accum_degree: usize,
 ) {
     let target_handle = thread::spawn(move || {
         let mut target = i_psi_ca::fuzzy::target::Target::new(
             t_set,
-            ACCUM_DEGREE,
+            accum_degree,
             sk1,
             pk1,
             pk2_for_target,
             vector_size,
             threshold,
         );
-        target.run(ADDR).expect("[Target] server error");
+        target.run(ADDR, 1).expect("[Target] server error");
     });
 
     thread::sleep(Duration::from_millis(50));
