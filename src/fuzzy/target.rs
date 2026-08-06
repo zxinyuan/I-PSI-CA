@@ -1,8 +1,8 @@
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
-use curve25519_dalek_ng::scalar::Scalar;
 use curve25519_dalek_ng::ristretto::CompressedRistretto;
+use curve25519_dalek_ng::scalar::Scalar;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
@@ -211,7 +211,9 @@ impl Target {
         )?;
 
         // Kept only for the match indicator; no longer gates advancement.
-        let is_match = threshold_distances.iter().any(|ct| test_zero(&self.sk1, ct));
+        let is_match = threshold_distances
+            .iter()
+            .any(|ct| test_zero(&self.sk1, ct));
 
         // Always advance to the monitor's next_accum, re-randomized locally
         // and kept without sending it back to the monitor.
@@ -296,7 +298,12 @@ impl Target {
                 recv_bytes as f64 / 1024.0,
             );
 
-            match self.process_round(&mut rng, &current_accum, &msg) {
+            let t_verify = std::time::Instant::now();
+            let round_result = self.process_round(&mut rng, &current_accum, &msg);
+            let verification_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[Target] Verification Time: {verification_ms:.3} ms");
+
+            match round_result {
                 Ok((next_accum, matched)) => {
                     eprintln!("[Target] match={matched}");
                     current_accum = next_accum;
@@ -383,15 +390,7 @@ mod tests {
         let mut rng = OsRng;
         let (sk1, pk1) = generate_key_share(&mut rng);
         let (sk2, pk2) = generate_key_share(&mut rng);
-        let mut target = Target::new(
-            vec![Scalar::from(11u64)],
-            5,
-            sk1,
-            pk1.clone(),
-            pk2,
-            8,
-            1,
-        );
+        let mut target = Target::new(vec![Scalar::from(11u64)], 5, sk1, pk1.clone(), pk2, 8, 1);
         let zero_accum = EncryptedPoly(vec![
             encrypt_zero(&mut rng, &target.pk),
             encrypt_zero(&mut rng, &target.pk),

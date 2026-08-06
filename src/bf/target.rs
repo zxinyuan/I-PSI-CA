@@ -314,7 +314,9 @@ impl Target {
 
         // Build the (unchanging) encrypted T-polynomial and the initial
         // accumulator ciphertext once, up front.
+        let t_deploy = std::time::Instant::now();
         let current = self.build_poly_ctext(&mut rng);
+        let mut deploy_ms = None;
         let mut current_accum = self.build_accum_ctext(&mut rng);
         eprintln!(
             "[Target] Built TPolyCtext for {} marked Bloom positions, Accum (deg {})",
@@ -337,6 +339,9 @@ impl Target {
 
             let t_send = std::time::Instant::now();
             send_msg(&mut s, &outgoing)?;
+            if deploy_ms.is_none() {
+                deploy_ms = Some(t_deploy.elapsed().as_secs_f64() * 1000.0);
+            }
 
             // Wait for the monitor's full reply (messages + proof).
             let msg: MonitorToTarget = match recv_msg(&mut s) {
@@ -361,8 +366,18 @@ impl Target {
                 sent_bytes as f64 / 1024.0,
                 recv_bytes as f64 / 1024.0,
             );
+            if let Some(deploy_ms) = deploy_ms.take() {
+                eprintln!(
+                    "[Target] Deploy Time (generate t_poly_ct -> first forward to monitor): {deploy_ms:.3} ms"
+                );
+            }
 
-            match self.process_round(&mut rng, &current, &current_accum, &msg) {
+            let t_verify = std::time::Instant::now();
+            let round_result = self.process_round(&mut rng, &current, &current_accum, &msg);
+            let verification_ms = t_verify.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[Target] Verification Time: {verification_ms:.3} ms");
+
+            match round_result {
                 Ok((next_accum, matched)) => {
                     eprintln!("[Target] match={matched}  state={}", self.state);
                     current_accum = next_accum;
@@ -374,7 +389,10 @@ impl Target {
             }
         }
 
-        eprintln!("[Target] Done after {rounds} round(s). state = {}", self.state);
+        eprintln!(
+            "[Target] Done after {rounds} round(s). state = {}",
+            self.state
+        );
         Ok(())
     }
 }
