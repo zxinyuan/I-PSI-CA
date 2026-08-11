@@ -53,8 +53,9 @@ pub struct SigmaBulletProof {
 /// relations for:
 /// 1. `t_poly_ct` evaluation glue,
 /// 2. partial decryption of the masked `t_poly_ct` evaluation,
-/// 3. partial decryption of the masked `accum` evaluation,
-/// 4. `next_accum = y · accum`,
+/// 3. `accum` evaluation glue under an independent non-zero mask,
+/// 4. partial decryption of the masked `accum` evaluation,
+/// 5. `next_accum = y · accum`,
 /// all sharing one Fiat-Shamir challenge and one `alpha_tag = y·G`.
 pub struct CombinedSigmaProof {
     pub chain_proof: bp::EvalChainProof,
@@ -66,6 +67,11 @@ pub struct CombinedSigmaProof {
     pub partial_a: CompressedRistretto,
     pub partial_z1: Scalar,
     pub partial_z2: Scalar,
+    pub accum_chain_proof: bp::EvalChainProof,
+    pub accum_glue_a_t: CompressedRistretto,
+    pub accum_glue_z_e: Vec<Scalar>,
+    pub accum_glue_z_alpha: Scalar,
+    pub accum_glue_z_y_blind: Scalar,
     pub accum_partial_a: CompressedRistretto,
     pub accum_partial_z1: Scalar,
     pub accum_partial_z2: Scalar,
@@ -73,6 +79,30 @@ pub struct CombinedSigmaProof {
     pub accum_mul_a2: CompressedRistretto,
     pub accum_mul_a_m: CompressedRistretto,
     pub accum_mul_s_y: Scalar,
+}
+
+/// Accumulator-independent part of a full monitor-round proof.
+///
+/// This contains every commitment that can be built before the accumulator is
+/// available. The Fiat-Shamir challenge is deliberately deferred because it
+/// binds both these commitments and the accumulator-dependent relations.
+pub(crate) struct RoundProofPrecomputation {
+    chain_proof: bp::EvalChainProof,
+    e_asc: Vec<Scalar>,
+    y_blind: Scalar,
+    k_e: Vec<Scalar>,
+    alpha: Scalar,
+    alpha_tag_pt: RistrettoPoint,
+    alpha_tag: CompressedRistretto,
+    k_alpha: Scalar,
+    k_y_blind: Scalar,
+    glue_a_t: CompressedRistretto,
+    k_sk2: Scalar,
+    k_r_prime: Scalar,
+    partial_a: CompressedRistretto,
+    r_prime: Scalar,
+    sk2: Scalar,
+    transcript: Transcript,
 }
 
 fn append_point(t: &mut Transcript, label: &'static [u8], p: &RistrettoPoint) {
@@ -126,8 +156,9 @@ fn glue_transcript(
     t
 }
 
-fn append_glue_section(
+pub(crate) fn append_glue_section(
     t: &mut Transcript,
+    section: &'static [u8],
     chain_proof: &bp::EvalChainProof,
     pk: &PublicKey,
     coeff_cts: &[Ciphertext],
@@ -138,7 +169,7 @@ fn append_glue_section(
     alpha_tag: &CompressedRistretto,
     glue_a_t: &CompressedRistretto,
 ) {
-    t.append_message(b"section", b"sigma_bullet_glue");
+    t.append_message(b"section", section);
     append_point(t, b"pk", &pk.0);
     for c in coeff_cts {
         append_point(t, b"coef_c1", &c.c1);
@@ -210,7 +241,7 @@ fn append_poly_scalar_mul_section(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn combined_transcript(
+fn combined_transcript_prefix(
     pk: &PublicKey,
     coeff_cts: &[Ciphertext],
     c_star: &Ciphertext,
@@ -227,22 +258,11 @@ fn combined_transcript(
     beta_pd: Scalar,
     gamma_pd: Scalar,
     partial_a: &CompressedRistretto,
-    accum_partial_in_ct: &Ciphertext,
-    accum_partial_out_ct: &Ciphertext,
-    beta_accum_pd: Scalar,
-    gamma_accum_pd: Scalar,
-    accum_partial_a: &CompressedRistretto,
-    accum_in: &crate::crypto::elgamal::EncryptedPoly,
-    accum_out: &crate::crypto::elgamal::EncryptedPoly,
-    beta_accum_mul: Scalar,
-    gamma_accum_mul: Scalar,
-    accum_mul_a1: &CompressedRistretto,
-    accum_mul_a2: &CompressedRistretto,
-    accum_mul_a_m: &CompressedRistretto,
 ) -> Transcript {
-    let mut t = Transcript::new(b"I-PSI-CA::combined_sigma_round_v1");
+    let mut t = Transcript::new(b"I-PSI-CA::combined_sigma_round_v2");
     append_glue_section(
         &mut t,
+        b"sigma_bullet_glue",
         chain_proof,
         pk,
         coeff_cts,
@@ -262,6 +282,76 @@ fn combined_transcript(
         beta_pd,
         gamma_pd,
         partial_a,
+    );
+    t
+}
+
+#[allow(clippy::too_many_arguments)]
+fn combined_transcript(
+    pk: &PublicKey,
+    coeff_cts: &[Ciphertext],
+    c_star: &Ciphertext,
+    chain_proof: &bp::EvalChainProof,
+    alpha_tag: &CompressedRistretto,
+    glue_a_t: &CompressedRistretto,
+    beta_y: Scalar,
+    beta_c1: Scalar,
+    beta_c2: Scalar,
+    pk2: &crate::crypto::elgamal::PublicKeyShare,
+    pk1: &crate::crypto::elgamal::PublicKeyShare,
+    partial_in_ct: &Ciphertext,
+    partial_out_ct: &Ciphertext,
+    beta_pd: Scalar,
+    gamma_pd: Scalar,
+    partial_a: &CompressedRistretto,
+    accum_chain_proof: &bp::EvalChainProof,
+    accum_glue_a_t: &CompressedRistretto,
+    beta_accum_y: Scalar,
+    beta_accum_c1: Scalar,
+    beta_accum_c2: Scalar,
+    accum_partial_in_ct: &Ciphertext,
+    accum_partial_out_ct: &Ciphertext,
+    beta_accum_pd: Scalar,
+    gamma_accum_pd: Scalar,
+    accum_partial_a: &CompressedRistretto,
+    accum_in: &crate::crypto::elgamal::EncryptedPoly,
+    accum_out: &crate::crypto::elgamal::EncryptedPoly,
+    beta_accum_mul: Scalar,
+    gamma_accum_mul: Scalar,
+    accum_mul_a1: &CompressedRistretto,
+    accum_mul_a2: &CompressedRistretto,
+    accum_mul_a_m: &CompressedRistretto,
+) -> Transcript {
+    let mut t = combined_transcript_prefix(
+        pk,
+        coeff_cts,
+        c_star,
+        chain_proof,
+        alpha_tag,
+        glue_a_t,
+        beta_y,
+        beta_c1,
+        beta_c2,
+        pk2,
+        pk1,
+        partial_in_ct,
+        partial_out_ct,
+        beta_pd,
+        gamma_pd,
+        partial_a,
+    );
+    append_glue_section(
+        &mut t,
+        b"accum_sigma_bullet_glue",
+        accum_chain_proof,
+        pk,
+        &accum_in.0,
+        accum_partial_in_ct,
+        beta_accum_y,
+        beta_accum_c1,
+        beta_accum_c2,
+        alpha_tag,
+        accum_glue_a_t,
     );
     append_partial_decrypt_section(
         &mut t,
@@ -288,70 +378,6 @@ fn combined_transcript(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn combined_prover_challenge(
-    pk: &PublicKey,
-    coeff_cts: &[Ciphertext],
-    c_star: &Ciphertext,
-    chain_proof: &bp::EvalChainProof,
-    alpha_tag: &CompressedRistretto,
-    glue_a_t: &CompressedRistretto,
-    beta_y: Scalar,
-    beta_c1: Scalar,
-    beta_c2: Scalar,
-    pk2: &crate::crypto::elgamal::PublicKeyShare,
-    pk1: &crate::crypto::elgamal::PublicKeyShare,
-    partial_in_ct: &Ciphertext,
-    partial_out_ct: &Ciphertext,
-    beta_pd: Scalar,
-    gamma_pd: Scalar,
-    partial_a: &CompressedRistretto,
-    accum_partial_in_ct: &Ciphertext,
-    accum_partial_out_ct: &Ciphertext,
-    beta_accum_pd: Scalar,
-    gamma_accum_pd: Scalar,
-    accum_partial_a: &CompressedRistretto,
-    accum_in: &crate::crypto::elgamal::EncryptedPoly,
-    accum_out: &crate::crypto::elgamal::EncryptedPoly,
-    beta_accum_mul: Scalar,
-    gamma_accum_mul: Scalar,
-    accum_mul_a1: &CompressedRistretto,
-    accum_mul_a2: &CompressedRistretto,
-    accum_mul_a_m: &CompressedRistretto,
-) -> Scalar {
-    let mut t = combined_transcript(
-        pk,
-        coeff_cts,
-        c_star,
-        chain_proof,
-        alpha_tag,
-        glue_a_t,
-        beta_y,
-        beta_c1,
-        beta_c2,
-        pk2,
-        pk1,
-        partial_in_ct,
-        partial_out_ct,
-        beta_pd,
-        gamma_pd,
-        partial_a,
-        accum_partial_in_ct,
-        accum_partial_out_ct,
-        beta_accum_pd,
-        gamma_accum_pd,
-        accum_partial_a,
-        accum_in,
-        accum_out,
-        beta_accum_mul,
-        gamma_accum_mul,
-        accum_mul_a1,
-        accum_mul_a2,
-        accum_mul_a_m,
-    );
-    challenge_scalar(&mut t)
-}
-
-#[allow(clippy::too_many_arguments)]
 fn combined_challenge(
     pk: &PublicKey,
     coeff_cts: &[Ciphertext],
@@ -369,6 +395,11 @@ fn combined_challenge(
     beta_pd: Scalar,
     gamma_pd: Scalar,
     partial_a: &CompressedRistretto,
+    accum_chain_proof: &bp::EvalChainProof,
+    accum_glue_a_t: &CompressedRistretto,
+    beta_accum_y: Scalar,
+    beta_accum_c1: Scalar,
+    beta_accum_c2: Scalar,
     accum_partial_in_ct: &Ciphertext,
     accum_partial_out_ct: &Ciphertext,
     beta_accum_pd: Scalar,
@@ -381,7 +412,7 @@ fn combined_challenge(
     accum_mul_a1: &CompressedRistretto,
     accum_mul_a2: &CompressedRistretto,
     accum_mul_a_m: &CompressedRistretto,
-) -> (Scalar, Scalar, Scalar, Scalar, Scalar) {
+) -> (Scalar, Scalar, Scalar, Scalar, Scalar, Scalar) {
     let mut t = combined_transcript(
         pk,
         coeff_cts,
@@ -399,6 +430,11 @@ fn combined_challenge(
         beta_pd,
         gamma_pd,
         partial_a,
+        accum_chain_proof,
+        accum_glue_a_t,
+        beta_accum_y,
+        beta_accum_c1,
+        beta_accum_c2,
         accum_partial_in_ct,
         accum_partial_out_ct,
         beta_accum_pd,
@@ -415,12 +451,14 @@ fn combined_challenge(
     let challenge = challenge_scalar(&mut t);
     let rho_glue = batch_scalar(&mut t, b"rho_glue");
     let rho_partial = batch_scalar(&mut t, b"rho_partial");
+    let rho_accum_glue = batch_scalar(&mut t, b"rho_accum_glue");
     let rho_accum_partial = batch_scalar(&mut t, b"rho_accum_partial");
     let rho_accum_mul = batch_scalar(&mut t, b"rho_accum_mul");
     (
         challenge,
         rho_glue,
         rho_partial,
+        rho_accum_glue,
         rho_accum_partial,
         rho_accum_mul,
     )
@@ -441,7 +479,7 @@ pub fn round_challenge_and_batch_scalars(
     accum_in: &crate::crypto::elgamal::EncryptedPoly,
     accum_out: &crate::crypto::elgamal::EncryptedPoly,
     proof: &CombinedSigmaProof,
-) -> Result<(Scalar, Scalar, Scalar, Scalar, Scalar), String> {
+) -> Result<(Scalar, Scalar, Scalar, Scalar, Scalar, Scalar), String> {
     let alpha_tag = proof
         .alpha_tag
         .decompress()
@@ -449,6 +487,8 @@ pub fn round_challenge_and_batch_scalars(
     let (beta_y, beta_c1, beta_c2) = relation_scalars(&proof.chain_proof, pk, coeff_cts, c_star);
     let (beta_pd, gamma_pd) =
         sigma::partial_decrypt_relation_scalars(pk2, pk1, c_star, partial_out_ct);
+    let (beta_accum_y, beta_accum_c1, beta_accum_c2) =
+        relation_scalars(&proof.accum_chain_proof, pk, &accum_in.0, accum_c_star);
     let (beta_accum_pd, gamma_accum_pd) =
         sigma::partial_decrypt_relation_scalars(pk2, pk1, accum_c_star, accum_partial_out_ct);
     let accum_mul_temp = PolyScalarMulProof {
@@ -479,6 +519,11 @@ pub fn round_challenge_and_batch_scalars(
         beta_pd,
         gamma_pd,
         &proof.partial_a,
+        &proof.accum_chain_proof,
+        &proof.accum_glue_a_t,
+        beta_accum_y,
+        beta_accum_c1,
+        beta_accum_c2,
         accum_c_star,
         accum_partial_out_ct,
         beta_accum_pd,
@@ -494,7 +539,7 @@ pub fn round_challenge_and_batch_scalars(
     ))
 }
 
-fn relation_scalars(
+pub(crate) fn relation_scalars(
     chain_proof: &bp::EvalChainProof,
     pk: &PublicKey,
     coeff_cts: &[Ciphertext],
@@ -508,7 +553,7 @@ fn relation_scalars(
 }
 
 /// Build Bulletproof chain proof while retaining e-commitment blindings for glue.
-fn prove_chain_with_openings<R: CryptoRng + RngCore>(
+pub(crate) fn prove_chain_with_openings<R: CryptoRng + RngCore>(
     rng: &mut R,
     pc_gens: &PedersenGens,
     bp_gens: &BulletproofGens,
@@ -635,7 +680,7 @@ pub fn prove(
 /// Prove the full monitor round with one shared Fiat-Shamir challenge across
 /// Sigma-Bullet glue, two partial-decrypt relations, and `accum` scalar multiplication.
 #[allow(clippy::too_many_arguments)]
-pub fn prove_round<R: CryptoRng + RngCore>(
+pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
     rng: &mut R,
     pc_gens: &PedersenGens,
     bp_gens: &BulletproofGens,
@@ -645,16 +690,11 @@ pub fn prove_round<R: CryptoRng + RngCore>(
     coeff_cts: &[Ciphertext],
     c_star: &Ciphertext,
     partial_out_ct: &Ciphertext,
-    accum_c_star: &Ciphertext,
-    accum_partial_out_ct: &Ciphertext,
-    accum_in: &crate::crypto::elgamal::EncryptedPoly,
-    accum_out: &crate::crypto::elgamal::EncryptedPoly,
     alpha: Scalar,
     r: Scalar,
     r_prime: Scalar,
-    accum_r_prime: Scalar,
     sk2: &Scalar,
-) -> Result<CombinedSigmaProof, R1CSError> {
+) -> Result<RoundProofPrecomputation, R1CSError> {
     assert!(!coeff_cts.is_empty(), "coeff_cts must not be empty");
 
     let mut e_asc = Vec::with_capacity(coeff_cts.len());
@@ -702,6 +742,121 @@ pub fn prove_round<R: CryptoRng + RngCore>(
     let partial_a = (mul_g(&k_sk2) - k_sk2 * (gamma_pd * c_star.c1)
         + k_r_prime * (gamma_pd * (pk1.0 + beta_g)))
         .compress();
+    let transcript = combined_transcript_prefix(
+        pk,
+        coeff_cts,
+        c_star,
+        &chain_proof,
+        &alpha_tag,
+        &glue_a_t,
+        beta_y,
+        beta_c1,
+        beta_c2,
+        pk2,
+        pk1,
+        c_star,
+        partial_out_ct,
+        beta_pd,
+        gamma_pd,
+        &partial_a,
+    );
+
+    Ok(RoundProofPrecomputation {
+        chain_proof,
+        e_asc,
+        y_blind,
+        k_e,
+        alpha,
+        alpha_tag_pt,
+        alpha_tag,
+        k_alpha,
+        k_y_blind,
+        glue_a_t,
+        k_sk2,
+        k_r_prime,
+        partial_a,
+        r_prime,
+        sk2: *sk2,
+        transcript,
+    })
+}
+
+/// Complete a monitor-round proof after the accumulator becomes available.
+///
+/// The shared random-oracle challenge is generated here, after all accumulator
+/// statements and nonce commitments have been added to the transcript.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_round_proof<R: CryptoRng + RngCore>(
+    rng: &mut R,
+    pc_gens: &PedersenGens,
+    bp_gens: &BulletproofGens,
+    pk: &PublicKey,
+    pk1: &crate::crypto::elgamal::PublicKeyShare,
+    pk2: &crate::crypto::elgamal::PublicKeyShare,
+    accum_c_star: &Ciphertext,
+    accum_partial_out_ct: &Ciphertext,
+    accum_in: &crate::crypto::elgamal::EncryptedPoly,
+    accum_out: &crate::crypto::elgamal::EncryptedPoly,
+    accum_mask: Scalar,
+    accum_r_prime: Scalar,
+    precomputed: RoundProofPrecomputation,
+) -> Result<CombinedSigmaProof, R1CSError> {
+    let RoundProofPrecomputation {
+        chain_proof,
+        e_asc,
+        y_blind,
+        k_e,
+        alpha,
+        alpha_tag_pt,
+        alpha_tag,
+        k_alpha,
+        k_y_blind,
+        glue_a_t,
+        k_sk2,
+        k_r_prime,
+        partial_a,
+        r_prime,
+        sk2,
+        mut transcript,
+    } = precomputed;
+
+    let mut accum_e_asc = Vec::with_capacity(accum_in.0.len());
+    accum_e_asc.push(accum_mask);
+    for i in 1..accum_in.0.len() {
+        accum_e_asc.push(accum_e_asc[i - 1] * alpha);
+    }
+    let accum_e_rev: Vec<Scalar> = accum_e_asc.iter().cloned().rev().collect();
+    let (accum_chain_proof, accum_y_blind) =
+        prove_chain_with_openings(rng, pc_gens, bp_gens, &accum_e_rev, alpha)?;
+    let (beta_accum_y, beta_accum_c1, beta_accum_c2) =
+        relation_scalars(&accum_chain_proof, pk, &accum_in.0, accum_c_star);
+    let mut k_accum_e = Vec::with_capacity(accum_e_asc.len());
+    for _ in 0..accum_e_asc.len() {
+        k_accum_e.push(Scalar::random(rng));
+    }
+    let k_accum_alpha = Scalar::random(rng);
+    let k_accum_y_blind = Scalar::random(rng);
+    let mut accum_glue_scalars = Vec::with_capacity(3 + k_accum_e.len());
+    let mut accum_glue_points = Vec::with_capacity(3 + k_accum_e.len());
+    accum_glue_scalars.push(k_accum_alpha);
+    accum_glue_points.push(G);
+    accum_glue_scalars.push(beta_accum_y * k_accum_alpha);
+    accum_glue_points.push(pc_gens.B);
+    accum_glue_scalars.push(beta_accum_y * k_accum_y_blind);
+    accum_glue_points.push(pc_gens.B_blinding);
+    for (idx, (k, ct)) in k_accum_e.iter().zip(accum_in.0.iter()).enumerate() {
+        let mut basis = beta_accum_c1 * ct.c1 + beta_accum_c2 * ct.c2;
+        if idx == 0 {
+            basis += beta_accum_c1 * G + beta_accum_c2 * pk.0;
+        }
+        accum_glue_scalars.push(*k);
+        accum_glue_points.push(basis);
+    }
+    let accum_glue_a_t = RistrettoPoint::multiscalar_mul(
+        accum_glue_scalars.iter().copied(),
+        accum_glue_points.iter().copied(),
+    )
+    .compress();
 
     let (beta_accum_pd, gamma_accum_pd) =
         sigma::partial_decrypt_relation_scalars(pk2, pk1, accum_c_star, accum_partial_out_ct);
@@ -729,36 +884,43 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         sigma::poly_scalar_mul_batch_scalars(&accum_mul_temp, accum_in, accum_out, &alpha_tag_pt)
             .map_err(|_| R1CSError::FormatError)?;
 
-    let shared_chal = combined_prover_challenge(
+    // The accumulator evaluation is bound to the same hidden `alpha` through
+    // the shared alpha tag and challenge.
+    append_glue_section(
+        &mut transcript,
+        b"accum_sigma_bullet_glue",
+        &accum_chain_proof,
         pk,
-        coeff_cts,
-        c_star,
-        &chain_proof,
+        &accum_in.0,
+        accum_c_star,
+        beta_accum_y,
+        beta_accum_c1,
+        beta_accum_c2,
         &alpha_tag,
-        &glue_a_t,
-        beta_y,
-        beta_c1,
-        beta_c2,
+        &accum_glue_a_t,
+    );
+    append_partial_decrypt_section(
+        &mut transcript,
         pk2,
         pk1,
-        c_star,
-        partial_out_ct,
-        beta_pd,
-        gamma_pd,
-        &partial_a,
         accum_c_star,
         accum_partial_out_ct,
         beta_accum_pd,
         gamma_accum_pd,
         &accum_partial_a,
+    );
+    append_poly_scalar_mul_section(
+        &mut transcript,
         accum_in,
         accum_out,
+        &alpha_tag,
         beta_accum_mul,
         gamma_accum_mul,
         &accum_mul_a1,
         &accum_mul_a2,
         &accum_mul_a_m,
     );
+    let shared_chal = challenge_scalar(&mut transcript);
 
     Ok(CombinedSigmaProof {
         chain_proof,
@@ -774,6 +936,15 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         partial_a,
         partial_z1: k_sk2 + shared_chal * sk2,
         partial_z2: k_r_prime + shared_chal * r_prime,
+        accum_chain_proof,
+        accum_glue_a_t,
+        accum_glue_z_e: k_accum_e
+            .iter()
+            .zip(accum_e_asc.iter())
+            .map(|(k, x)| k + shared_chal * x)
+            .collect(),
+        accum_glue_z_alpha: k_accum_alpha + shared_chal * alpha,
+        accum_glue_z_y_blind: k_accum_y_blind + shared_chal * accum_y_blind,
         accum_partial_a,
         accum_partial_z1: k_accum_sk2 + shared_chal * sk2,
         accum_partial_z2: k_accum_r_prime + shared_chal * accum_r_prime,
@@ -782,6 +953,65 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         accum_mul_a_m,
         accum_mul_s_y: k_accum_mul_y + shared_chal * alpha,
     })
+}
+
+/// Prove a complete monitor round sequentially.
+///
+/// This compatibility wrapper preserves the original all-at-once behavior;
+/// callers that receive the accumulator later can invoke
+/// [`preprocess_round_proof`] and [`finish_round_proof`] separately.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_round<R: CryptoRng + RngCore>(
+    rng: &mut R,
+    pc_gens: &PedersenGens,
+    bp_gens: &BulletproofGens,
+    pk: &PublicKey,
+    pk1: &crate::crypto::elgamal::PublicKeyShare,
+    pk2: &crate::crypto::elgamal::PublicKeyShare,
+    coeff_cts: &[Ciphertext],
+    c_star: &Ciphertext,
+    partial_out_ct: &Ciphertext,
+    accum_c_star: &Ciphertext,
+    accum_partial_out_ct: &Ciphertext,
+    accum_in: &crate::crypto::elgamal::EncryptedPoly,
+    accum_out: &crate::crypto::elgamal::EncryptedPoly,
+    alpha: Scalar,
+    r: Scalar,
+    r_prime: Scalar,
+    accum_mask: Scalar,
+    accum_r_prime: Scalar,
+    sk2: &Scalar,
+) -> Result<CombinedSigmaProof, R1CSError> {
+    let precomputed = preprocess_round_proof(
+        rng,
+        pc_gens,
+        bp_gens,
+        pk,
+        pk1,
+        pk2,
+        coeff_cts,
+        c_star,
+        partial_out_ct,
+        alpha,
+        r,
+        r_prime,
+        sk2,
+    )?;
+    finish_round_proof(
+        rng,
+        pc_gens,
+        bp_gens,
+        pk,
+        pk1,
+        pk2,
+        accum_c_star,
+        accum_partial_out_ct,
+        accum_in,
+        accum_out,
+        accum_mask,
+        accum_r_prime,
+        precomputed,
+    )
 }
 
 /// Verify Sigma-Bullet glue proof.
@@ -886,9 +1116,17 @@ pub fn verify_round(
     if proof.glue_z_e.len() != coeff_cts.len() {
         return Err("glue vector length mismatch".to_string());
     }
+    if proof.accum_chain_proof.e_comms.len() != accum_in.0.len() {
+        return Err("accum e commitment length mismatch".to_string());
+    }
+    if proof.accum_glue_z_e.len() != accum_in.0.len() {
+        return Err("accum glue vector length mismatch".to_string());
+    }
 
     bp::verify(pc_gens, bp_gens, &proof.chain_proof)
         .map_err(|e| format!("chain Bulletproof invalid: {e:?}"))?;
+    bp::verify(pc_gens, bp_gens, &proof.accum_chain_proof)
+        .map_err(|e| format!("accum chain Bulletproof invalid: {e:?}"))?;
 
     let alpha_tag = proof
         .alpha_tag
@@ -902,6 +1140,10 @@ pub fn verify_round(
         .partial_a
         .decompress()
         .ok_or_else(|| "invalid partial A point".to_string())?;
+    let accum_glue_a_t = proof
+        .accum_glue_a_t
+        .decompress()
+        .ok_or_else(|| "invalid accum glue A_t point".to_string())?;
     let accum_partial_a = proof
         .accum_partial_a
         .decompress()
@@ -925,6 +1167,13 @@ pub fn verify_round(
         .y_comm
         .decompress()
         .ok_or_else(|| "invalid y commitment point".to_string())?;
+    let (beta_accum_y, beta_accum_c1, beta_accum_c2) =
+        relation_scalars(&proof.accum_chain_proof, pk, &accum_in.0, accum_c_star);
+    let accum_y_comm_pt = proof
+        .accum_chain_proof
+        .y_comm
+        .decompress()
+        .ok_or_else(|| "invalid accum y commitment point".to_string())?;
     let (beta_pd, gamma_pd) =
         sigma::partial_decrypt_relation_scalars(pk2, pk1, c_star, partial_out_ct);
     let delta_c1 = partial_out_ct.c1 - c_star.c1;
@@ -935,7 +1184,7 @@ pub fn verify_round(
     let accum_delta_c2 = accum_partial_out_ct.c2 - accum_c_star.c2;
     let (accum_mul_x_c1, accum_mul_x_c2, accum_mul_y_c1, accum_mul_y_c2, _) =
         sigma::poly_scalar_mul_relation_points(accum_in, accum_out, &alpha_tag);
-    let (chal, rho_glue, rho_partial, rho_accum_partial, rho_accum_mul) =
+    let (chal, rho_glue, rho_partial, rho_accum_glue, rho_accum_partial, rho_accum_mul) =
         round_challenge_and_batch_scalars(
             pk,
             pk1,
@@ -1005,6 +1254,36 @@ pub fn verify_round(
     points.push(delta_c2);
     scalars.push(-rho_partial * chal * gamma_pd * beta_pd);
     points.push(delta_c1);
+
+    scalars.push(rho_accum_glue * proof.accum_glue_z_alpha);
+    points.push(G);
+    scalars.push(rho_accum_glue * beta_accum_y * proof.accum_glue_z_alpha);
+    points.push(pc_gens.B);
+    scalars.push(rho_accum_glue * beta_accum_y * proof.accum_glue_z_y_blind);
+    points.push(pc_gens.B_blinding);
+    for (idx, (z, ct)) in proof
+        .accum_glue_z_e
+        .iter()
+        .zip(accum_in.0.iter())
+        .enumerate()
+    {
+        let mut basis = beta_accum_c1 * ct.c1 + beta_accum_c2 * ct.c2;
+        if idx == 0 {
+            basis += beta_accum_c1 * G + beta_accum_c2 * pk.0;
+        }
+        scalars.push(rho_accum_glue * *z);
+        points.push(basis);
+    }
+    scalars.push(-rho_accum_glue);
+    points.push(accum_glue_a_t);
+    scalars.push(-rho_accum_glue * chal);
+    points.push(alpha_tag);
+    scalars.push(-rho_accum_glue * chal * beta_accum_y);
+    points.push(accum_y_comm_pt);
+    scalars.push(-rho_accum_glue * chal * beta_accum_c1);
+    points.push(accum_c_star.c1);
+    scalars.push(-rho_accum_glue * chal * beta_accum_c2);
+    points.push(accum_c_star.c2);
 
     scalars.push(
         rho_accum_partial
@@ -1076,7 +1355,10 @@ fn weighted_sum(coeff_cts: &[Ciphertext], e_asc: &[Scalar]) -> Ciphertext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::elgamal::{combine_public_keys, encrypt_poly, generate_key_share};
+    use crate::crypto::elgamal::{
+        combine_public_keys, ct_add, ct_scalar_mul, encrypt_poly, eval_poly, generate_key_share,
+        partial_decrypt_with_witness, poly_scalar_mul,
+    };
     use rand::rngs::OsRng;
 
     fn make_bp_gens(n_mul: usize) -> BulletproofGens {
@@ -1162,6 +1444,91 @@ mod tests {
         assert!(
             verify(&pc_gens, &bp_gens, &pk, &poly.0, &tampered, &proof).is_err(),
             "tampered c_star must fail",
+        );
+    }
+
+    #[test]
+    fn combined_round_rejects_well_formed_but_false_accum_eval() {
+        let mut rng = OsRng;
+        let (_sk1, pk1) = generate_key_share(&mut rng);
+        let (sk2, pk2) = generate_key_share(&mut rng);
+        let pk = combine_public_keys(&pk1, &pk2);
+        let alpha = Scalar::from(5u64);
+
+        let poly = encrypt_poly(
+            &mut rng,
+            &pk,
+            &[Scalar::from(3u64), Scalar::from(7u64), Scalar::from(11u64)],
+        );
+        let mask = Scalar::from(13u64);
+        let eval = eval_poly(&poly, &alpha);
+        let scaled = ct_add(&ct_scalar_mul(&eval, &mask), &enc_zero_with_r(&pk, mask));
+        let (m_poly_ct, r_prime) = partial_decrypt_with_witness(&mut rng, &sk2, &pk1, &scaled);
+
+        let accum = encrypt_poly(
+            &mut rng,
+            &pk,
+            &[Scalar::one(), Scalar::from(2u64), Scalar::from(4u64)],
+        );
+        let next_accum = poly_scalar_mul(&accum, &alpha);
+        let accum_mask = Scalar::from(17u64);
+        let accum_eval = eval_poly(&accum, &alpha);
+        let correct_accum_scaled = ct_add(
+            &ct_scalar_mul(&accum_eval, &accum_mask),
+            &enc_zero_with_r(&pk, accum_mask),
+        );
+        let false_accum_scaled = Ciphertext {
+            c1: correct_accum_scaled.c1 + G,
+            c2: correct_accum_scaled.c2,
+        };
+        // The partial-decryption statement remains valid for this arbitrary
+        // ciphertext; only the new accumulator-evaluation glue must reject it.
+        let (false_accum_partial, accum_r_prime) =
+            partial_decrypt_with_witness(&mut rng, &sk2, &pk1, &false_accum_scaled);
+
+        let pc_gens = PedersenGens::default();
+        let bp_gens = make_bp_gens(2 * poly.0.len().max(accum.0.len()));
+        let proof = prove_round(
+            &mut rng,
+            &pc_gens,
+            &bp_gens,
+            &pk,
+            &pk1,
+            &pk2,
+            &poly.0,
+            &scaled,
+            &m_poly_ct,
+            &false_accum_scaled,
+            &false_accum_partial,
+            &accum,
+            &next_accum,
+            alpha,
+            mask,
+            r_prime,
+            accum_mask,
+            accum_r_prime,
+            sk2.as_scalar(),
+        )
+        .expect("prover can construct commitments from a false witness");
+
+        assert!(
+            verify_round(
+                &pc_gens,
+                &bp_gens,
+                &pk,
+                &pk1,
+                &pk2,
+                &poly.0,
+                &scaled,
+                &m_poly_ct,
+                &false_accum_scaled,
+                &false_accum_partial,
+                &accum,
+                &next_accum,
+                &proof,
+            )
+            .is_err(),
+            "a valid partial decrypt of an unrelated accumulator ciphertext must be rejected",
         );
     }
 }

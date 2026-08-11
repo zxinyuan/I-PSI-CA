@@ -198,7 +198,9 @@ impl Target {
     ) -> Self {
         let pk = combine_public_keys(&pk1, &pk2);
         let max_degree = marked_positions.len();
-        let cap = crate::bf::bp_capacity(max_degree, bf_config);
+        let target_cap = crate::bf::bp_capacity(max_degree, bf_config);
+        let accum_cap = (2 * (accum_degree + 1)).next_power_of_two().max(64);
+        let cap = target_cap.max(accum_cap);
         Target {
             marked_positions,
             bf_config,

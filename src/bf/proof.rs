@@ -16,10 +16,12 @@ use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use crate::bf::bloom::{hash_params, scalar_positions, BloomFilterConfig};
+use crate::crypto::bulletproof as bp;
 use crate::crypto::elgamal::{
     ct_add, ct_scalar_mul, Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare,
 };
 use crate::crypto::sigma::{self, PolyScalarMulProof};
+use crate::crypto::sigma_bullet;
 
 pub(crate) struct AggregateEvalWitness {
     pub e_vals: Vec<Scalar>,
@@ -44,7 +46,14 @@ pub struct WireEvalSumProof {
     pub inv_r_comm: [u8; 32],
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WireAccumEvalProof {
+    pub proof_bytes: Vec<u8>,
+    pub e_comms: Vec<[u8; 32]>,
+    pub y_comm: [u8; 32],
+    pub inv_en_comm: [u8; 32],
+}
+
 struct CombinedSigmaProof {
     eval_proof: EvalSumProof,
     alpha_tag: CompressedRistretto,
@@ -55,6 +64,11 @@ struct CombinedSigmaProof {
     partial_a: CompressedRistretto,
     partial_z1: Scalar,
     partial_z2: Scalar,
+    accum_chain_proof: bp::EvalChainProof,
+    accum_glue_a_t: CompressedRistretto,
+    accum_glue_z_e: Vec<Scalar>,
+    accum_glue_z_alpha: Scalar,
+    accum_glue_z_y_blind: Scalar,
     accum_partial_a: CompressedRistretto,
     accum_partial_z1: Scalar,
     accum_partial_z2: Scalar,
@@ -64,6 +78,30 @@ struct CombinedSigmaProof {
     accum_mul_s_y: Scalar,
 }
 
+/// Accumulator-independent part of a full Bloom-filter monitor proof.
+///
+/// The proof commitments are prepared here, while the shared Fiat-Shamir
+/// challenge and all responses remain deferred until the accumulator-bound
+/// statements are known.
+pub(crate) struct RoundProofPrecomputation {
+    eval_proof: EvalSumProof,
+    y_blind: Scalar,
+    e_vals: Vec<Scalar>,
+    y: Scalar,
+    k_e: Vec<Scalar>,
+    k_alpha: Scalar,
+    k_y_blind: Scalar,
+    alpha_tag_pt: RistrettoPoint,
+    alpha_tag: CompressedRistretto,
+    glue_a_t: CompressedRistretto,
+    k_sk2: Scalar,
+    k_r_prime: Scalar,
+    partial_a: CompressedRistretto,
+    mpoly_r_prime: Scalar,
+    sk2: Scalar,
+    transcript: Transcript,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RoundBatchScalars {
     beta_y: Scalar,
@@ -71,6 +109,9 @@ struct RoundBatchScalars {
     beta_c2: Scalar,
     beta_pd: Scalar,
     gamma_pd: Scalar,
+    beta_accum_y: Scalar,
+    beta_accum_c1: Scalar,
+    beta_accum_c2: Scalar,
     beta_accum_pd: Scalar,
     gamma_accum_pd: Scalar,
     beta_accum_mul: Scalar,
@@ -78,6 +119,7 @@ struct RoundBatchScalars {
     challenge: Scalar,
     rho_glue: Scalar,
     rho_partial: Scalar,
+    rho_accum_glue: Scalar,
     rho_accum_partial: Scalar,
     rho_accum_mul: Scalar,
 }
@@ -93,6 +135,11 @@ pub struct WireCombinedSigmaProof {
     pub partial_a: [u8; 32],
     pub partial_z1: [u8; 32],
     pub partial_z2: [u8; 32],
+    pub accum_chain_proof: WireAccumEvalProof,
+    pub accum_glue_a_t: [u8; 32],
+    pub accum_glue_z_e: Vec<[u8; 32]>,
+    pub accum_glue_z_alpha: [u8; 32],
+    pub accum_glue_z_y_blind: [u8; 32],
     pub accum_partial_a: [u8; 32],
     pub accum_partial_z1: [u8; 32],
     pub accum_partial_z2: [u8; 32],
@@ -578,6 +625,42 @@ fn append_poly_scalar_mul_section(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn combined_transcript_prefix(
+    pk: &PublicKey,
+    coeff_cts: &[Ciphertext],
+    c_star: &Ciphertext,
+    eval_proof: &EvalSumProof,
+    alpha_tag: &CompressedRistretto,
+    glue_a_t: &CompressedRistretto,
+    beta_y: Scalar,
+    beta_c1: Scalar,
+    beta_c2: Scalar,
+    pk2: &PublicKeyShare,
+    pk1: &PublicKeyShare,
+    partial_in_ct: &Ciphertext,
+    partial_out_ct: &Ciphertext,
+    beta_pd: Scalar,
+    gamma_pd: Scalar,
+    partial_a: &CompressedRistretto,
+) -> Transcript {
+    let mut t = Transcript::new(b"I-PSI-CA::bf_combined_sigma_round_v2");
+    append_glue_section(
+        &mut t, eval_proof, pk, coeff_cts, c_star, beta_y, beta_c1, beta_c2, alpha_tag, glue_a_t,
+    );
+    append_partial_decrypt_section(
+        &mut t,
+        pk2,
+        pk1,
+        partial_in_ct,
+        partial_out_ct,
+        beta_pd,
+        gamma_pd,
+        partial_a,
+    );
+    t
+}
+
+#[allow(clippy::too_many_arguments)]
 fn combined_transcript(
     pk: &PublicKey,
     coeff_cts: &[Ciphertext],
@@ -595,6 +678,11 @@ fn combined_transcript(
     beta_pd: Scalar,
     gamma_pd: Scalar,
     partial_a: &CompressedRistretto,
+    accum_chain_proof: &bp::EvalChainProof,
+    accum_glue_a_t: &CompressedRistretto,
+    beta_accum_y: Scalar,
+    beta_accum_c1: Scalar,
+    beta_accum_c2: Scalar,
     accum_partial_in_ct: &Ciphertext,
     accum_partial_out_ct: &Ciphertext,
     beta_accum_pd: Scalar,
@@ -608,12 +696,16 @@ fn combined_transcript(
     accum_mul_a2: &CompressedRistretto,
     accum_mul_a_m: &CompressedRistretto,
 ) -> Transcript {
-    let mut t = Transcript::new(b"I-PSI-CA::bf_combined_sigma_round_v1");
-    append_glue_section(
-        &mut t, eval_proof, pk, coeff_cts, c_star, beta_y, beta_c1, beta_c2, alpha_tag, glue_a_t,
-    );
-    append_partial_decrypt_section(
-        &mut t,
+    let mut t = combined_transcript_prefix(
+        pk,
+        coeff_cts,
+        c_star,
+        eval_proof,
+        alpha_tag,
+        glue_a_t,
+        beta_y,
+        beta_c1,
+        beta_c2,
         pk2,
         pk1,
         partial_in_ct,
@@ -621,6 +713,19 @@ fn combined_transcript(
         beta_pd,
         gamma_pd,
         partial_a,
+    );
+    sigma_bullet::append_glue_section(
+        &mut t,
+        b"bf_accum_sigma_bullet_glue",
+        accum_chain_proof,
+        pk,
+        &accum_in.0,
+        accum_partial_in_ct,
+        beta_accum_y,
+        beta_accum_c1,
+        beta_accum_c2,
+        alpha_tag,
+        accum_glue_a_t,
     );
     append_partial_decrypt_section(
         &mut t,
@@ -664,6 +769,11 @@ fn combined_challenge(
     beta_pd: Scalar,
     gamma_pd: Scalar,
     partial_a: &CompressedRistretto,
+    accum_chain_proof: &bp::EvalChainProof,
+    accum_glue_a_t: &CompressedRistretto,
+    beta_accum_y: Scalar,
+    beta_accum_c1: Scalar,
+    beta_accum_c2: Scalar,
     accum_partial_in_ct: &Ciphertext,
     accum_partial_out_ct: &Ciphertext,
     beta_accum_pd: Scalar,
@@ -676,7 +786,7 @@ fn combined_challenge(
     accum_mul_a1: &CompressedRistretto,
     accum_mul_a2: &CompressedRistretto,
     accum_mul_a_m: &CompressedRistretto,
-) -> (Scalar, Scalar, Scalar, Scalar, Scalar) {
+) -> (Scalar, Scalar, Scalar, Scalar, Scalar, Scalar) {
     let mut t = combined_transcript(
         pk,
         coeff_cts,
@@ -694,6 +804,11 @@ fn combined_challenge(
         beta_pd,
         gamma_pd,
         partial_a,
+        accum_chain_proof,
+        accum_glue_a_t,
+        beta_accum_y,
+        beta_accum_c1,
+        beta_accum_c2,
         accum_partial_in_ct,
         accum_partial_out_ct,
         beta_accum_pd,
@@ -710,12 +825,14 @@ fn combined_challenge(
     let challenge = challenge_scalar(&mut t);
     let rho_glue = batch_scalar(&mut t, b"rho_glue");
     let rho_partial = batch_scalar(&mut t, b"rho_partial");
+    let rho_accum_glue = batch_scalar(&mut t, b"rho_accum_glue");
     let rho_accum_partial = batch_scalar(&mut t, b"rho_accum_partial");
     let rho_accum_mul = batch_scalar(&mut t, b"rho_accum_mul");
     (
         challenge,
         rho_glue,
         rho_partial,
+        rho_accum_glue,
         rho_accum_partial,
         rho_accum_mul,
     )
@@ -733,6 +850,8 @@ fn derive_round_batch_scalars(
     glue_a_t: &CompressedRistretto,
     partial_out_ct: &Ciphertext,
     partial_a: &CompressedRistretto,
+    accum_chain_proof: &bp::EvalChainProof,
+    accum_glue_a_t: &CompressedRistretto,
     accum_c_star: &Ciphertext,
     accum_partial_out_ct: &Ciphertext,
     accum_partial_a: &CompressedRistretto,
@@ -746,6 +865,8 @@ fn derive_round_batch_scalars(
     let (beta_y, beta_c1, beta_c2) = relation_scalars(eval_proof, pk, coeff_cts, c_star);
     let (beta_pd, gamma_pd) =
         sigma::partial_decrypt_relation_scalars(pk2, pk1, c_star, partial_out_ct);
+    let (beta_accum_y, beta_accum_c1, beta_accum_c2) =
+        sigma_bullet::relation_scalars(accum_chain_proof, pk, &accum_in.0, accum_c_star);
     let (beta_accum_pd, gamma_accum_pd) =
         sigma::partial_decrypt_relation_scalars(pk2, pk1, accum_c_star, accum_partial_out_ct);
 
@@ -766,36 +887,42 @@ fn derive_round_batch_scalars(
     )
     .map_err(str::to_string)?;
 
-    let (challenge, rho_glue, rho_partial, rho_accum_partial, rho_accum_mul) = combined_challenge(
-        pk,
-        coeff_cts,
-        c_star,
-        eval_proof,
-        alpha_tag,
-        glue_a_t,
-        beta_y,
-        beta_c1,
-        beta_c2,
-        pk2,
-        pk1,
-        c_star,
-        partial_out_ct,
-        beta_pd,
-        gamma_pd,
-        partial_a,
-        accum_c_star,
-        accum_partial_out_ct,
-        beta_accum_pd,
-        gamma_accum_pd,
-        accum_partial_a,
-        accum_in,
-        accum_out,
-        beta_accum_mul,
-        gamma_accum_mul,
-        accum_mul_a1,
-        accum_mul_a2,
-        accum_mul_a_m,
-    );
+    let (challenge, rho_glue, rho_partial, rho_accum_glue, rho_accum_partial, rho_accum_mul) =
+        combined_challenge(
+            pk,
+            coeff_cts,
+            c_star,
+            eval_proof,
+            alpha_tag,
+            glue_a_t,
+            beta_y,
+            beta_c1,
+            beta_c2,
+            pk2,
+            pk1,
+            c_star,
+            partial_out_ct,
+            beta_pd,
+            gamma_pd,
+            partial_a,
+            accum_chain_proof,
+            accum_glue_a_t,
+            beta_accum_y,
+            beta_accum_c1,
+            beta_accum_c2,
+            accum_c_star,
+            accum_partial_out_ct,
+            beta_accum_pd,
+            gamma_accum_pd,
+            accum_partial_a,
+            accum_in,
+            accum_out,
+            beta_accum_mul,
+            gamma_accum_mul,
+            accum_mul_a1,
+            accum_mul_a2,
+            accum_mul_a_m,
+        );
 
     Ok(RoundBatchScalars {
         beta_y,
@@ -803,6 +930,9 @@ fn derive_round_batch_scalars(
         beta_c2,
         beta_pd,
         gamma_pd,
+        beta_accum_y,
+        beta_accum_c1,
+        beta_accum_c2,
         beta_accum_pd,
         gamma_accum_pd,
         beta_accum_mul,
@@ -810,6 +940,7 @@ fn derive_round_batch_scalars(
         challenge,
         rho_glue,
         rho_partial,
+        rho_accum_glue,
         rho_accum_partial,
         rho_accum_mul,
     })
@@ -842,6 +973,31 @@ impl WireEvalSumProof {
     }
 }
 
+impl WireAccumEvalProof {
+    fn from_proof(p: &bp::EvalChainProof) -> Self {
+        Self {
+            proof_bytes: p.proof.to_bytes(),
+            e_comms: p.e_comms.iter().map(|c| c.to_bytes()).collect(),
+            y_comm: p.y_comm.to_bytes(),
+            inv_en_comm: p.inv_en_comm.to_bytes(),
+        }
+    }
+
+    fn to_proof(&self) -> Result<bp::EvalChainProof, String> {
+        Ok(bp::EvalChainProof {
+            proof: R1CSProof::from_bytes(&self.proof_bytes)
+                .map_err(|e| format!("accum R1CSProof decode: {e:?}"))?,
+            e_comms: self
+                .e_comms
+                .iter()
+                .map(|b| CompressedRistretto::from_slice(b))
+                .collect(),
+            y_comm: CompressedRistretto::from_slice(&self.y_comm),
+            inv_en_comm: CompressedRistretto::from_slice(&self.inv_en_comm),
+        })
+    }
+}
+
 impl WireCombinedSigmaProof {
     fn from_proof(p: &CombinedSigmaProof) -> Self {
         Self {
@@ -854,6 +1010,11 @@ impl WireCombinedSigmaProof {
             partial_a: p.partial_a.to_bytes(),
             partial_z1: p.partial_z1.to_bytes(),
             partial_z2: p.partial_z2.to_bytes(),
+            accum_chain_proof: WireAccumEvalProof::from_proof(&p.accum_chain_proof),
+            accum_glue_a_t: p.accum_glue_a_t.to_bytes(),
+            accum_glue_z_e: p.accum_glue_z_e.iter().map(|s| s.to_bytes()).collect(),
+            accum_glue_z_alpha: p.accum_glue_z_alpha.to_bytes(),
+            accum_glue_z_y_blind: p.accum_glue_z_y_blind.to_bytes(),
             accum_partial_a: p.accum_partial_a.to_bytes(),
             accum_partial_z1: p.accum_partial_z1.to_bytes(),
             accum_partial_z2: p.accum_partial_z2.to_bytes(),
@@ -870,6 +1031,11 @@ impl WireCombinedSigmaProof {
             .iter()
             .map(|b| Scalar::from_canonical_bytes(*b).ok_or("glue_z_e: non-canonical scalar"))
             .collect();
+        let accum_glue_z_e: Result<Vec<_>, _> = self
+            .accum_glue_z_e
+            .iter()
+            .map(|b| Scalar::from_canonical_bytes(*b).ok_or("accum_glue_z_e: non-canonical scalar"))
+            .collect();
         Ok(CombinedSigmaProof {
             eval_proof: self.eval_proof.to_proof()?,
             alpha_tag: CompressedRistretto::from_slice(&self.alpha_tag),
@@ -884,6 +1050,13 @@ impl WireCombinedSigmaProof {
                 .ok_or("partial_z1: non-canonical scalar")?,
             partial_z2: Scalar::from_canonical_bytes(self.partial_z2)
                 .ok_or("partial_z2: non-canonical scalar")?,
+            accum_chain_proof: self.accum_chain_proof.to_proof()?,
+            accum_glue_a_t: CompressedRistretto::from_slice(&self.accum_glue_a_t),
+            accum_glue_z_e: accum_glue_z_e.map_err(str::to_string)?,
+            accum_glue_z_alpha: Scalar::from_canonical_bytes(self.accum_glue_z_alpha)
+                .ok_or("accum_glue_z_alpha: non-canonical scalar")?,
+            accum_glue_z_y_blind: Scalar::from_canonical_bytes(self.accum_glue_z_y_blind)
+                .ok_or("accum_glue_z_y_blind: non-canonical scalar")?,
             accum_partial_a: CompressedRistretto::from_slice(&self.accum_partial_a),
             accum_partial_z1: Scalar::from_canonical_bytes(self.accum_partial_z1)
                 .ok_or("accum_partial_z1: non-canonical scalar")?,
@@ -899,7 +1072,7 @@ impl WireCombinedSigmaProof {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn prove_round<R: CryptoRng + RngCore>(
+pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
     rng: &mut R,
     pc_gens: &PedersenGens,
     bp_gens: &BulletproofGens,
@@ -913,14 +1086,9 @@ pub fn prove_round<R: CryptoRng + RngCore>(
     pk1: &PublicKeyShare,
     pk2: &PublicKeyShare,
     m_poly_ct: &Ciphertext,
-    accum_scaled_eval: &Ciphertext,
-    accum_m_poly_ct: &Ciphertext,
-    accum_in: &EncryptedPoly,
-    next_accum: &EncryptedPoly,
     mpoly_r_prime: Scalar,
-    accum_r_prime: Scalar,
     sk2: &Scalar,
-) -> Result<(Ciphertext, RoundProof), R1CSError> {
+) -> Result<RoundProofPrecomputation, R1CSError> {
     let (eval_proof, y_blind) =
         prove_eval_sum_with_openings(rng, pc_gens, bp_gens, y, hash_count, e_vals, eval_mask)?;
     let hash_count_inv = Scalar::from(hash_count as u64).invert();
@@ -962,6 +1130,119 @@ pub fn prove_round<R: CryptoRng + RngCore>(
     let partial_a = (mul_g(&k_sk2) - k_sk2 * (gamma_pd * scaled_eval.c1)
         + k_r_prime * (gamma_pd * (pk1.0 + beta_g)))
         .compress();
+    let transcript = combined_transcript_prefix(
+        pk,
+        &t_poly.0,
+        scaled_eval,
+        &eval_proof,
+        &alpha_tag,
+        &glue_a_t,
+        beta_y,
+        beta_c1,
+        beta_c2,
+        pk2,
+        pk1,
+        scaled_eval,
+        m_poly_ct,
+        beta_pd,
+        gamma_pd,
+        &partial_a,
+    );
+
+    Ok(RoundProofPrecomputation {
+        eval_proof,
+        y_blind,
+        e_vals: e_vals.to_vec(),
+        y,
+        k_e,
+        k_alpha,
+        k_y_blind,
+        alpha_tag_pt,
+        alpha_tag,
+        glue_a_t,
+        k_sk2,
+        k_r_prime,
+        partial_a,
+        mpoly_r_prime,
+        sk2: *sk2,
+        transcript,
+    })
+}
+
+/// Complete a preprocessed Bloom-filter proof once the accumulator arrives.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_round_proof<R: CryptoRng + RngCore>(
+    rng: &mut R,
+    pc_gens: &PedersenGens,
+    bp_gens: &BulletproofGens,
+    pk: &PublicKey,
+    scaled_eval: &Ciphertext,
+    pk1: &PublicKeyShare,
+    pk2: &PublicKeyShare,
+    accum_scaled_eval: &Ciphertext,
+    accum_m_poly_ct: &Ciphertext,
+    accum_in: &EncryptedPoly,
+    next_accum: &EncryptedPoly,
+    accum_mask: Scalar,
+    accum_r_prime: Scalar,
+    precomputed: RoundProofPrecomputation,
+) -> Result<(Ciphertext, RoundProof), R1CSError> {
+    let RoundProofPrecomputation {
+        eval_proof,
+        y_blind,
+        e_vals,
+        y,
+        k_e,
+        k_alpha,
+        k_y_blind,
+        alpha_tag_pt,
+        alpha_tag,
+        glue_a_t,
+        k_sk2,
+        k_r_prime,
+        partial_a,
+        mpoly_r_prime,
+        sk2,
+        mut transcript,
+    } = precomputed;
+
+    let mut accum_e_asc = Vec::with_capacity(accum_in.0.len());
+    accum_e_asc.push(accum_mask);
+    for i in 1..accum_in.0.len() {
+        accum_e_asc.push(accum_e_asc[i - 1] * y);
+    }
+    let accum_e_rev: Vec<Scalar> = accum_e_asc.iter().cloned().rev().collect();
+    let (accum_chain_proof, accum_y_blind) =
+        sigma_bullet::prove_chain_with_openings(rng, pc_gens, bp_gens, &accum_e_rev, y)?;
+    let (beta_accum_y, beta_accum_c1, beta_accum_c2) =
+        sigma_bullet::relation_scalars(&accum_chain_proof, pk, &accum_in.0, accum_scaled_eval);
+    let mut k_accum_e = Vec::with_capacity(accum_e_asc.len());
+    for _ in 0..accum_e_asc.len() {
+        k_accum_e.push(Scalar::random(rng));
+    }
+    let k_accum_alpha = Scalar::random(rng);
+    let k_accum_y_blind = Scalar::random(rng);
+    let mut accum_glue_scalars = Vec::with_capacity(3 + k_accum_e.len());
+    let mut accum_glue_points = Vec::with_capacity(3 + k_accum_e.len());
+    accum_glue_scalars.push(k_accum_alpha);
+    accum_glue_points.push(G);
+    accum_glue_scalars.push(beta_accum_y * k_accum_alpha);
+    accum_glue_points.push(pc_gens.B);
+    accum_glue_scalars.push(beta_accum_y * k_accum_y_blind);
+    accum_glue_points.push(pc_gens.B_blinding);
+    for (idx, (k, ct)) in k_accum_e.iter().zip(accum_in.0.iter()).enumerate() {
+        let mut basis = beta_accum_c1 * ct.c1 + beta_accum_c2 * ct.c2;
+        if idx == 0 {
+            basis += beta_accum_c1 * G + beta_accum_c2 * pk.0;
+        }
+        accum_glue_scalars.push(*k);
+        accum_glue_points.push(basis);
+    }
+    let accum_glue_a_t = RistrettoPoint::multiscalar_mul(
+        accum_glue_scalars.iter().copied(),
+        accum_glue_points.iter().copied(),
+    )
+    .compress();
 
     let k_accum_sk2 = Scalar::random(rng);
     let k_accum_r_prime = Scalar::random(rng);
@@ -979,28 +1260,57 @@ pub fn prove_round<R: CryptoRng + RngCore>(
     let accum_mul_a1 = (k_accum_mul_y * accum_x_c1).compress();
     let accum_mul_a2 = (k_accum_mul_y * accum_x_c2).compress();
     let accum_mul_a_m = mul_g(&k_accum_mul_y).compress();
-    let batch = derive_round_batch_scalars(
-        pk,
-        pk1,
-        pk2,
-        &t_poly.0,
-        scaled_eval,
-        &eval_proof,
-        &alpha_tag,
-        &glue_a_t,
-        m_poly_ct,
-        &partial_a,
-        accum_scaled_eval,
-        accum_m_poly_ct,
-        &accum_partial_a,
+
+    let (beta_accum_mul, gamma_accum_mul) = sigma::poly_scalar_mul_batch_scalars(
+        &PolyScalarMulProof {
+            a1: accum_mul_a1,
+            a2: accum_mul_a2,
+            alpha_tag,
+            a_m: accum_mul_a_m,
+            s_y: Scalar::zero(),
+        },
         accum_in,
         next_accum,
+        &alpha_tag_pt,
+    )
+    .map_err(|description| R1CSError::GadgetError {
+        description: description.to_string(),
+    })?;
+    sigma_bullet::append_glue_section(
+        &mut transcript,
+        b"bf_accum_sigma_bullet_glue",
+        &accum_chain_proof,
+        pk,
+        &accum_in.0,
+        accum_scaled_eval,
+        beta_accum_y,
+        beta_accum_c1,
+        beta_accum_c2,
+        &alpha_tag,
+        &accum_glue_a_t,
+    );
+    append_partial_decrypt_section(
+        &mut transcript,
+        pk2,
+        pk1,
+        accum_scaled_eval,
+        accum_m_poly_ct,
+        beta_accum_pd,
+        gamma_accum_pd,
+        &accum_partial_a,
+    );
+    append_poly_scalar_mul_section(
+        &mut transcript,
+        accum_in,
+        next_accum,
+        &alpha_tag,
+        beta_accum_mul,
+        gamma_accum_mul,
         &accum_mul_a1,
         &accum_mul_a2,
         &accum_mul_a_m,
-        Scalar::zero(),
-    )
-    .map_err(|description| R1CSError::GadgetError { description })?;
+    );
+    let challenge = challenge_scalar(&mut transcript);
 
     Ok((
         scaled_eval.clone(),
@@ -1012,23 +1322,95 @@ pub fn prove_round<R: CryptoRng + RngCore>(
                 glue_z_e: k_e
                     .iter()
                     .zip(e_vals.iter())
-                    .map(|(k, e)| k + batch.challenge * e)
+                    .map(|(k, e)| k + challenge * e)
                     .collect(),
-                glue_z_alpha: k_alpha + batch.challenge * y,
-                glue_z_y_blind: k_y_blind + batch.challenge * y_blind,
+                glue_z_alpha: k_alpha + challenge * y,
+                glue_z_y_blind: k_y_blind + challenge * y_blind,
                 partial_a,
-                partial_z1: k_sk2 + batch.challenge * sk2,
-                partial_z2: k_r_prime + batch.challenge * mpoly_r_prime,
+                partial_z1: k_sk2 + challenge * sk2,
+                partial_z2: k_r_prime + challenge * mpoly_r_prime,
+                accum_chain_proof,
+                accum_glue_a_t,
+                accum_glue_z_e: k_accum_e
+                    .iter()
+                    .zip(accum_e_asc.iter())
+                    .map(|(k, e)| k + challenge * e)
+                    .collect(),
+                accum_glue_z_alpha: k_accum_alpha + challenge * y,
+                accum_glue_z_y_blind: k_accum_y_blind + challenge * accum_y_blind,
                 accum_partial_a,
-                accum_partial_z1: k_accum_sk2 + batch.challenge * sk2,
-                accum_partial_z2: k_accum_r_prime + batch.challenge * accum_r_prime,
+                accum_partial_z1: k_accum_sk2 + challenge * sk2,
+                accum_partial_z2: k_accum_r_prime + challenge * accum_r_prime,
                 accum_mul_a1,
                 accum_mul_a2,
                 accum_mul_a_m,
-                accum_mul_s_y: k_accum_mul_y + batch.challenge * y,
+                accum_mul_s_y: k_accum_mul_y + challenge * y,
             }),
         },
     ))
+}
+
+/// Prove a complete Bloom-filter monitor round sequentially.
+///
+/// This retains the original all-at-once API while allowing the monitor to
+/// time or schedule the accumulator-independent prefix separately.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_round<R: CryptoRng + RngCore>(
+    rng: &mut R,
+    pc_gens: &PedersenGens,
+    bp_gens: &BulletproofGens,
+    t_poly: &EncryptedPoly,
+    hash_count: usize,
+    e_vals: &[Scalar],
+    scaled_eval: &Ciphertext,
+    y: Scalar,
+    eval_mask: Scalar,
+    pk: &PublicKey,
+    pk1: &PublicKeyShare,
+    pk2: &PublicKeyShare,
+    m_poly_ct: &Ciphertext,
+    accum_scaled_eval: &Ciphertext,
+    accum_m_poly_ct: &Ciphertext,
+    accum_in: &EncryptedPoly,
+    next_accum: &EncryptedPoly,
+    mpoly_r_prime: Scalar,
+    accum_mask: Scalar,
+    accum_r_prime: Scalar,
+    sk2: &Scalar,
+) -> Result<(Ciphertext, RoundProof), R1CSError> {
+    let precomputed = preprocess_round_proof(
+        rng,
+        pc_gens,
+        bp_gens,
+        t_poly,
+        hash_count,
+        e_vals,
+        scaled_eval,
+        y,
+        eval_mask,
+        pk,
+        pk1,
+        pk2,
+        m_poly_ct,
+        mpoly_r_prime,
+        sk2,
+    )?;
+    finish_round_proof(
+        rng,
+        pc_gens,
+        bp_gens,
+        pk,
+        scaled_eval,
+        pk1,
+        pk2,
+        accum_scaled_eval,
+        accum_m_poly_ct,
+        accum_in,
+        next_accum,
+        accum_mask,
+        accum_r_prime,
+        precomputed,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1055,8 +1437,16 @@ pub fn verify_round(
     if proof.glue_z_e.len() != t_poly.0.len() {
         return Err("glue vector length mismatch".to_string());
     }
+    if proof.accum_chain_proof.e_comms.len() != current_accum.0.len() {
+        return Err("accum e commitment length mismatch".to_string());
+    }
+    if proof.accum_glue_z_e.len() != current_accum.0.len() {
+        return Err("accum glue vector length mismatch".to_string());
+    }
 
     verify_eval_sum(pc_gens, bp_gens, bf_config.hash_count, &proof.eval_proof)?;
+    bp::verify(pc_gens, bp_gens, &proof.accum_chain_proof)
+        .map_err(|e| format!("accum chain Bulletproof invalid: {e:?}"))?;
 
     let alpha_tag = proof
         .alpha_tag
@@ -1070,6 +1460,10 @@ pub fn verify_round(
         .partial_a
         .decompress()
         .ok_or_else(|| "invalid partial A point".to_string())?;
+    let accum_glue_a_t = proof
+        .accum_glue_a_t
+        .decompress()
+        .ok_or_else(|| "invalid accum glue A_t point".to_string())?;
     let accum_partial_a = proof
         .accum_partial_a
         .decompress()
@@ -1091,6 +1485,11 @@ pub fn verify_round(
         .y_comm
         .decompress()
         .ok_or_else(|| "invalid y commitment point".to_string())?;
+    let accum_y_comm_pt = proof
+        .accum_chain_proof
+        .y_comm
+        .decompress()
+        .ok_or_else(|| "invalid accum y commitment point".to_string())?;
     let hash_count_inv = Scalar::from(bf_config.hash_count as u64).invert();
 
     let delta_c1 = m_poly_ct.c1 - scaled_eval.c1;
@@ -1110,6 +1509,8 @@ pub fn verify_round(
         &proof.glue_a_t,
         m_poly_ct,
         &proof.partial_a,
+        &proof.accum_chain_proof,
+        &proof.accum_glue_a_t,
         accum_scaled_eval,
         accum_m_poly_ct,
         &proof.accum_partial_a,
@@ -1166,6 +1567,36 @@ pub fn verify_round(
     scalars.push(-batch.rho_partial * batch.challenge * batch.gamma_pd * batch.beta_pd);
     points.push(delta_c1);
 
+    scalars.push(batch.rho_accum_glue * proof.accum_glue_z_alpha);
+    points.push(G);
+    scalars.push(batch.rho_accum_glue * batch.beta_accum_y * proof.accum_glue_z_alpha);
+    points.push(pc_gens.B);
+    scalars.push(batch.rho_accum_glue * batch.beta_accum_y * proof.accum_glue_z_y_blind);
+    points.push(pc_gens.B_blinding);
+    for (idx, (z, ct)) in proof
+        .accum_glue_z_e
+        .iter()
+        .zip(current_accum.0.iter())
+        .enumerate()
+    {
+        let mut basis = batch.beta_accum_c1 * ct.c1 + batch.beta_accum_c2 * ct.c2;
+        if idx == 0 {
+            basis += batch.beta_accum_c1 * G + batch.beta_accum_c2 * pk.0;
+        }
+        scalars.push(batch.rho_accum_glue * *z);
+        points.push(basis);
+    }
+    scalars.push(-batch.rho_accum_glue);
+    points.push(accum_glue_a_t);
+    scalars.push(-batch.rho_accum_glue * batch.challenge);
+    points.push(alpha_tag);
+    scalars.push(-batch.rho_accum_glue * batch.challenge * batch.beta_accum_y);
+    points.push(accum_y_comm_pt);
+    scalars.push(-batch.rho_accum_glue * batch.challenge * batch.beta_accum_c1);
+    points.push(accum_scaled_eval.c1);
+    scalars.push(-batch.rho_accum_glue * batch.challenge * batch.beta_accum_c2);
+    points.push(accum_scaled_eval.c2);
+
     scalars.push(
         batch.rho_accum_partial
             * (proof.accum_partial_z1
@@ -1213,4 +1644,110 @@ pub fn verify_round(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::elgamal::{
+        combine_public_keys, encrypt_poly, eval_poly, generate_key_share,
+        partial_decrypt_with_witness, poly_scalar_mul,
+    };
+    use rand::rngs::OsRng;
+
+    #[test]
+    fn round_rejects_well_formed_but_false_accum_eval() {
+        let mut rng = OsRng;
+        let (_sk1, pk1) = generate_key_share(&mut rng);
+        let (sk2, pk2) = generate_key_share(&mut rng);
+        let pk = combine_public_keys(&pk1, &pk2);
+        let config = BloomFilterConfig {
+            bloom_filter_size: 32,
+            hash_count: 1,
+            target_marked_count: 3,
+        };
+        let y = Scalar::from(19u64);
+
+        let t_poly = encrypt_poly(
+            &mut rng,
+            &pk,
+            &[Scalar::from(3u64), Scalar::from(7u64), Scalar::from(11u64)],
+        );
+        let eval_mask = Scalar::from(13u64);
+        let aggregate = build_aggregate_eval_witness(&t_poly, y, config, eval_mask, &pk).unwrap();
+        let (m_poly_ct, mpoly_r_prime) =
+            partial_decrypt_with_witness(&mut rng, &sk2, &pk1, &aggregate.scaled_eval);
+
+        let accum = encrypt_poly(
+            &mut rng,
+            &pk,
+            &[Scalar::one(), Scalar::from(2u64), Scalar::from(4u64)],
+        );
+        let next_accum = poly_scalar_mul(&accum, &y);
+        let accum_mask = Scalar::from(17u64);
+        let accum_eval = eval_poly(&accum, &y);
+        let correct_accum_scaled = ct_add(
+            &ct_scalar_mul(&accum_eval, &accum_mask),
+            &Ciphertext {
+                c1: mul_g(&accum_mask),
+                c2: accum_mask * pk.0,
+            },
+        );
+        let false_accum_scaled = Ciphertext {
+            c1: correct_accum_scaled.c1 + G,
+            c2: correct_accum_scaled.c2,
+        };
+        let (false_accum_partial, accum_r_prime) =
+            partial_decrypt_with_witness(&mut rng, &sk2, &pk1, &false_accum_scaled);
+
+        let pc_gens = PedersenGens::default();
+        let target_cap = crate::bf::bp_capacity(t_poly.0.len() - 1, config);
+        let accum_cap = (2 * accum.0.len()).next_power_of_two().max(64);
+        let bp_gens = BulletproofGens::new(target_cap.max(accum_cap), 1);
+        let (_, proof) = prove_round(
+            &mut rng,
+            &pc_gens,
+            &bp_gens,
+            &t_poly,
+            config.hash_count,
+            &aggregate.e_vals,
+            &aggregate.scaled_eval,
+            y,
+            eval_mask,
+            &pk,
+            &pk1,
+            &pk2,
+            &m_poly_ct,
+            &false_accum_scaled,
+            &false_accum_partial,
+            &accum,
+            &next_accum,
+            mpoly_r_prime,
+            accum_mask,
+            accum_r_prime,
+            sk2.as_scalar(),
+        )
+        .expect("prover can construct commitments from a false witness");
+
+        assert!(
+            verify_round(
+                &pc_gens,
+                &bp_gens,
+                config,
+                &pk,
+                &pk1,
+                &pk2,
+                &t_poly,
+                &aggregate.scaled_eval,
+                &m_poly_ct,
+                &false_accum_scaled,
+                &false_accum_partial,
+                &accum,
+                &next_accum,
+                &proof,
+            )
+            .is_err(),
+            "a valid partial decrypt of an unrelated accumulator ciphertext must be rejected",
+        );
+    }
 }

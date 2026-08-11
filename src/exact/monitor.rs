@@ -32,7 +32,7 @@ use rand::rngs::OsRng;
 
 use crate::crypto::elgamal::{
     combine_public_keys, ct_add, ct_scalar_mul, eval_poly, partial_decrypt_with_witness,
-    poly_scalar_mul, PublicKey, PublicKeyShare, SecretKeyShare,
+    poly_scalar_mul, Ciphertext, PublicKey, PublicKeyShare, SecretKeyShare,
 };
 use crate::crypto::sigma_bullet;
 // Re-use all wire types from target.rs.
@@ -57,6 +57,13 @@ pub struct Monitor {
     /// Shared generator sets — must match the target's.
     pc_gens: PedersenGens,
     bp_gens: BulletproofGens,
+}
+
+/// Work for one round that does not depend on the current accumulator.
+struct RoundPrecomputation {
+    scaled: Ciphertext,
+    m_poly_ct: Ciphertext,
+    proof: sigma_bullet::RoundProofPrecomputation,
 }
 
 impl Monitor {
@@ -88,21 +95,17 @@ impl Monitor {
 
     // ── Core computation ──────────────────────────────────────────────────────
 
-    /// Compute one protocol round given the current encrypted T-polynomial.
-    ///
-    /// Returns `MonitorToTarget` ready to be sent to the target.
-    fn compute_round(
+    /// Compute the target-polynomial ciphertext and proof commitments that do
+    /// not depend on the current accumulator.
+    fn preprocess_round(
         &self,
         rng: &mut OsRng,
         t_poly_ct: &WireEncryptedPoly,
-        accum_ct: &WireEncryptedPoly,
-    ) -> Result<MonitorToTarget, String> {
+    ) -> Result<RoundPrecomputation, String> {
         let poly = t_poly_ct.to_native()?;
-        let accum = accum_ct.to_native()?;
 
         // M.1  THEval[pk]{TPolyCtext}{MElmt} — evaluate the encrypted polynomial.
         let eval_ct = eval_poly(&poly, &self.m_elmt);
-        let accum_eval = eval_poly(&accum, &self.m_elmt);
 
         // M.2  Choose mask ←$ 𝔽* (non-zero), scale, blind with Enc(0; mask),
         //      then partially decrypt with sk2.
@@ -110,17 +113,10 @@ impl Monitor {
         let scaled = self.mask_eval(eval_ct, mask);
         let (m_poly_ct, r_prime) = partial_decrypt_with_witness(rng, &self.sk2, &self.pk1, &scaled);
 
-        // Apply the same masking-and-partial-decryption flow to the accumulated
-        // polynomial evaluation before sending it back to the target.
-        let accum_mask = non_zero_scalar(rng);
-        let accum_scaled = self.mask_eval(accum_eval, accum_mask);
-        let (accum_m_poly_ct, accum_r_prime) =
-            partial_decrypt_with_witness(rng, &self.sk2, &self.pk1, &accum_scaled);
-
-        let next_accum = poly_scalar_mul(&accum, &self.m_elmt);
-
-        // M.3  Build the combined proof for the evaluation and accum update.
-        let round_proof = sigma_bullet::prove_round(
+        // Build all accumulator-independent ZK commitments. The shared
+        // Fiat-Shamir challenge must wait until the accumulator relations are
+        // available, so the responses are completed in `finish_round`.
+        let proof = sigma_bullet::preprocess_round_proof(
             rng,
             &self.pc_gens,
             &self.bp_gens,
@@ -130,15 +126,58 @@ impl Monitor {
             &poly.0,
             &scaled,
             &m_poly_ct,
+            self.m_elmt,
+            mask,
+            r_prime,
+            self.sk2.as_scalar(),
+        )
+        .map_err(|e| format!("round proof preprocess: {e:?}"))?;
+
+        Ok(RoundPrecomputation {
+            scaled,
+            m_poly_ct,
+            proof,
+        })
+    }
+
+    /// Complete a preprocessed round once the accumulator is available.
+    fn finish_round(
+        &self,
+        rng: &mut OsRng,
+        precomputed: RoundPrecomputation,
+        accum_ct: &WireEncryptedPoly,
+    ) -> Result<MonitorToTarget, String> {
+        let accum = accum_ct.to_native()?;
+        let accum_eval = eval_poly(&accum, &self.m_elmt);
+
+        // Apply the same masking-and-partial-decryption flow to the accumulated
+        // polynomial evaluation before sending it back to the target.
+        let accum_mask = non_zero_scalar(rng);
+        let accum_scaled = self.mask_eval(accum_eval, accum_mask);
+        let (accum_m_poly_ct, accum_r_prime) =
+            partial_decrypt_with_witness(rng, &self.sk2, &self.pk1, &accum_scaled);
+
+        let next_accum = poly_scalar_mul(&accum, &self.m_elmt);
+        let required_bp_capacity = (2 * accum.0.len()).next_power_of_two().max(64);
+        let expanded_bp_gens = (self.bp_gens.gens_capacity < required_bp_capacity)
+            .then(|| BulletproofGens::new(required_bp_capacity, 1));
+        let accum_bp_gens = expanded_bp_gens.as_ref().unwrap_or(&self.bp_gens);
+
+        // M.3  Build the combined proof for the evaluation and accum update.
+        let round_proof = sigma_bullet::finish_round_proof(
+            rng,
+            &self.pc_gens,
+            accum_bp_gens,
+            &self.pk,
+            &self.pk1,
+            &self.pk2,
             &accum_scaled,
             &accum_m_poly_ct,
             &accum,
             &next_accum,
-            self.m_elmt,
-            mask,
-            r_prime,
+            accum_mask,
             accum_r_prime,
-            self.sk2.as_scalar(),
+            precomputed.proof,
         )
         .map_err(|e| format!("round prove: {e:?}"))?;
 
@@ -146,10 +185,23 @@ impl Monitor {
             next_accum: WireEncryptedPoly::from_native(&next_accum),
             accum_scaled_eval: WireCiphertext::from_native(&accum_scaled),
             accum_m_poly_ctext: WireCiphertext::from_native(&accum_m_poly_ct),
-            scaled_eval: WireCiphertext::from_native(&scaled),
-            m_poly_ctext: WireCiphertext::from_native(&m_poly_ct),
+            scaled_eval: WireCiphertext::from_native(&precomputed.scaled),
+            m_poly_ctext: WireCiphertext::from_native(&precomputed.m_poly_ct),
             round_proof: WireCombinedSigmaProof::from_proof(&round_proof),
         })
+    }
+
+    /// Compute one complete round sequentially, without hiding preprocessing
+    /// behind accumulator retrieval.
+    #[cfg(test)]
+    fn compute_round(
+        &self,
+        rng: &mut OsRng,
+        t_poly_ct: &WireEncryptedPoly,
+        accum_ct: &WireEncryptedPoly,
+    ) -> Result<MonitorToTarget, String> {
+        let precomputed = self.preprocess_round(rng, t_poly_ct)?;
+        self.finish_round(rng, precomputed, accum_ct)
     }
 
     // ── TCP client ────────────────────────────────────────────────────────────
@@ -175,7 +227,10 @@ impl Monitor {
             let incoming: TargetToMonitor = match recv_msg(&mut stream) {
                 Ok(m) => m,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    eprintln!("[Monitor] Target disconnected after {} round(s).", round - 1);
+                    eprintln!(
+                        "[Monitor] Target disconnected after {} round(s).",
+                        round - 1
+                    );
                     return Ok(());
                 }
                 Err(e) => return Err(e),
@@ -186,12 +241,20 @@ impl Monitor {
             );
 
             let t_compute_start = std::time::Instant::now();
+            let t_preprocess_start = std::time::Instant::now();
+            let precomputed = self
+                .preprocess_round(&mut rng, &incoming.t_poly_ct)
+                .map_err(io::Error::other)?;
+            let preprocess_ms = t_preprocess_start.elapsed().as_secs_f64() * 1000.0;
             let reply = self
-                .compute_round(&mut rng, &incoming.t_poly_ct, &incoming.accum)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .finish_round(&mut rng, precomputed, &incoming.accum)
+                .map_err(io::Error::other)?;
             let compute_ms = t_compute_start.elapsed().as_secs_f64() * 1000.0;
 
             send_msg(&mut stream, &reply)?;
+            eprintln!(
+                "[Monitor] Round {round}: Preprocess Time (accum-independent): {preprocess_ms:.3} ms"
+            );
             eprintln!("[Monitor] Round {round}: Compute Time: {compute_ms:.3} ms; reply sent");
         }
 

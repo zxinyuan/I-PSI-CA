@@ -209,6 +209,11 @@ pub struct WireCombinedSigmaProof {
     pub partial_a: [u8; 32],
     pub partial_z1: [u8; 32],
     pub partial_z2: [u8; 32],
+    pub accum_chain_proof: WireEvalChainProof,
+    pub accum_glue_a_t: [u8; 32],
+    pub accum_glue_z_e: Vec<[u8; 32]>,
+    pub accum_glue_z_alpha: [u8; 32],
+    pub accum_glue_z_y_blind: [u8; 32],
     pub accum_partial_a: [u8; 32],
     pub accum_partial_z1: [u8; 32],
     pub accum_partial_z2: [u8; 32],
@@ -230,6 +235,11 @@ impl WireCombinedSigmaProof {
             partial_a: p.partial_a.to_bytes(),
             partial_z1: p.partial_z1.to_bytes(),
             partial_z2: p.partial_z2.to_bytes(),
+            accum_chain_proof: WireEvalChainProof::from_proof(&p.accum_chain_proof),
+            accum_glue_a_t: p.accum_glue_a_t.to_bytes(),
+            accum_glue_z_e: p.accum_glue_z_e.iter().map(|s| s.to_bytes()).collect(),
+            accum_glue_z_alpha: p.accum_glue_z_alpha.to_bytes(),
+            accum_glue_z_y_blind: p.accum_glue_z_y_blind.to_bytes(),
             accum_partial_a: p.accum_partial_a.to_bytes(),
             accum_partial_z1: p.accum_partial_z1.to_bytes(),
             accum_partial_z2: p.accum_partial_z2.to_bytes(),
@@ -246,6 +256,11 @@ impl WireCombinedSigmaProof {
             .iter()
             .map(|b| Scalar::from_canonical_bytes(*b).ok_or("glue_z_e: non-canonical scalar"))
             .collect();
+        let accum_glue_z_e: Result<Vec<_>, _> = self
+            .accum_glue_z_e
+            .iter()
+            .map(|b| Scalar::from_canonical_bytes(*b).ok_or("accum_glue_z_e: non-canonical scalar"))
+            .collect();
         Ok(sb::CombinedSigmaProof {
             chain_proof: self.chain_proof.to_proof()?,
             alpha_tag: CompressedRistretto::from_slice(&self.alpha_tag),
@@ -260,6 +275,13 @@ impl WireCombinedSigmaProof {
                 .ok_or("partial_z1: non-canonical scalar")?,
             partial_z2: Scalar::from_canonical_bytes(self.partial_z2)
                 .ok_or("partial_z2: non-canonical scalar")?,
+            accum_chain_proof: self.accum_chain_proof.to_proof()?,
+            accum_glue_a_t: CompressedRistretto::from_slice(&self.accum_glue_a_t),
+            accum_glue_z_e: accum_glue_z_e?,
+            accum_glue_z_alpha: Scalar::from_canonical_bytes(self.accum_glue_z_alpha)
+                .ok_or("accum_glue_z_alpha: non-canonical scalar")?,
+            accum_glue_z_y_blind: Scalar::from_canonical_bytes(self.accum_glue_z_y_blind)
+                .ok_or("accum_glue_z_y_blind: non-canonical scalar")?,
             accum_partial_a: CompressedRistretto::from_slice(&self.accum_partial_a),
             accum_partial_z1: Scalar::from_canonical_bytes(self.accum_partial_z1)
                 .ok_or("accum_partial_z1: non-canonical scalar")?,
@@ -383,8 +405,8 @@ impl Target {
         pk2: PublicKeyShare,
     ) -> Self {
         let pk = combine_public_keys(&pk1, &pk2);
-        // Choose BP generator capacity ≥ 2·(|TSet|+2) rounded up to a power of two.
-        let n = t_set.len() + 2;
+        // Cover both the target-polynomial and accumulator evaluation circuits.
+        let n = t_set.len().max(accum_degree) + 2;
         let cap = 1usize << (usize::BITS - (2 * n).leading_zeros()) as usize;
         let cap = cap.max(64);
         Target {
@@ -664,6 +686,7 @@ mod tests {
             m,
             mask,
             r_prime,
+            accum_mask,
             _accum_r_prime,
             sk2.as_scalar(),
         )
@@ -746,6 +769,7 @@ mod tests {
             m,
             mask,
             r_prime,
+            accum_mask,
             _accum_r_prime,
             sk2.as_scalar(),
         )
