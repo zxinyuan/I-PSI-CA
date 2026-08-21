@@ -108,8 +108,9 @@ pub struct MonitorToTarget {
     /// Partially decrypted accumulated evaluation used for the target's
     /// non-zero test before advancing state.
     pub accum_eval_ctext: WireCiphertext,
-    /// `scaled_eval = mask · Σ_j THEval[pk](TPolyCtext, j)` over the bloom
-    /// positions derived from `y`, fed into partial decryption.
+    /// `scaled_eval = Σ_j (r·H(y,j)·THEval[pk](TPolyCtext,H(y,j)) +
+    /// Enc_pk(0; r·H(y,j)))`: each Bloom evaluation has its own additional
+    /// hash-derived mask before the aggregate is partially decrypted.
     pub scaled_eval: WireCiphertext,
     /// `MPolyCtext = THDec[sk2](scaled_eval)`.
     pub m_poly_ctext: WireCiphertext,

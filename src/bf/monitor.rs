@@ -17,8 +17,9 @@
 //!
 //! # ZK proof structure
 //! Uses the Sigma-Bullet hybrid proof (`crypto/sigma-bullet.rs`) to bind:
-//! - arithmetic consistency (`e_0 = mask`, `e_{i+1}=e_i·position`, `mask ≠ 0`)
-//! - ciphertext consistency (`scaled_eval = Σ e_i·C_i + Enc(0; mask)`).
+//! - one additional per-term mask `μ_j = H(y,j)` for each evaluation;
+//! - arithmetic consistency for `e_d = Σ_j r·μ_j·μ_j^d` and non-zero masks;
+//! - ciphertext consistency (`scaled_eval = Σ_j(r·μ_j·Eval(T,μ_j)+Enc(0;r·μ_j))`).
 //!
 //! # Network
 //! Runs as a **TCP client**; connects to the target's address and submits one
@@ -103,11 +104,10 @@ impl Monitor {
     ) -> Result<RoundPrecomputation, String> {
         let poly = t_poly_ct.to_native()?;
 
-        // M.2  Build the BF aggregate-evaluation witness once. This keeps the
-        //      sigma-side work linear in the outsourced polynomial size:
-        //      derive the e_d coefficients and fold the ciphertext once,
-        //      instead of evaluating the encrypted polynomial separately for
-        //      each Bloom index.
+        // M.2  Build the BF aggregate-evaluation witness once.  Each
+        //      evaluation term gets its additional μ_j = H(y,j) mask before
+        //      aggregation; the proof retains the vector so L9 can bind every
+        //      μ_j to the hidden y and to the ciphertext witness vector.
         let mask = non_zero_scalar(rng);
         let aggregate = bfproof::build_aggregate_eval_witness(
             &poly,
@@ -129,6 +129,7 @@ impl Monitor {
             &poly,
             self.bf_config.hash_count,
             &aggregate.e_vals,
+            &aggregate.term_masks,
             &scaled,
             self.input_y,
             mask,

@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
-
 use bulletproofs::{
     r1cs::{ConstraintSystem, LinearCombination, Prover, R1CSError, R1CSProof, Variable, Verifier},
     BulletproofGens, PedersenGens,
@@ -24,6 +21,9 @@ use crate::crypto::sigma::{self, PolyScalarMulProof};
 use crate::crypto::sigma_bullet;
 
 pub(crate) struct AggregateEvalWitness {
+    /// One additional non-zero mask per encrypted evaluation term:
+    /// `term_masks[j] = H(y, j)`.
+    pub term_masks: Vec<Scalar>,
     pub e_vals: Vec<Scalar>,
     pub scaled_eval: Ciphertext,
 }
@@ -32,6 +32,11 @@ pub(crate) struct AggregateEvalWitness {
 struct EvalSumProof {
     proof: R1CSProof,
     e_comms: Vec<CompressedRistretto>,
+    /// Commitments to the per-term masks `μ_j = H(y, j)`.
+    mask_comms: Vec<CompressedRistretto>,
+    /// Commitments to `μ_j⁻¹`; these make every term mask non-zero in the
+    /// R1CS statement.
+    inv_mask_comms: Vec<CompressedRistretto>,
     y_comm: CompressedRistretto,
     r_comm: CompressedRistretto,
     inv_r_comm: CompressedRistretto,
@@ -41,6 +46,8 @@ struct EvalSumProof {
 pub struct WireEvalSumProof {
     pub proof_bytes: Vec<u8>,
     pub e_comms: Vec<[u8; 32]>,
+    pub mask_comms: Vec<[u8; 32]>,
+    pub inv_mask_comms: Vec<[u8; 32]>,
     pub y_comm: [u8; 32],
     pub r_comm: [u8; 32],
     pub inv_r_comm: [u8; 32],
@@ -57,6 +64,13 @@ pub struct WireAccumEvalProof {
 struct CombinedSigmaProof {
     eval_proof: EvalSumProof,
     alpha_tag: CompressedRistretto,
+    /// Shared-challenge Sigma bridge for every Bulletproof mask commitment.
+    /// It proves that the committed mask is the scalar exponent of
+    /// `H(y, j)·G`, where `y·G = alpha_tag`.
+    mask_a_tags: Vec<CompressedRistretto>,
+    mask_a_comms: Vec<CompressedRistretto>,
+    mask_z: Vec<Scalar>,
+    mask_z_blind: Vec<Scalar>,
     glue_a_t: CompressedRistretto,
     glue_z_e: Vec<Scalar>,
     glue_z_alpha: Scalar,
@@ -87,12 +101,18 @@ pub(crate) struct RoundProofPrecomputation {
     eval_proof: EvalSumProof,
     y_blind: Scalar,
     e_vals: Vec<Scalar>,
+    term_masks: Vec<Scalar>,
+    mask_blinds: Vec<Scalar>,
     y: Scalar,
     k_e: Vec<Scalar>,
     k_alpha: Scalar,
     k_y_blind: Scalar,
     alpha_tag_pt: RistrettoPoint,
     alpha_tag: CompressedRistretto,
+    mask_k: Vec<Scalar>,
+    mask_k_blind: Vec<Scalar>,
+    mask_a_tags: Vec<CompressedRistretto>,
+    mask_a_comms: Vec<CompressedRistretto>,
     glue_a_t: CompressedRistretto,
     k_sk2: Scalar,
     k_r_prime: Scalar,
@@ -118,6 +138,7 @@ struct RoundBatchScalars {
     gamma_accum_mul: Scalar,
     challenge: Scalar,
     rho_glue: Scalar,
+    rho_mask_bridge: Scalar,
     rho_partial: Scalar,
     rho_accum_glue: Scalar,
     rho_accum_partial: Scalar,
@@ -128,6 +149,10 @@ struct RoundBatchScalars {
 pub struct WireCombinedSigmaProof {
     pub eval_proof: WireEvalSumProof,
     pub alpha_tag: [u8; 32],
+    pub mask_a_tags: Vec<[u8; 32]>,
+    pub mask_a_comms: Vec<[u8; 32]>,
+    pub mask_z: Vec<[u8; 32]>,
+    pub mask_z_blind: Vec<[u8; 32]>,
     pub glue_a_t: [u8; 32],
     pub glue_z_e: Vec<[u8; 32]>,
     pub glue_z_alpha: [u8; 32],
@@ -179,106 +204,15 @@ fn batch_scalar(t: &mut Transcript, label: &'static [u8]) -> Scalar {
     Scalar::from_bytes_mod_order_wide(&buf)
 }
 
-fn power_sum_coefficients(hash_count: usize, coeff_len: usize) -> Arc<Vec<Vec<Scalar>>> {
-    static CACHE: OnceLock<Mutex<HashMap<(usize, usize), Arc<Vec<Vec<Scalar>>>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(coeffs) = cache
-        .lock()
-        .expect("power_sum_coefficients cache poisoned")
-        .get(&(hash_count, coeff_len))
-        .cloned()
-    {
-        return coeffs;
-    }
-
-    let mut coeffs = vec![vec![Scalar::zero(); coeff_len]; coeff_len];
-    for hash_index in 0..hash_count {
-        let (slope, intercept) = hash_params(hash_index);
-        let mut slope_pows = vec![Scalar::one(); coeff_len];
-        let mut intercept_pows = vec![Scalar::one(); coeff_len];
-        for idx in 1..coeff_len {
-            slope_pows[idx] = slope_pows[idx - 1] * slope;
-            intercept_pows[idx] = intercept_pows[idx - 1] * intercept;
-        }
-
-        let mut binom = vec![Scalar::zero(); coeff_len];
-        binom[0] = Scalar::one();
-        for degree in 0..coeff_len {
-            if degree > 0 {
-                for t in (1..=degree).rev() {
-                    let prev = binom[t - 1];
-                    binom[t] += prev;
-                }
-            }
-            for t in 0..=degree {
-                coeffs[degree][t] += binom[t] * slope_pows[t] * intercept_pows[degree - t];
-            }
-        }
-    }
-    let coeffs = Arc::new(coeffs);
-    cache
-        .lock()
-        .expect("power_sum_coefficients cache poisoned")
-        .insert((hash_count, coeff_len), coeffs.clone());
-    coeffs
-}
-
-fn characteristic_coefficients(hash_count: usize) -> Arc<Vec<Vec<Scalar>>> {
-    static CACHE: OnceLock<Mutex<HashMap<usize, Arc<Vec<Vec<Scalar>>>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(coeffs) = cache
-        .lock()
-        .expect("characteristic_coefficients cache poisoned")
-        .get(&hash_count)
-        .cloned()
-    {
-        return coeffs;
-    }
-
-    let max_deg = hash_count;
-    let mut coeffs = vec![vec![Scalar::zero(); max_deg + 1]; max_deg + 1];
-    let mut next = vec![vec![Scalar::zero(); max_deg + 1]; max_deg + 1];
-    coeffs[0][0] = Scalar::one();
-    let mut poly_deg = 0usize;
-    for hash_index in 0..hash_count {
-        let (slope, intercept) = hash_params(hash_index);
-        for row in &mut next {
-            for val in row.iter_mut() {
-                *val = Scalar::zero();
-            }
-        }
-        for x_deg in 0..=poly_deg {
-            for y_deg in 0..=max_deg {
-                let coeff = coeffs[x_deg][y_deg];
-                if coeff == Scalar::zero() {
-                    continue;
-                }
-                next[x_deg + 1][y_deg] += coeff;
-                next[x_deg][y_deg] -= intercept * coeff;
-                if y_deg < max_deg {
-                    next[x_deg][y_deg + 1] -= slope * coeff;
-                }
-            }
-        }
-        std::mem::swap(&mut coeffs, &mut next);
-        poly_deg += 1;
-    }
-
-    let coeffs = Arc::new(coeffs);
-    cache
-        .lock()
-        .expect("characteristic_coefficients cache poisoned")
-        .insert(hash_count, coeffs.clone());
-    coeffs
-}
-
 fn eval_sum_relation_gadget<CS: ConstraintSystem>(
     cs: &mut CS,
     e_vars: &[Variable],
     y_var: Variable,
     r_var: Variable,
+    mask_vars: &[Variable],
     hash_count: usize,
     inv_r_var: Variable,
+    inv_mask_vars: &[Variable],
 ) -> Result<(), R1CSError> {
     if e_vars.is_empty() {
         return Err(R1CSError::GadgetError {
@@ -292,70 +226,61 @@ fn eval_sum_relation_gadget<CS: ConstraintSystem>(
     );
     cs.constrain(LinearCombination::from(r_nonzero) - Scalar::one());
 
-    let init_len = hash_count.min(e_vars.len());
-    let init_coeffs = power_sum_coefficients(hash_count, init_len);
-    let char_coeffs = characteristic_coefficients(hash_count);
-
-    let mut q_vars = Vec::with_capacity(init_len);
-    if init_len > 0 {
-        q_vars.push(r_var);
+    if mask_vars.len() != hash_count || inv_mask_vars.len() != hash_count {
+        return Err(R1CSError::GadgetError {
+            description: "mask witness lengths must equal hash_count".to_string(),
+        });
     }
-    let mut current_q = r_var;
-    for _ in 1..init_len {
-        let (_, _, next_q) = cs.multiply(
-            LinearCombination::from(current_q),
-            LinearCombination::from(y_var),
+
+    // L9(a): commit to every additional L6 mask and prove that it is the
+    // corresponding Bloom hash: μ_j = H(y, j).  The public hash family is
+    // affine here, so this is a linear R1CS constraint.  Each μ_j is also
+    // proved non-zero to preserve the zero-test semantics of every term.
+    for (hash_index, (&mask_var, &inv_mask_var)) in
+        mask_vars.iter().zip(inv_mask_vars.iter()).enumerate()
+    {
+        let (slope, intercept) = hash_params(hash_index);
+        cs.constrain(
+            LinearCombination::from(mask_var) - slope * LinearCombination::from(y_var) - intercept,
         );
-        q_vars.push(next_q);
-        current_q = next_q;
-    }
-
-    let mut z_vars = Vec::with_capacity(hash_count + 1);
-    z_vars.push(None);
-    let mut current_z: Option<Variable> = None;
-    for _ in 0..hash_count {
-        let left = current_z.map_or_else(
-            || LinearCombination::from(Scalar::one()),
-            LinearCombination::from,
+        let (_, _, mask_nonzero) = cs.multiply(
+            LinearCombination::from(mask_var),
+            LinearCombination::from(inv_mask_var),
         );
-        let (_, _, next_z) = cs.multiply(left, LinearCombination::from(y_var));
-        z_vars.push(Some(next_z));
-        current_z = Some(next_z);
+        cs.constrain(LinearCombination::from(mask_nonzero) - Scalar::one());
     }
 
-    for degree in 0..init_len {
-        let mut expected = LinearCombination::default();
-        for (t, q_var) in q_vars.iter().copied().take(degree + 1).enumerate() {
-            let coeff = init_coeffs[degree][t];
-            if coeff != Scalar::zero() {
-                expected = expected + coeff * LinearCombination::from(q_var);
+    // L9(b): link every per-term mask directly to the witness vector used by
+    // the Sigma-Bullet ciphertext bridge.  For each encrypted evaluation term
+    // j, its effective coefficient is r·μ_j·μ_j^d.  Summing those witnesses
+    // yields e_d, the coefficient of encrypted polynomial term C_d.
+    let mut expected_e = vec![LinearCombination::default(); e_vars.len()];
+    let witness_len = expected_e.len();
+    for &mask_var in mask_vars {
+        let (_, _, initial) = cs.multiply(
+            LinearCombination::from(r_var),
+            LinearCombination::from(mask_var),
+        );
+        let mut current = LinearCombination::from(initial);
+        for (degree, expected) in expected_e.iter_mut().enumerate() {
+            *expected = expected.clone() + current.clone();
+            if degree + 1 < witness_len {
+                let (_, _, next) = cs.multiply(current, LinearCombination::from(mask_var));
+                current = LinearCombination::from(next);
             }
         }
-        cs.constrain(expected - LinearCombination::from(e_vars[degree]));
     }
-
-    for m in 0..e_vars.len().saturating_sub(hash_count) {
-        let mut recurrence = LinearCombination::from(e_vars[m + hash_count]);
-        for coeff_index in 0..hash_count {
-            let mut coeff_lc = LinearCombination::default();
-            for (y_deg, z_var) in z_vars.iter().enumerate() {
-                let coeff = char_coeffs[coeff_index][y_deg];
-                if coeff == Scalar::zero() {
-                    continue;
-                }
-                coeff_lc = match z_var {
-                    Some(z_var) => coeff_lc + coeff * LinearCombination::from(*z_var),
-                    None => coeff_lc + coeff,
-                };
-            }
-            let (_, _, prod) =
-                cs.multiply(coeff_lc, LinearCombination::from(e_vars[m + coeff_index]));
-            recurrence = recurrence + LinearCombination::from(prod);
-        }
-        cs.constrain(recurrence);
+    for (expected, &e_var) in expected_e.into_iter().zip(e_vars.iter()) {
+        cs.constrain(expected - LinearCombination::from(e_var));
     }
 
     Ok(())
+}
+
+struct EvalSumOpenings {
+    proof: EvalSumProof,
+    y_blind: Scalar,
+    mask_blinds: Vec<Scalar>,
 }
 
 fn prove_eval_sum_with_openings<R: CryptoRng + RngCore>(
@@ -366,7 +291,8 @@ fn prove_eval_sum_with_openings<R: CryptoRng + RngCore>(
     hash_count: usize,
     e_vals: &[Scalar],
     r: Scalar,
-) -> Result<(EvalSumProof, Scalar), R1CSError> {
+    term_masks: &[Scalar],
+) -> Result<EvalSumOpenings, R1CSError> {
     if hash_count == 0 {
         return Err(R1CSError::GadgetError {
             description: "hash_count must be non-zero".to_string(),
@@ -380,6 +306,16 @@ fn prove_eval_sum_with_openings<R: CryptoRng + RngCore>(
     if r == Scalar::zero() {
         return Err(R1CSError::GadgetError {
             description: "mask r must be non-zero".to_string(),
+        });
+    }
+    if term_masks.len() != hash_count {
+        return Err(R1CSError::GadgetError {
+            description: "term-mask vector length must equal hash_count".to_string(),
+        });
+    }
+    if term_masks.iter().any(|mask| *mask == Scalar::zero()) {
+        return Err(R1CSError::GadgetError {
+            description: "per-term Bloom mask must be non-zero".to_string(),
         });
     }
 
@@ -397,22 +333,54 @@ fn prove_eval_sum_with_openings<R: CryptoRng + RngCore>(
     let y_blind = Scalar::random(rng);
     let (y_comm, y_var) = prover.commit(y, y_blind);
 
+    let mut mask_comms = Vec::with_capacity(term_masks.len());
+    let mut mask_vars = Vec::with_capacity(term_masks.len());
+    let mut mask_blinds = Vec::with_capacity(term_masks.len());
+    let mut inv_mask_comms = Vec::with_capacity(term_masks.len());
+    let mut inv_mask_vars = Vec::with_capacity(term_masks.len());
+    for &mask in term_masks {
+        let blind = Scalar::random(rng);
+        let (comm, var) = prover.commit(mask, blind);
+        mask_comms.push(comm);
+        mask_vars.push(var);
+        mask_blinds.push(blind);
+    }
+    // Keep commitment order identical to the verifier: all μ_j commitments,
+    // then all μ_j⁻¹ commitments.
+    for &mask in term_masks {
+        let (inv_comm, inv_var) = prover.commit(mask.invert(), Scalar::random(rng));
+        inv_mask_comms.push(inv_comm);
+        inv_mask_vars.push(inv_var);
+    }
+
     let (r_comm, r_var) = prover.commit(r, Scalar::random(rng));
     let (inv_r_comm, inv_r_var) = prover.commit(r.invert(), Scalar::random(rng));
 
-    eval_sum_relation_gadget(&mut prover, &e_vars, y_var, r_var, hash_count, inv_r_var)?;
+    eval_sum_relation_gadget(
+        &mut prover,
+        &e_vars,
+        y_var,
+        r_var,
+        &mask_vars,
+        hash_count,
+        inv_r_var,
+        &inv_mask_vars,
+    )?;
 
     let proof = prover.prove(bp_gens)?;
-    Ok((
-        EvalSumProof {
+    Ok(EvalSumOpenings {
+        proof: EvalSumProof {
             proof,
             e_comms,
+            mask_comms,
+            inv_mask_comms,
             y_comm,
             r_comm,
             inv_r_comm,
         },
         y_blind,
-    ))
+        mask_blinds,
+    })
 }
 
 fn verify_eval_sum(
@@ -423,6 +391,9 @@ fn verify_eval_sum(
 ) -> Result<(), String> {
     if proof.e_comms.is_empty() {
         return Err("e commitment vector must not be empty".to_string());
+    }
+    if proof.mask_comms.len() != hash_count || proof.inv_mask_comms.len() != hash_count {
+        return Err("per-term mask commitment length mismatch".to_string());
     }
 
     let mut transcript = Transcript::new(b"I-PSI-CA::bf_eval_sum_v1");
@@ -435,23 +406,50 @@ fn verify_eval_sum(
         .map(|comm| verifier.commit(comm))
         .collect();
     let y_var = verifier.commit(proof.y_comm);
+    let mask_vars: Vec<_> = proof
+        .mask_comms
+        .iter()
+        .copied()
+        .map(|comm| verifier.commit(comm))
+        .collect();
+    let inv_mask_vars: Vec<_> = proof
+        .inv_mask_comms
+        .iter()
+        .copied()
+        .map(|comm| verifier.commit(comm))
+        .collect();
     let r_var = verifier.commit(proof.r_comm);
     let inv_r_var = verifier.commit(proof.inv_r_comm);
 
-    eval_sum_relation_gadget(&mut verifier, &e_vars, y_var, r_var, hash_count, inv_r_var)
-        .map_err(|e| format!("BF Bulletproof gadget invalid: {e:?}"))?;
+    eval_sum_relation_gadget(
+        &mut verifier,
+        &e_vars,
+        y_var,
+        r_var,
+        &mask_vars,
+        hash_count,
+        inv_r_var,
+        &inv_mask_vars,
+    )
+    .map_err(|e| format!("BF Bulletproof gadget invalid: {e:?}"))?;
 
     verifier
         .verify(&proof.proof, pc_gens, bp_gens)
         .map_err(|e| format!("BF Bulletproof verification failed: {e:?}"))
 }
 
-fn eval_witnesses_from_positions(coeff_len: usize, positions: &[Scalar], r: Scalar) -> Vec<Scalar> {
+fn eval_witnesses_from_positions(
+    coeff_len: usize,
+    positions: &[Scalar],
+    term_masks: &[Scalar],
+    r: Scalar,
+) -> Vec<Scalar> {
+    assert_eq!(positions.len(), term_masks.len());
     let mut sums = vec![Scalar::zero(); coeff_len];
-    for &position in positions {
+    for (&position, &term_mask) in positions.iter().zip(term_masks.iter()) {
         let mut power = Scalar::one();
         for sum in &mut sums {
-            *sum += power;
+            *sum += term_mask * power;
             power *= position;
         }
     }
@@ -490,18 +488,45 @@ pub(crate) fn build_aggregate_eval_witness(
         return Err("position set must be non-empty".to_string());
     }
 
-    let e_vals = eval_witnesses_from_positions(poly.0.len(), &positions, eval_mask);
-    let scaled_eval_no_blind = weighted_ciphertext_sum(&poly.0, &e_vals)?;
-    let scaled_eval = ct_add(
-        &scaled_eval_no_blind,
-        &Ciphertext {
-            c1: &eval_mask * &RISTRETTO_BASEPOINT_TABLE,
-            c2: eval_mask * pk.0,
-        },
-    );
+    if eval_mask == Scalar::zero() {
+        return Err("outer evaluation mask must be non-zero".to_string());
+    }
+
+    // L6: each encrypted evaluation term receives its own additional mask
+    // μ_j = H(y, j).  We retain the existing random outer blind r, so the
+    // effective non-zero term mask is r·μ_j.  The aggregate ciphertext below
+    // is exactly Σ_j (r·μ_j·Eval(T, μ_j) + Enc_pk(0; r·μ_j)).
+    let term_masks = positions.clone();
+    if term_masks.iter().any(|mask| *mask == Scalar::zero()) {
+        return Err("Bloom hash produced a zero per-term mask".to_string());
+    }
+
+    let e_vals = eval_witnesses_from_positions(poly.0.len(), &positions, &term_masks, eval_mask);
+    let mut scaled_eval: Option<Ciphertext> = None;
+    for (&position, &term_mask) in positions.iter().zip(term_masks.iter()) {
+        let mut weights = Vec::with_capacity(poly.0.len());
+        let mut power = Scalar::one();
+        let effective_mask = eval_mask * term_mask;
+        for _ in 0..poly.0.len() {
+            weights.push(effective_mask * power);
+            power *= position;
+        }
+        let masked_term = ct_add(
+            &weighted_ciphertext_sum(&poly.0, &weights)?,
+            &Ciphertext {
+                c1: &effective_mask * &RISTRETTO_BASEPOINT_TABLE,
+                c2: effective_mask * pk.0,
+            },
+        );
+        scaled_eval = Some(match scaled_eval {
+            Some(acc) => ct_add(&acc, &masked_term),
+            None => masked_term,
+        });
+    }
     Ok(AggregateEvalWitness {
+        term_masks,
         e_vals,
-        scaled_eval,
+        scaled_eval: scaled_eval.expect("non-empty position set checked above"),
     })
 }
 
@@ -521,6 +546,12 @@ fn glue_transcript(
     append_point(&mut t, b"cstar_c2", &c_star.c2);
     for comm in &eval_proof.e_comms {
         append_compressed(&mut t, b"e_comm", comm);
+    }
+    for comm in &eval_proof.mask_comms {
+        append_compressed(&mut t, b"mask_comm", comm);
+    }
+    for comm in &eval_proof.inv_mask_comms {
+        append_compressed(&mut t, b"inv_mask_comm", comm);
     }
     append_compressed(&mut t, b"y_comm", &eval_proof.y_comm);
     append_compressed(&mut t, b"r_comm", &eval_proof.r_comm);
@@ -564,6 +595,12 @@ fn append_glue_section(
     for comm in &eval_proof.e_comms {
         append_compressed(t, b"e_comm", comm);
     }
+    for comm in &eval_proof.mask_comms {
+        append_compressed(t, b"mask_comm", comm);
+    }
+    for comm in &eval_proof.inv_mask_comms {
+        append_compressed(t, b"inv_mask_comm", comm);
+    }
     append_compressed(t, b"y_comm", &eval_proof.y_comm);
     append_compressed(t, b"r_comm", &eval_proof.r_comm);
     t.append_message(b"r1cs", &eval_proof.proof.to_bytes());
@@ -572,6 +609,33 @@ fn append_glue_section(
     t.append_message(b"beta_c2", &beta_c2.to_bytes());
     append_compressed(t, b"alpha_tag", alpha_tag);
     append_compressed(t, b"A_t", glue_a_t);
+}
+
+/// Append the Sigma side of the per-term-mask bridge.  `alpha_tag = y·G` is
+/// already part of the aggregate Sigma-Bullet statement.  For every mask
+/// commitment M_j this section binds its exponent to
+/// `H(y, j)·G = slope_j·alpha_tag + intercept_j·G` under the same challenge.
+fn append_mask_bridge_section(
+    t: &mut Transcript,
+    eval_proof: &EvalSumProof,
+    alpha_tag: &CompressedRistretto,
+    mask_a_tags: &[CompressedRistretto],
+    mask_a_comms: &[CompressedRistretto],
+) {
+    t.append_message(b"section", b"bf_per_term_mask_bridge");
+    append_compressed(t, b"alpha_tag", alpha_tag);
+    for (index, ((mask_comm, a_tag), a_comm)) in eval_proof
+        .mask_comms
+        .iter()
+        .zip(mask_a_tags.iter())
+        .zip(mask_a_comms.iter())
+        .enumerate()
+    {
+        t.append_message(b"hash_index", &(index as u64).to_le_bytes());
+        append_compressed(t, b"mask_comm", mask_comm);
+        append_compressed(t, b"mask_A_tag", a_tag);
+        append_compressed(t, b"mask_A_comm", a_comm);
+    }
 }
 
 fn append_partial_decrypt_section(
@@ -631,6 +695,8 @@ fn combined_transcript_prefix(
     c_star: &Ciphertext,
     eval_proof: &EvalSumProof,
     alpha_tag: &CompressedRistretto,
+    mask_a_tags: &[CompressedRistretto],
+    mask_a_comms: &[CompressedRistretto],
     glue_a_t: &CompressedRistretto,
     beta_y: Scalar,
     beta_c1: Scalar,
@@ -647,6 +713,7 @@ fn combined_transcript_prefix(
     append_glue_section(
         &mut t, eval_proof, pk, coeff_cts, c_star, beta_y, beta_c1, beta_c2, alpha_tag, glue_a_t,
     );
+    append_mask_bridge_section(&mut t, eval_proof, alpha_tag, mask_a_tags, mask_a_comms);
     append_partial_decrypt_section(
         &mut t,
         pk2,
@@ -667,6 +734,8 @@ fn combined_transcript(
     c_star: &Ciphertext,
     eval_proof: &EvalSumProof,
     alpha_tag: &CompressedRistretto,
+    mask_a_tags: &[CompressedRistretto],
+    mask_a_comms: &[CompressedRistretto],
     glue_a_t: &CompressedRistretto,
     beta_y: Scalar,
     beta_c1: Scalar,
@@ -702,6 +771,8 @@ fn combined_transcript(
         c_star,
         eval_proof,
         alpha_tag,
+        mask_a_tags,
+        mask_a_comms,
         glue_a_t,
         beta_y,
         beta_c1,
@@ -758,6 +829,8 @@ fn combined_challenge(
     c_star: &Ciphertext,
     eval_proof: &EvalSumProof,
     alpha_tag: &CompressedRistretto,
+    mask_a_tags: &[CompressedRistretto],
+    mask_a_comms: &[CompressedRistretto],
     glue_a_t: &CompressedRistretto,
     beta_y: Scalar,
     beta_c1: Scalar,
@@ -786,13 +859,15 @@ fn combined_challenge(
     accum_mul_a1: &CompressedRistretto,
     accum_mul_a2: &CompressedRistretto,
     accum_mul_a_m: &CompressedRistretto,
-) -> (Scalar, Scalar, Scalar, Scalar, Scalar, Scalar) {
+) -> (Scalar, Scalar, Scalar, Scalar, Scalar, Scalar, Scalar) {
     let mut t = combined_transcript(
         pk,
         coeff_cts,
         c_star,
         eval_proof,
         alpha_tag,
+        mask_a_tags,
+        mask_a_comms,
         glue_a_t,
         beta_y,
         beta_c1,
@@ -824,6 +899,7 @@ fn combined_challenge(
     );
     let challenge = challenge_scalar(&mut t);
     let rho_glue = batch_scalar(&mut t, b"rho_glue");
+    let rho_mask_bridge = batch_scalar(&mut t, b"rho_mask_bridge");
     let rho_partial = batch_scalar(&mut t, b"rho_partial");
     let rho_accum_glue = batch_scalar(&mut t, b"rho_accum_glue");
     let rho_accum_partial = batch_scalar(&mut t, b"rho_accum_partial");
@@ -831,6 +907,7 @@ fn combined_challenge(
     (
         challenge,
         rho_glue,
+        rho_mask_bridge,
         rho_partial,
         rho_accum_glue,
         rho_accum_partial,
@@ -847,6 +924,8 @@ fn derive_round_batch_scalars(
     c_star: &Ciphertext,
     eval_proof: &EvalSumProof,
     alpha_tag: &CompressedRistretto,
+    mask_a_tags: &[CompressedRistretto],
+    mask_a_comms: &[CompressedRistretto],
     glue_a_t: &CompressedRistretto,
     partial_out_ct: &Ciphertext,
     partial_a: &CompressedRistretto,
@@ -887,42 +966,51 @@ fn derive_round_batch_scalars(
     )
     .map_err(str::to_string)?;
 
-    let (challenge, rho_glue, rho_partial, rho_accum_glue, rho_accum_partial, rho_accum_mul) =
-        combined_challenge(
-            pk,
-            coeff_cts,
-            c_star,
-            eval_proof,
-            alpha_tag,
-            glue_a_t,
-            beta_y,
-            beta_c1,
-            beta_c2,
-            pk2,
-            pk1,
-            c_star,
-            partial_out_ct,
-            beta_pd,
-            gamma_pd,
-            partial_a,
-            accum_chain_proof,
-            accum_glue_a_t,
-            beta_accum_y,
-            beta_accum_c1,
-            beta_accum_c2,
-            accum_c_star,
-            accum_partial_out_ct,
-            beta_accum_pd,
-            gamma_accum_pd,
-            accum_partial_a,
-            accum_in,
-            accum_out,
-            beta_accum_mul,
-            gamma_accum_mul,
-            accum_mul_a1,
-            accum_mul_a2,
-            accum_mul_a_m,
-        );
+    let (
+        challenge,
+        rho_glue,
+        rho_mask_bridge,
+        rho_partial,
+        rho_accum_glue,
+        rho_accum_partial,
+        rho_accum_mul,
+    ) = combined_challenge(
+        pk,
+        coeff_cts,
+        c_star,
+        eval_proof,
+        alpha_tag,
+        mask_a_tags,
+        mask_a_comms,
+        glue_a_t,
+        beta_y,
+        beta_c1,
+        beta_c2,
+        pk2,
+        pk1,
+        c_star,
+        partial_out_ct,
+        beta_pd,
+        gamma_pd,
+        partial_a,
+        accum_chain_proof,
+        accum_glue_a_t,
+        beta_accum_y,
+        beta_accum_c1,
+        beta_accum_c2,
+        accum_c_star,
+        accum_partial_out_ct,
+        beta_accum_pd,
+        gamma_accum_pd,
+        accum_partial_a,
+        accum_in,
+        accum_out,
+        beta_accum_mul,
+        gamma_accum_mul,
+        accum_mul_a1,
+        accum_mul_a2,
+        accum_mul_a_m,
+    );
 
     Ok(RoundBatchScalars {
         beta_y,
@@ -939,6 +1027,7 @@ fn derive_round_batch_scalars(
         gamma_accum_mul,
         challenge,
         rho_glue,
+        rho_mask_bridge,
         rho_partial,
         rho_accum_glue,
         rho_accum_partial,
@@ -951,6 +1040,8 @@ impl WireEvalSumProof {
         Self {
             proof_bytes: p.proof.to_bytes(),
             e_comms: p.e_comms.iter().map(|c| c.to_bytes()).collect(),
+            mask_comms: p.mask_comms.iter().map(|c| c.to_bytes()).collect(),
+            inv_mask_comms: p.inv_mask_comms.iter().map(|c| c.to_bytes()).collect(),
             y_comm: p.y_comm.to_bytes(),
             r_comm: p.r_comm.to_bytes(),
             inv_r_comm: p.inv_r_comm.to_bytes(),
@@ -963,6 +1054,16 @@ impl WireEvalSumProof {
                 .map_err(|e| format!("R1CSProof decode: {e:?}"))?,
             e_comms: self
                 .e_comms
+                .iter()
+                .map(|b| CompressedRistretto::from_slice(b))
+                .collect(),
+            mask_comms: self
+                .mask_comms
+                .iter()
+                .map(|b| CompressedRistretto::from_slice(b))
+                .collect(),
+            inv_mask_comms: self
+                .inv_mask_comms
                 .iter()
                 .map(|b| CompressedRistretto::from_slice(b))
                 .collect(),
@@ -1003,6 +1104,10 @@ impl WireCombinedSigmaProof {
         Self {
             eval_proof: WireEvalSumProof::from_proof(&p.eval_proof),
             alpha_tag: p.alpha_tag.to_bytes(),
+            mask_a_tags: p.mask_a_tags.iter().map(|p| p.to_bytes()).collect(),
+            mask_a_comms: p.mask_a_comms.iter().map(|p| p.to_bytes()).collect(),
+            mask_z: p.mask_z.iter().map(|s| s.to_bytes()).collect(),
+            mask_z_blind: p.mask_z_blind.iter().map(|s| s.to_bytes()).collect(),
             glue_a_t: p.glue_a_t.to_bytes(),
             glue_z_e: p.glue_z_e.iter().map(|s| s.to_bytes()).collect(),
             glue_z_alpha: p.glue_z_alpha.to_bytes(),
@@ -1036,9 +1141,31 @@ impl WireCombinedSigmaProof {
             .iter()
             .map(|b| Scalar::from_canonical_bytes(*b).ok_or("accum_glue_z_e: non-canonical scalar"))
             .collect();
+        let mask_z: Result<Vec<_>, _> = self
+            .mask_z
+            .iter()
+            .map(|b| Scalar::from_canonical_bytes(*b).ok_or("mask_z: non-canonical scalar"))
+            .collect();
+        let mask_z_blind: Result<Vec<_>, _> = self
+            .mask_z_blind
+            .iter()
+            .map(|b| Scalar::from_canonical_bytes(*b).ok_or("mask_z_blind: non-canonical scalar"))
+            .collect();
         Ok(CombinedSigmaProof {
             eval_proof: self.eval_proof.to_proof()?,
             alpha_tag: CompressedRistretto::from_slice(&self.alpha_tag),
+            mask_a_tags: self
+                .mask_a_tags
+                .iter()
+                .map(|b| CompressedRistretto::from_slice(b))
+                .collect(),
+            mask_a_comms: self
+                .mask_a_comms
+                .iter()
+                .map(|b| CompressedRistretto::from_slice(b))
+                .collect(),
+            mask_z: mask_z.map_err(str::to_string)?,
+            mask_z_blind: mask_z_blind.map_err(str::to_string)?,
             glue_a_t: CompressedRistretto::from_slice(&self.glue_a_t),
             glue_z_e: glue_z_e.map_err(str::to_string)?,
             glue_z_alpha: Scalar::from_canonical_bytes(self.glue_z_alpha)
@@ -1079,6 +1206,7 @@ pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
     t_poly: &EncryptedPoly,
     hash_count: usize,
     e_vals: &[Scalar],
+    term_masks: &[Scalar],
     scaled_eval: &Ciphertext,
     y: Scalar,
     eval_mask: Scalar,
@@ -1089,9 +1217,13 @@ pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
     mpoly_r_prime: Scalar,
     sk2: &Scalar,
 ) -> Result<RoundProofPrecomputation, R1CSError> {
-    let (eval_proof, y_blind) =
-        prove_eval_sum_with_openings(rng, pc_gens, bp_gens, y, hash_count, e_vals, eval_mask)?;
-    let hash_count_inv = Scalar::from(hash_count as u64).invert();
+    let EvalSumOpenings {
+        proof: eval_proof,
+        y_blind,
+        mask_blinds,
+    } = prove_eval_sum_with_openings(
+        rng, pc_gens, bp_gens, y, hash_count, e_vals, eval_mask, term_masks,
+    )?;
 
     let mut k_e = Vec::with_capacity(e_vals.len());
     for _ in 0..e_vals.len() {
@@ -1101,6 +1233,26 @@ pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
     let k_y_blind = Scalar::random(rng);
     let alpha_tag_pt = mul_g(&y);
     let alpha_tag = alpha_tag_pt.compress();
+
+    // The Sigma part of L9 proves the exponent of every committed μ_j and
+    // uses the same challenge as the aggregate Sigma-Bullet bridge.  Together
+    // with the R1CS relation, this prevents substituting a mask after the
+    // ciphertext witness vector has been formed.
+    let mut mask_k = Vec::with_capacity(term_masks.len());
+    let mut mask_k_blind = Vec::with_capacity(term_masks.len());
+    let mut mask_a_tags = Vec::with_capacity(term_masks.len());
+    let mut mask_a_comms = Vec::with_capacity(term_masks.len());
+    for _ in term_masks {
+        let k = Scalar::random(rng);
+        let k_blind = Scalar::random(rng);
+        mask_a_tags.push(mul_g(&k).compress());
+        mask_a_comms.push(
+            RistrettoPoint::multiscalar_mul([k, k_blind], [pc_gens.B, pc_gens.B_blinding])
+                .compress(),
+        );
+        mask_k.push(k);
+        mask_k_blind.push(k_blind);
+    }
 
     let mut scalars = Vec::with_capacity(4 + k_e.len());
     let mut points = Vec::with_capacity(4 + k_e.len());
@@ -1115,7 +1267,9 @@ pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
         scalars.push(*k);
         let mut basis = beta_c1 * ct.c1 + beta_c2 * ct.c2;
         if idx == 0 {
-            basis += hash_count_inv * (beta_c1 * G + beta_c2 * pk.0);
+            // Σ_j Enc(0; r·μ_j) = Enc(0; e_0), so the encrypted-zero
+            // correction is bound to the same e_0 witness.
+            basis += beta_c1 * G + beta_c2 * pk.0;
         }
         points.push(basis);
     }
@@ -1136,6 +1290,8 @@ pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
         scaled_eval,
         &eval_proof,
         &alpha_tag,
+        &mask_a_tags,
+        &mask_a_comms,
         &glue_a_t,
         beta_y,
         beta_c1,
@@ -1153,12 +1309,18 @@ pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
         eval_proof,
         y_blind,
         e_vals: e_vals.to_vec(),
+        term_masks: term_masks.to_vec(),
+        mask_blinds,
         y,
         k_e,
         k_alpha,
         k_y_blind,
         alpha_tag_pt,
         alpha_tag,
+        mask_k,
+        mask_k_blind,
+        mask_a_tags,
+        mask_a_comms,
         glue_a_t,
         k_sk2,
         k_r_prime,
@@ -1191,12 +1353,18 @@ pub(crate) fn finish_round_proof<R: CryptoRng + RngCore>(
         eval_proof,
         y_blind,
         e_vals,
+        term_masks,
+        mask_blinds,
         y,
         k_e,
         k_alpha,
         k_y_blind,
         alpha_tag_pt,
         alpha_tag,
+        mask_k,
+        mask_k_blind,
+        mask_a_tags,
+        mask_a_comms,
         glue_a_t,
         k_sk2,
         k_r_prime,
@@ -1318,6 +1486,18 @@ pub(crate) fn finish_round_proof<R: CryptoRng + RngCore>(
             aggregate_eval_proof: WireCombinedSigmaProof::from_proof(&CombinedSigmaProof {
                 eval_proof,
                 alpha_tag,
+                mask_a_tags,
+                mask_a_comms,
+                mask_z: mask_k
+                    .iter()
+                    .zip(term_masks.iter())
+                    .map(|(k, mask)| k + challenge * mask)
+                    .collect(),
+                mask_z_blind: mask_k_blind
+                    .iter()
+                    .zip(mask_blinds.iter())
+                    .map(|(k, blind)| k + challenge * blind)
+                    .collect(),
                 glue_a_t,
                 glue_z_e: k_e
                     .iter()
@@ -1362,6 +1542,7 @@ pub fn prove_round<R: CryptoRng + RngCore>(
     t_poly: &EncryptedPoly,
     hash_count: usize,
     e_vals: &[Scalar],
+    term_masks: &[Scalar],
     scaled_eval: &Ciphertext,
     y: Scalar,
     eval_mask: Scalar,
@@ -1385,6 +1566,7 @@ pub fn prove_round<R: CryptoRng + RngCore>(
         t_poly,
         hash_count,
         e_vals,
+        term_masks,
         scaled_eval,
         y,
         eval_mask,
@@ -1437,6 +1619,14 @@ pub fn verify_round(
     if proof.glue_z_e.len() != t_poly.0.len() {
         return Err("glue vector length mismatch".to_string());
     }
+    if proof.eval_proof.mask_comms.len() != bf_config.hash_count
+        || proof.mask_a_tags.len() != bf_config.hash_count
+        || proof.mask_a_comms.len() != bf_config.hash_count
+        || proof.mask_z.len() != bf_config.hash_count
+        || proof.mask_z_blind.len() != bf_config.hash_count
+    {
+        return Err("per-term mask bridge length mismatch".to_string());
+    }
     if proof.accum_chain_proof.e_comms.len() != current_accum.0.len() {
         return Err("accum e commitment length mismatch".to_string());
     }
@@ -1452,6 +1642,25 @@ pub fn verify_round(
         .alpha_tag
         .decompress()
         .ok_or_else(|| "invalid alpha_tag point".to_string())?;
+    let mask_a_tags: Result<Vec<_>, _> = proof
+        .mask_a_tags
+        .iter()
+        .map(|point| point.decompress().ok_or("invalid mask A_tag point"))
+        .collect();
+    let mask_a_tags = mask_a_tags?;
+    let mask_a_comms: Result<Vec<_>, _> = proof
+        .mask_a_comms
+        .iter()
+        .map(|point| point.decompress().ok_or("invalid mask A_comm point"))
+        .collect();
+    let mask_a_comms = mask_a_comms?;
+    let mask_comms: Result<Vec<_>, _> = proof
+        .eval_proof
+        .mask_comms
+        .iter()
+        .map(|point| point.decompress().ok_or("invalid mask commitment point"))
+        .collect();
+    let mask_comms = mask_comms?;
     let glue_a_t = proof
         .glue_a_t
         .decompress()
@@ -1490,7 +1699,6 @@ pub fn verify_round(
         .y_comm
         .decompress()
         .ok_or_else(|| "invalid accum y commitment point".to_string())?;
-    let hash_count_inv = Scalar::from(bf_config.hash_count as u64).invert();
 
     let delta_c1 = m_poly_ct.c1 - scaled_eval.c1;
     let delta_c2 = m_poly_ct.c2 - scaled_eval.c2;
@@ -1506,6 +1714,8 @@ pub fn verify_round(
         scaled_eval,
         &proof.eval_proof,
         &proof.alpha_tag,
+        &proof.mask_a_tags,
+        &proof.mask_a_comms,
         &proof.glue_a_t,
         m_poly_ct,
         &proof.partial_a,
@@ -1535,7 +1745,7 @@ pub fn verify_round(
         scalars.push(batch.rho_glue * *z);
         let mut basis = batch.beta_c1 * ct.c1 + batch.beta_c2 * ct.c2;
         if idx == 0 {
-            basis += hash_count_inv * (batch.beta_c1 * G + batch.beta_c2 * pk.0);
+            basis += batch.beta_c1 * G + batch.beta_c2 * pk.0;
         }
         points.push(basis);
     }
@@ -1549,6 +1759,38 @@ pub fn verify_round(
     points.push(scaled_eval.c1);
     scalars.push(-batch.rho_glue * batch.challenge * batch.beta_c2);
     points.push(scaled_eval.c2);
+
+    // Sigma exponent and Pedersen-opening bridge for each L6 mask.  The
+    // expected tag is derived from the shared y tag, so every response is
+    // tied both to μ_j = H(y, j) and to the committed witness used by the
+    // Bulletproof/e-vector relation above.
+    for (hash_index, (((&z, &z_blind), a_tag), (a_comm, mask_comm))) in proof
+        .mask_z
+        .iter()
+        .zip(proof.mask_z_blind.iter())
+        .zip(mask_a_tags.iter())
+        .zip(mask_a_comms.iter().zip(mask_comms.iter()))
+        .enumerate()
+    {
+        let (slope, intercept) = hash_params(hash_index);
+        scalars.push(batch.rho_mask_bridge * z);
+        points.push(G);
+        scalars.push(-batch.rho_mask_bridge);
+        points.push(*a_tag);
+        scalars.push(-batch.rho_mask_bridge * batch.challenge * slope);
+        points.push(alpha_tag);
+        scalars.push(-batch.rho_mask_bridge * batch.challenge * intercept);
+        points.push(G);
+
+        scalars.push(batch.rho_mask_bridge * z);
+        points.push(pc_gens.B);
+        scalars.push(batch.rho_mask_bridge * z_blind);
+        points.push(pc_gens.B_blinding);
+        scalars.push(-batch.rho_mask_bridge);
+        points.push(*a_comm);
+        scalars.push(-batch.rho_mask_bridge * batch.challenge);
+        points.push(*mask_comm);
+    }
 
     scalars.push(
         batch.rho_partial * (proof.partial_z1 + proof.partial_z2 * batch.gamma_pd * batch.beta_pd),
@@ -1711,6 +1953,7 @@ mod tests {
             &t_poly,
             config.hash_count,
             &aggregate.e_vals,
+            &aggregate.term_masks,
             &aggregate.scaled_eval,
             y,
             eval_mask,
@@ -1748,6 +1991,121 @@ mod tests {
             )
             .is_err(),
             "a valid partial decrypt of an unrelated accumulator ciphertext must be rejected",
+        );
+    }
+
+    #[test]
+    fn multi_hash_term_masks_are_bound_to_the_l9_sigma_bullet_bridge() {
+        let mut rng = OsRng;
+        let (_sk1, pk1) = generate_key_share(&mut rng);
+        let (sk2, pk2) = generate_key_share(&mut rng);
+        let pk = combine_public_keys(&pk1, &pk2);
+        let config = BloomFilterConfig {
+            bloom_filter_size: 32,
+            hash_count: 3,
+            target_marked_count: 8,
+        };
+        let y = Scalar::from(2u64);
+        let t_poly = encrypt_poly(
+            &mut rng,
+            &pk,
+            &[Scalar::from(3u64), Scalar::from(7u64), Scalar::from(11u64)],
+        );
+        let eval_mask = Scalar::from(13u64);
+        let aggregate = build_aggregate_eval_witness(&t_poly, y, config, eval_mask, &pk).unwrap();
+        assert_eq!(aggregate.term_masks, scalar_positions(y, config));
+        let (m_poly_ct, mpoly_r_prime) =
+            partial_decrypt_with_witness(&mut rng, &sk2, &pk1, &aggregate.scaled_eval);
+
+        let accum = encrypt_poly(
+            &mut rng,
+            &pk,
+            &[Scalar::one(), Scalar::from(2u64), Scalar::from(4u64)],
+        );
+        let next_accum = poly_scalar_mul(&accum, &y);
+        let accum_mask = Scalar::from(17u64);
+        let accum_eval = eval_poly(&accum, &y);
+        let accum_scaled = ct_add(
+            &ct_scalar_mul(&accum_eval, &accum_mask),
+            &Ciphertext {
+                c1: mul_g(&accum_mask),
+                c2: accum_mask * pk.0,
+            },
+        );
+        let (accum_m_poly_ct, accum_r_prime) =
+            partial_decrypt_with_witness(&mut rng, &sk2, &pk1, &accum_scaled);
+
+        let pc_gens = PedersenGens::default();
+        let target_cap = crate::bf::bp_capacity(t_poly.0.len() - 1, config);
+        let accum_cap = (2 * accum.0.len()).next_power_of_two().max(64);
+        let bp_gens = BulletproofGens::new(target_cap.max(accum_cap), 1);
+        let (_, proof) = prove_round(
+            &mut rng,
+            &pc_gens,
+            &bp_gens,
+            &t_poly,
+            config.hash_count,
+            &aggregate.e_vals,
+            &aggregate.term_masks,
+            &aggregate.scaled_eval,
+            y,
+            eval_mask,
+            &pk,
+            &pk1,
+            &pk2,
+            &m_poly_ct,
+            &accum_scaled,
+            &accum_m_poly_ct,
+            &accum,
+            &next_accum,
+            mpoly_r_prime,
+            accum_mask,
+            accum_r_prime,
+            sk2.as_scalar(),
+        )
+        .expect("valid multi-hash round proof");
+
+        verify_round(
+            &pc_gens,
+            &bp_gens,
+            config,
+            &pk,
+            &pk1,
+            &pk2,
+            &t_poly,
+            &aggregate.scaled_eval,
+            &m_poly_ct,
+            &accum_scaled,
+            &accum_m_poly_ct,
+            &accum,
+            &next_accum,
+            &proof,
+        )
+        .expect("valid per-term masks must verify");
+
+        let mut tampered = proof.clone();
+        let z = Scalar::from_canonical_bytes(tampered.aggregate_eval_proof.mask_z[1])
+            .expect("prover emitted canonical scalar");
+        tampered.aggregate_eval_proof.mask_z[1] = (z + Scalar::one()).to_bytes();
+        assert!(
+            verify_round(
+                &pc_gens,
+                &bp_gens,
+                config,
+                &pk,
+                &pk1,
+                &pk2,
+                &t_poly,
+                &aggregate.scaled_eval,
+                &m_poly_ct,
+                &accum_scaled,
+                &accum_m_poly_ct,
+                &accum,
+                &next_accum,
+                &tampered,
+            )
+            .is_err(),
+            "tampering with a per-term mask bridge response must be rejected",
         );
     }
 }
