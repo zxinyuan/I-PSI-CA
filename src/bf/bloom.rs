@@ -31,12 +31,6 @@ impl BloomFilterConfig {
     }
 }
 
-/// Choose a public Bloom-filter hash count `k` from the Bernoulli-honeyword
-/// relation `(|B| / b)^k = p_h`.
-///
-/// We pick the smallest integer `k` that keeps the expected bit density near
-/// `1/2`, which is the usual Bloom-filter sweet spot and also keeps later ZK
-/// proofs cheaper because both hashing witnesses and proof size scale with `k`.
 pub fn recommended_hash_count(honeyword_probability: f64) -> usize {
     if !honeyword_probability.is_finite()
         || honeyword_probability <= 0.0

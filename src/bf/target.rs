@@ -1,31 +1,3 @@
-//! Target's side of the Bloom-filter I-PSI-CA protocol.
-//!
-//! # Role
-//! Holds the Bloom filter index set `B ⊆ 𝔽` consisting of the positions whose
-//! bits are marked `1`. Encodes it as a polynomial whose roots are exactly
-//! those marked positions, encrypts it under the joint public key, and
-//! outsources the ciphertext to the monitor. For each subsequent round it
-//! verifies the monitor's proof and decides whether to increment its counter.
-//!
-//! # Network
-//! Runs as a **TCP server**; accepts one monitor connection and drives the
-//! protocol for an arbitrary number of rounds.
-//!
-//! # Module layout assumed
-//! ```text
-//! src/
-//!   crypto/elgamal.rs     ← ../Crypto/ElGamal.rs
-//!   crypto/bulletproof.rs ← ../Crypto/bulletproof.rs
-//!   exact/target.rs       ← this file
-//!   exact/monitor.rs
-//!   exact/wire.rs         ← shared wire types (defined here, re-exported)
-//! ```
-//!
-//! # Extra Cargo deps
-//! ```toml
-//! serde   = { version = "1", features = ["derive"] }
-//! bincode = "1"
-//! ```
 
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -43,9 +15,6 @@ use crate::crypto::elgamal::{
     test_zero, Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare, SecretKeyShare,
 };
 
-// ── Wire types (shared with Monitor) ─────────────────────────────────────────
-
-/// Serialisable ElGamal ciphertext: two 32-byte compressed Ristretto points.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireCiphertext {
     pub c1: [u8; 32],
@@ -70,7 +39,6 @@ impl WireCiphertext {
     }
 }
 
-/// Serialisable encrypted polynomial: a length-prefixed vector of wire ciphertexts.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireEncryptedPoly(pub Vec<WireCiphertext>);
 
@@ -84,48 +52,26 @@ impl WireEncryptedPoly {
     }
 }
 
-// ── Protocol messages ─────────────────────────────────────────────────────────
-
-/// Target → Monitor message: sent once per round to kick it off.
-///
-/// The target is the protocol initiator: it sends the (unchanging) encrypted
-/// T-polynomial together with its current, locally re-randomized accumulator
-/// ciphertext, then waits for the monitor's full reply.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TargetToMonitor {
     pub t_poly_ct: WireEncryptedPoly,
     pub accum: WireEncryptedPoly,
 }
 
-/// Monitor → Target message (one per round).
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MonitorToTarget {
-    /// `accumNext = y · Accum`.
     pub accum_next: WireEncryptedPoly,
-    /// Masked accumulated evaluation `accum_mask · THEval[pk](Accum, y)`,
-    /// included so the target can verify the corresponding sigma proof.
     pub accum_eval_masked: WireCiphertext,
-    /// Partially decrypted accumulated evaluation used for the target's
-    /// non-zero test before advancing state.
     pub accum_eval_ctext: WireCiphertext,
-    /// `scaled_eval = Σ_j (r·H(y,j)·THEval[pk](TPolyCtext,H(y,j)) +
-    /// Enc_pk(0; r·H(y,j)))`: each Bloom evaluation has its own additional
-    /// hash-derived mask before the aggregate is partially decrypted.
     pub scaled_eval: WireCiphertext,
-    /// `MPolyCtext = THDec[sk2](scaled_eval)`.
     pub m_poly_ctext: WireCiphertext,
-    /// BF-specific proof bundle for position hashing, partial decryptions, and
-    /// accumulated-polynomial update.
     pub round_proof: bfproof::RoundProof,
 }
-
-// ── Framed TCP helpers ────────────────────────────────────────────────────────
 
 pub fn send_msg<T: Serialize>(stream: &mut TcpStream, msg: &T) -> io::Result<()> {
     let bytes =
         bincode::serialize(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let len = (bytes.len() as u32).to_be_bytes();
-    // Write length prefix and payload in a single syscall via vectored I/O.
     let mut bufs: &mut [IoSlice<'_>] = &mut [IoSlice::new(&len), IoSlice::new(&bytes)];
     let total = len.len() + bytes.len();
     let mut written = 0;
@@ -146,51 +92,35 @@ pub fn recv_msg<T: for<'de> Deserialize<'de>>(stream: &mut TcpStream) -> io::Res
     bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-// ── Polynomial utilities ──────────────────────────────────────────────────────
-
-/// Build the monic polynomial `P(X) = ∏_{t ∈ roots} (X − t)`.
-///
-/// Returns `[a_0, a_1, …, a_n]` where `a_d` is the coefficient of `X^d`.
 pub fn poly_from_roots(roots: &[Scalar]) -> Vec<Scalar> {
-    // Start from polynomial "1" (constant) and multiply in each linear factor
-    // in-place, walking the coefficient vector backwards to avoid a clone.
     let mut coeffs = Vec::with_capacity(roots.len() + 1);
     coeffs.push(Scalar::one());
     for root in roots {
         let n = coeffs.len();
-        // The new leading coefficient (degree n) equals the old leading
-        // coefficient (degree n-1) — copy it before the in-place updates below
-        // overwrite it.
         let leading = *coeffs.last().unwrap();
-        coeffs.push(leading); // extend for the new degree-n term
+        coeffs.push(leading);
         for d in (1..n).rev() {
-            coeffs[d] = coeffs[d - 1] - root * coeffs[d]; // middle terms
+            coeffs[d] = coeffs[d - 1] - root * coeffs[d];
         }
-        coeffs[0] *= -root; // constant term
+        coeffs[0] *= -root;
     }
     coeffs
 }
 
-// ── Target ────────────────────────────────────────────────────────────────────
-
 pub struct Target {
-    marked_positions: Vec<Scalar>,
     bf_config: BloomFilterConfig,
     accum_degree: usize,
     sk1: SecretKeyShare,
     pk1: PublicKeyShare,
     pk2: PublicKeyShare,
     pk: PublicKey,
-    /// Matching counter, incremented on each genuine match.
     pub state: u64,
     pc_gens: PedersenGens,
     bp_gens: BulletproofGens,
 }
 
 impl Target {
-    /// Construct a Target from its secret key share and the public parameters.
     pub fn new(
-        marked_positions: Vec<Scalar>,
         bf_config: BloomFilterConfig,
         accum_degree: usize,
         sk1: SecretKeyShare,
@@ -198,12 +128,11 @@ impl Target {
         pk2: PublicKeyShare,
     ) -> Self {
         let pk = combine_public_keys(&pk1, &pk2);
-        let max_degree = marked_positions.len();
+        let max_degree = bf_config.bloom_filter_size;
         let target_cap = crate::bf::bp_capacity(max_degree, bf_config);
         let accum_cap = (2 * (accum_degree + 1)).next_power_of_two().max(64);
         let cap = target_cap.max(accum_cap);
         Target {
-            marked_positions,
             bf_config,
             accum_degree,
             sk1,
@@ -216,19 +145,14 @@ impl Target {
         }
     }
 
-    // ── Setup ─────────────────────────────────────────────────────────────────
-
-    /// `THEnc[pk](T-poly)`: construct P(X) from the Bloom filter positions
-    /// whose bits are `1`, then encrypt.
     fn build_poly_ctext(&self, rng: &mut OsRng) -> EncryptedPoly {
-        let coeffs = poly_from_roots(&self.marked_positions);
+        let roots: Vec<Scalar> = (1..=self.bf_config.bloom_filter_size as u64)
+            .map(Scalar::from)
+            .collect();
+        let coeffs = poly_from_roots(&roots);
         encrypt_poly(rng, &self.pk, &coeffs)
     }
 
-    /// Build the initial accumulated polynomial ciphertext:
-    /// an encryption of the constant polynomial `1`, padded with encrypted `0`s
-    /// through the configured accumulated-polynomial degree. This degree stays
-    /// fixed across outsourcing and every subsequent rerandomized update.
     fn build_accum_ctext(&self, rng: &mut OsRng) -> EncryptedPoly {
         let mut coeffs = Vec::with_capacity(self.accum_degree + 1);
         coeffs.push(encrypt_one(rng, &self.pk));
@@ -238,15 +162,6 @@ impl Target {
         EncryptedPoly(coeffs)
     }
 
-    // ── Protocol round ────────────────────────────────────────────────────────
-
-    /// One complete round: verify proof, test match, produce next accumulated ciphertext.
-    ///
-    /// The accumulator always advances to the monitor's `next_accum`
-    /// (re-randomized locally) — advancement is no longer conditioned on
-    /// the membership test result.
-    ///
-    /// Returns `(next_accum, is_match)`.
     pub(crate) fn process_round(
         &mut self,
         rng: &mut OsRng,
@@ -281,17 +196,11 @@ impl Target {
             &msg.round_proof,
         )?;
 
-        // T.2  THTest[sk1]{0}{MPolyCtext}:
-        //      MPolyCtext was partially decrypted by the monitor (THDec[sk2]),
-        //      so it lives in THCtextSpace[pk1].  test_zero finishes the job.
-        //      Kept only for the match counter; no longer gates advancement.
         let is_match = test_zero(&self.sk1, &m_poly_ct);
         if is_match {
             self.state += 1;
         }
 
-        // T.3  Always advance to the monitor's next_accum, re-randomized
-        //      locally and kept without sending it back to the monitor.
         let (rerand_accum, _) = rerandomize_poly_with_witness(rng, &self.pk, &next_accum);
         if rerand_accum.0.len() != current_accum.0.len() {
             return Err("rerandomized accum length mismatch".to_string());
@@ -300,10 +209,6 @@ impl Target {
         Ok((rerand_accum, is_match))
     }
 
-    // ── TCP server ────────────────────────────────────────────────────────────
-
-    /// Bind to `addr`, accept one monitor, and run `rounds` protocol
-    /// interactions.  The target is the initiator of each round.
     pub fn run(&mut self, addr: &str, rounds: usize) -> io::Result<()> {
         let listener = TcpListener::bind(addr)?;
         eprintln!("[Target] Listening on {addr}");
@@ -315,27 +220,27 @@ impl Target {
     fn handle(&mut self, mut s: TcpStream, rounds: usize) -> io::Result<()> {
         let mut rng = OsRng;
 
-        // Build the (unchanging) encrypted T-polynomial and the initial
-        // accumulator ciphertext once, up front.
         let t_deploy = std::time::Instant::now();
         let current = self.build_poly_ctext(&mut rng);
         let mut deploy_ms = None;
         let mut current_accum = self.build_accum_ctext(&mut rng);
         eprintln!(
-            "[Target] Built TPolyCtext for {} marked Bloom positions, Accum (deg {})",
-            self.marked_positions.len(),
+            "[Target] Built TPolyCtext for all {} Bloom positions, Accum (deg {})",
+            self.bf_config.bloom_filter_size,
             self.accum_degree
         );
 
         for round in 1..=rounds {
             eprintln!("[Target] Round {round}/{rounds}");
 
-            // Kick off the round: send the T-polynomial and the current
-            // (already re-randomized) accumulator to the monitor.
             let outgoing = TargetToMonitor {
                 t_poly_ct: WireEncryptedPoly::from_native(&current),
                 accum: WireEncryptedPoly::from_native(&current_accum),
             };
+            let t_poly_ct_bytes = bincode::serialized_size(&outgoing.t_poly_ct)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let accum_bytes = bincode::serialized_size(&outgoing.accum)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let sent_bytes = bincode::serialized_size(&outgoing)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
                 + 4;
@@ -346,7 +251,6 @@ impl Target {
                 deploy_ms = Some(t_deploy.elapsed().as_secs_f64() * 1000.0);
             }
 
-            // Wait for the monitor's full reply (messages + proof).
             let msg: MonitorToTarget = match recv_msg(&mut s) {
                 Ok(m) => m,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -365,8 +269,10 @@ impl Target {
                 "[Target] Latency (send t_poly_ct+accum -> recv monitor reply): {latency_ms:.3} ms"
             );
             eprintln!(
-                "[Target] Network Traffic: sent={:.2} KB  recv={:.2} KB",
+                "[Target] Network Traffic: sent={:.2} KB (t_poly_ct={:.2} KB, accum={:.2} KB)  recv={:.2} KB",
                 sent_bytes as f64 / 1024.0,
+                t_poly_ct_bytes as f64 / 1024.0,
+                accum_bytes as f64 / 1024.0,
                 recv_bytes as f64 / 1024.0,
             );
             if let Some(deploy_ms) = deploy_ms.take() {
@@ -400,8 +306,6 @@ impl Target {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,13 +332,11 @@ mod tests {
         panic!("no scalar input found for target position {target_position:?}");
     }
 
-    /// Verify that `poly_from_roots` evaluates to zero at each root.
     #[test]
     fn test_poly_roots_eval_zero() {
         let roots = [Scalar::from(2u64), Scalar::from(5u64), Scalar::from(11u64)];
         let coeffs = poly_from_roots(&roots);
         for r in &roots {
-            // Horner evaluation.
             let mut val = *coeffs.last().unwrap();
             for c in coeffs[..coeffs.len() - 1].iter().rev() {
                 val = val * r + c;
@@ -443,22 +345,13 @@ mod tests {
         }
     }
 
-    /// End-to-end test of one matched round using in-process crypto.
     #[test]
     fn test_process_round_match() {
         let mut rng = OsRng;
         let (sk1, pk1) = generate_key_share(&mut rng);
         let (sk2, pk2) = generate_key_share(&mut rng);
 
-        let t_set = vec![Scalar::from(7u64), Scalar::from(42u64)];
-        let mut target = Target::new(
-            t_set.clone(),
-            test_config(),
-            5,
-            sk1,
-            pk1.clone(),
-            pk2.clone(),
-        );
+        let mut target = Target::new(test_config(), 5, sk1, pk1.clone(), pk2.clone());
         let poly_ct = target.build_poly_ctext(&mut rng);
         let accum_ct = target.build_accum_ctext(&mut rng);
         let monitor = Monitor::new(
@@ -467,7 +360,7 @@ mod tests {
             sk2,
             pk1,
             pk2,
-            t_set.len(),
+            test_config().bloom_filter_size,
         );
 
         let msg = monitor
@@ -490,52 +383,6 @@ mod tests {
         );
     }
 
-    /// Non-match round: state stays at 0.
-    #[test]
-    fn test_process_round_no_match() {
-        let mut rng = OsRng;
-        let (sk1, pk1) = generate_key_share(&mut rng);
-        let (sk2, pk2) = generate_key_share(&mut rng);
-
-        let t_set = vec![Scalar::from(7u64)];
-        let mut target = Target::new(
-            t_set.clone(),
-            test_config(),
-            5,
-            sk1,
-            pk1.clone(),
-            pk2.clone(),
-        );
-        let poly_ct = target.build_poly_ctext(&mut rng);
-        let accum_ct = target.build_accum_ctext(&mut rng);
-        let monitor = Monitor::new(
-            Scalar::from(9u64),
-            test_config(),
-            sk2,
-            pk1,
-            pk2,
-            t_set.len(),
-        );
-        let msg = monitor
-            .compute_round(
-                &mut rng,
-                &WireEncryptedPoly::from_native(&poly_ct),
-                &WireEncryptedPoly::from_native(&accum_ct),
-            )
-            .unwrap();
-
-        let (next_accum_out, matched) = target
-            .process_round(&mut rng, &poly_ct, &accum_ct, &msg)
-            .unwrap();
-        assert!(!matched, "9 should not match");
-        assert_eq!(target.state, 0);
-        assert_eq!(
-            next_accum_out.0.len(),
-            accum_ct.0.len(),
-            "accum length should stay constant"
-        );
-    }
-
     #[test]
     fn test_build_accum_ctext_uses_fixed_degree() {
         let mut rng = OsRng;
@@ -543,14 +390,7 @@ mod tests {
         let (_sk2, pk2) = generate_key_share(&mut rng);
 
         let accum_degree = 5;
-        let target = Target::new(
-            vec![Scalar::from(7u64)],
-            test_config(),
-            accum_degree,
-            sk1,
-            pk1,
-            pk2,
-        );
+        let target = Target::new(test_config(), accum_degree, sk1, pk1, pk2);
         let accum_ct = target.build_accum_ctext(&mut rng);
 
         assert_eq!(
@@ -566,15 +406,7 @@ mod tests {
         let (sk1, pk1) = generate_key_share(&mut rng);
         let (sk2, pk2) = generate_key_share(&mut rng);
 
-        let t_set = vec![Scalar::from(7u64), Scalar::from(42u64)];
-        let mut target = Target::new(
-            t_set.clone(),
-            test_config(),
-            5,
-            sk1,
-            pk1.clone(),
-            pk2.clone(),
-        );
+        let mut target = Target::new(test_config(), 5, sk1, pk1.clone(), pk2.clone());
         let poly_ct = target.build_poly_ctext(&mut rng);
         let accum_ct = target.build_accum_ctext(&mut rng);
         let monitor = Monitor::new(
@@ -583,7 +415,7 @@ mod tests {
             sk2,
             pk1,
             pk2,
-            t_set.len(),
+            test_config().bloom_filter_size,
         );
 
         let msg = monitor

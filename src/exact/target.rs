@@ -1,31 +1,3 @@
-//! Target's side of the exact I-PSI-CA protocol (Figure 2).
-//!
-//! # Role
-//! Holds a set `TSet ⊆ 𝔽`.  Encodes it as a polynomial whose roots are
-//! exactly the set elements, encrypts it under the joint public key, and
-//! outsources the ciphertext to the monitor.  For each subsequent round it
-//! verifies the monitor's proof and decides whether to increment its counter.
-//!
-//! # Network
-//! Runs as a **TCP server**; accepts one monitor connection and drives the
-//! protocol for an arbitrary number of rounds.
-//!
-//! # Module layout assumed
-//! ```text
-//! src/
-//!   crypto/elgamal.rs     ← ../Crypto/ElGamal.rs
-//!   crypto/bulletproof.rs ← ../Crypto/bulletproof.rs
-//!   exact/target.rs       ← this file
-//!   exact/monitor.rs
-//!   exact/wire.rs         ← shared wire types (defined here, re-exported)
-//! ```
-//!
-//! # Extra Cargo deps
-//! ```toml
-//! serde   = { version = "1", features = ["derive"] }
-//! bincode = "1"
-//! ```
-
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
@@ -42,9 +14,6 @@ use crate::crypto::elgamal::{
 };
 use crate::crypto::sigma_bullet as sb;
 
-// ── Wire types (shared with Monitor) ─────────────────────────────────────────
-
-/// Serialisable ElGamal ciphertext: two 32-byte compressed Ristretto points.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireCiphertext {
     pub c1: [u8; 32],
@@ -69,7 +38,6 @@ impl WireCiphertext {
     }
 }
 
-/// Serialisable encrypted polynomial: a length-prefixed vector of wire ciphertexts.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireEncryptedPoly(pub Vec<WireCiphertext>);
 
@@ -83,7 +51,6 @@ impl WireEncryptedPoly {
     }
 }
 
-/// Serialisable form of `bp::EvalChainProof`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireEvalChainProof {
     pub proof_bytes: Vec<u8>,
@@ -121,21 +88,12 @@ impl WireEvalChainProof {
     }
 }
 
-/// The monitor's ZKPoK composed of two Bulletproof R1CS sub-proofs.
-///
-/// **power_chain**: proves `[y^n, y^{n-1}, …, y, 1]` is geometric with ratio `y`
-/// (binds the evaluation to a single consistent input point).
-///
-/// **mask_nonzero**: proves `mask ≠ 0` via the n=0 eval-chain gadget
-/// (just the inverse-exists gate: `mask · mask⁻¹ = 1`).
-///
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireMonitorProof {
     pub power_chain: WireEvalChainProof,
     pub mask_nonzero: WireEvalChainProof,
 }
 
-/// Serialisable form of `sigma_bullet::GlueProof`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireGlueProof {
     pub alpha_tag: [u8; 32],
@@ -174,7 +132,6 @@ impl WireGlueProof {
     }
 }
 
-/// Serialisable form of `sigma_bullet::SigmaBulletProof`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireSigmaBulletProof {
     pub chain_proof: WireEvalChainProof,
@@ -197,7 +154,6 @@ impl WireSigmaBulletProof {
     }
 }
 
-/// Serialisable form of the full combined round proof.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireCombinedSigmaProof {
     pub chain_proof: WireEvalChainProof,
@@ -296,46 +252,26 @@ impl WireCombinedSigmaProof {
     }
 }
 
-// ── Protocol messages ─────────────────────────────────────────────────────────
-
-/// Target → Monitor message: sent once per round to kick it off.
-///
-/// The target is the protocol initiator: it sends the (unchanging)
-/// encrypted T-polynomial together with its current, locally re-randomized
-/// accumulator ciphertext, then waits for the monitor's full reply.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct TargetToMonitor {
     pub t_poly_ct: WireEncryptedPoly,
     pub accum: WireEncryptedPoly,
 }
 
-/// Monitor → Target message (one per round).
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MonitorToTarget {
-    /// `nextAccum = MElmt · Accum`.
     pub next_accum: WireEncryptedPoly,
-    /// `accum_scaled_eval = accum_mask · THEval[pk](Accum, MElmt)` — the
-    /// ciphertext fed into partial decryption for the accumulated polynomial.
     pub accum_scaled_eval: WireCiphertext,
-    /// `accum_m_poly_ctext = THDec[sk2](accum_scaled_eval)`.
     pub accum_m_poly_ctext: WireCiphertext,
-    /// `scaled_eval = mask · THEval[pk](TPolyCtext, MElmt)` — the ciphertext
-    /// fed into partial decryption; needed by the target to verify the sigma proof.
     pub scaled_eval: WireCiphertext,
-    /// `MPolyCtext = THDec[sk2](scaled_eval)`.
     pub m_poly_ctext: WireCiphertext,
-    /// One composite proof covering encrypted evaluation, partial decryption,
-    /// and accumulated-polynomial update under a shared Fiat-Shamir challenge.
     pub round_proof: WireCombinedSigmaProof,
 }
-
-// ── Framed TCP helpers ────────────────────────────────────────────────────────
 
 pub fn send_msg<T: Serialize>(stream: &mut TcpStream, msg: &T) -> io::Result<()> {
     let bytes =
         bincode::serialize(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let len = (bytes.len() as u32).to_be_bytes();
-    // Write length prefix and payload in a single syscall via vectored I/O.
     let mut bufs: &mut [IoSlice<'_>] = &mut [IoSlice::new(&len), IoSlice::new(&bytes)];
     let total = len.len() + bytes.len();
     let mut written = 0;
@@ -355,32 +291,20 @@ pub fn recv_msg<T: for<'de> Deserialize<'de>>(stream: &mut TcpStream) -> io::Res
     bincode::deserialize(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-// ── Polynomial utilities ──────────────────────────────────────────────────────
-
-/// Build the monic polynomial `P(X) = ∏_{t ∈ roots} (X − t)`.
-///
-/// Returns `[a_0, a_1, …, a_n]` where `a_d` is the coefficient of `X^d`.
 pub fn poly_from_roots(roots: &[Scalar]) -> Vec<Scalar> {
-    // Start from polynomial "1" (constant) and multiply in each linear factor
-    // in-place, walking the coefficient vector backwards to avoid a clone.
     let mut coeffs = Vec::with_capacity(roots.len() + 1);
     coeffs.push(Scalar::one());
     for root in roots {
         let n = coeffs.len();
-        // The new leading coefficient (degree n) equals the old leading
-        // coefficient (degree n-1) — copy it before the in-place updates below
-        // overwrite it.
         let leading = *coeffs.last().unwrap();
-        coeffs.push(leading); // extend for the new degree-n term
+        coeffs.push(leading);
         for d in (1..n).rev() {
-            coeffs[d] = coeffs[d - 1] - root * coeffs[d]; // middle terms
+            coeffs[d] = coeffs[d - 1] - root * coeffs[d];
         }
-        coeffs[0] *= -root; // constant term
+        coeffs[0] *= -root;
     }
     coeffs
 }
-
-// ── Target ────────────────────────────────────────────────────────────────────
 
 pub struct Target {
     t_set: Vec<Scalar>,
@@ -389,14 +313,12 @@ pub struct Target {
     pk1: PublicKeyShare,
     pk2: PublicKeyShare,
     pk: PublicKey,
-    /// Matching counter, incremented on each genuine match.
     pub state: u64,
     pc_gens: PedersenGens,
     bp_gens: BulletproofGens,
 }
 
 impl Target {
-    /// Construct a Target from its secret key share and the public parameters.
     pub fn new(
         t_set: Vec<Scalar>,
         accum_degree: usize,
@@ -405,7 +327,6 @@ impl Target {
         pk2: PublicKeyShare,
     ) -> Self {
         let pk = combine_public_keys(&pk1, &pk2);
-        // Cover both the target-polynomial and accumulator evaluation circuits.
         let n = t_set.len().max(accum_degree) + 2;
         let cap = 1usize << (usize::BITS - (2 * n).leading_zeros()) as usize;
         let cap = cap.max(64);
@@ -422,17 +343,11 @@ impl Target {
         }
     }
 
-    // ── Setup ─────────────────────────────────────────────────────────────────
-
-    /// `THEnc[pk](T-poly)`: construct P(X) from TSet and encrypt.
     fn build_poly_ctext(&self, rng: &mut OsRng) -> EncryptedPoly {
         let coeffs = poly_from_roots(&self.t_set);
         encrypt_poly(rng, &self.pk, &coeffs)
     }
 
-    /// Build the initial accumulated polynomial ciphertext:
-    /// an encryption of the constant polynomial `1`, padded with encrypted `0`s
-    /// through the configured accumulated-polynomial degree.
     fn build_accum_ctext(&self, rng: &mut OsRng) -> EncryptedPoly {
         let mut coeffs = Vec::with_capacity(self.accum_degree + 1);
         coeffs.push(encrypt_one(rng, &self.pk));
@@ -442,15 +357,6 @@ impl Target {
         EncryptedPoly(coeffs)
     }
 
-    // ── Protocol round ────────────────────────────────────────────────────────
-
-    /// One complete round: verify proof, test match, produce next accumulated ciphertext.
-    ///
-    /// The accumulator always advances to the monitor's `next_accum`
-    /// (re-randomized locally) — advancement is no longer conditioned on
-    /// the membership test result.
-    ///
-    /// Returns `(next_accum, is_match)`.
     pub(crate) fn process_round(
         &mut self,
         rng: &mut OsRng,
@@ -468,7 +374,6 @@ impl Target {
             return Err("next_accum length mismatch".to_string());
         }
 
-        // T.1  Verify the Sigma-Bullet glue proof for encrypted evaluation.
         let round_proof = msg.round_proof.to_proof()?;
         sb::verify_round(
             &self.pc_gens,
@@ -487,17 +392,11 @@ impl Target {
         )
         .map_err(|e| format!("round proof invalid: {e}"))?;
 
-        // T.2  THTest[sk1]{0}{MPolyCtext}:
-        //      MPolyCtext was partially decrypted by the monitor (THDec[sk2]),
-        //      so it lives in THCtextSpace[pk1].  test_zero finishes the job.
-        //      Kept only for the match counter; no longer gates advancement.
         let is_match = test_zero(&self.sk1, &m_poly_ct);
         if is_match {
             self.state += 1;
         }
 
-        // T.3  Always advance to the monitor's next_accum, re-randomized
-        //      locally and kept without sending it back to the monitor.
         let (rerand_accum, _) = rerandomize_poly_with_witness(rng, &self.pk, &next_accum);
         if rerand_accum.0.len() != current_accum.0.len() {
             return Err("rerandomized accum length mismatch".to_string());
@@ -506,10 +405,6 @@ impl Target {
         Ok((rerand_accum, is_match))
     }
 
-    // ── TCP server ────────────────────────────────────────────────────────────
-
-    /// Bind to `addr`, accept one monitor, and run `rounds` protocol
-    /// interactions.  The target is the initiator of each round.
     pub fn run(&mut self, addr: &str, rounds: usize) -> io::Result<()> {
         let listener = TcpListener::bind(addr)?;
         eprintln!("[Target] Listening on {addr}");
@@ -521,8 +416,6 @@ impl Target {
     fn handle(&mut self, mut s: TcpStream, rounds: usize) -> io::Result<()> {
         let mut rng = OsRng;
 
-        // Build the (unchanging) encrypted T-polynomial and the initial
-        // accumulator ciphertext once, up front.
         let t_deploy = std::time::Instant::now();
         let current = self.build_poly_ctext(&mut rng);
         let mut deploy_ms = None;
@@ -536,8 +429,6 @@ impl Target {
         for round in 1..=rounds {
             eprintln!("[Target] Round {round}/{rounds}");
 
-            // Kick off the round: send the T-polynomial and the current
-            // (already re-randomized) accumulator to the monitor.
             let outgoing = TargetToMonitor {
                 t_poly_ct: WireEncryptedPoly::from_native(&current),
                 accum: WireEncryptedPoly::from_native(&current_accum),
@@ -552,7 +443,6 @@ impl Target {
                 deploy_ms = Some(t_deploy.elapsed().as_secs_f64() * 1000.0);
             }
 
-            // Wait for the monitor's full reply (messages + proof).
             let msg: MonitorToTarget = match recv_msg(&mut s) {
                 Ok(m) => m,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -606,21 +496,17 @@ impl Target {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crypto::elgamal::generate_key_share;
     use crate::crypto::elgamal::{ct_add, ct_scalar_mul, eval_poly, poly_scalar_mul};
 
-    /// Verify that `poly_from_roots` evaluates to zero at each root.
     #[test]
     fn test_poly_roots_eval_zero() {
         let roots = [Scalar::from(2u64), Scalar::from(5u64), Scalar::from(11u64)];
         let coeffs = poly_from_roots(&roots);
         for r in &roots {
-            // Horner evaluation.
             let mut val = *coeffs.last().unwrap();
             for c in coeffs[..coeffs.len() - 1].iter().rev() {
                 val = val * r + c;
@@ -629,7 +515,6 @@ mod tests {
         }
     }
 
-    /// End-to-end test of one matched round using in-process crypto.
     #[test]
     fn test_process_round_match() {
         use crate::crypto::elgamal::partial_decrypt_with_witness;
@@ -645,7 +530,6 @@ mod tests {
         let poly_ct = target.build_poly_ctext(&mut rng);
         let accum_ct = target.build_accum_ctext(&mut rng);
 
-        // Monitor side: MElmt = 7 (is a root).
         let m = Scalar::from(7u64);
         let next_accum = poly_scalar_mul(&accum_ct, &m);
         let accum_eval = eval_poly(&accum_ct, &m);
@@ -713,7 +597,6 @@ mod tests {
         );
     }
 
-    /// Non-match round: state stays at 0.
     #[test]
     fn test_process_round_no_match() {
         use crate::crypto::elgamal::partial_decrypt_with_witness;
@@ -729,7 +612,6 @@ mod tests {
         let poly_ct = target.build_poly_ctext(&mut rng);
         let accum_ct = target.build_accum_ctext(&mut rng);
 
-        // MElmt = 99 (NOT a root).
         let m = Scalar::from(99u64);
         let mask = Scalar::from(5u64);
         let next_accum = poly_scalar_mul(&accum_ct, &m);

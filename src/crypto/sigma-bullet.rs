@@ -1,16 +1,3 @@
-//! Sigma-Bullet "glue" proof for encrypted polynomial evaluation.
-//!
-//! Statement proved:
-//!   C* = sum_{i=0}^d e_i * C_i + Enc_pk(0; r)
-//! with hidden witnesses (alpha, r, e_0..e_d) such that:
-//!   e_0 = r,  e_{i+1} = e_i * alpha,  r != 0.
-//!
-//! The proof has two layers:
-//! 1) Bulletproof R1CS (`chain_proof`) over commitments to [e_d..e_0], proving
-//!    the geometric chain and non-zero seed.
-//! 2) Schnorr-style glue proof (`glue`) showing the same committed e_i values
-//!    satisfy the ciphertext relation above.
-
 use bulletproofs::{
     r1cs::{LinearCombination, Prover, R1CSError, Variable},
     BulletproofGens, PedersenGens,
@@ -28,35 +15,20 @@ use crate::crypto::bulletproof as bp;
 use crate::crypto::elgamal::{Ciphertext, PublicKey};
 use crate::crypto::sigma::{self, PolyScalarMulProof};
 
-/// Schnorr glue proof binding committed `e_i` values to the ciphertext relation.
 #[derive(Clone, Debug)]
 pub struct GlueProof {
-    /// Public tag binding the hidden alpha across proofs: `alpha_tag = alpha * G`.
     pub alpha_tag: CompressedRistretto,
-    /// Single batched Sigma-Bullet nonce commitment.
     pub a_t: CompressedRistretto,
-    /// Responses for e_i witnesses.
     pub z_e: Vec<Scalar>,
-    /// Response for alpha witness: `z_alpha = k_alpha + c * alpha`.
     pub z_alpha: Scalar,
-    /// Response for y-commitment blinding: `z_y_blind = k_y + c * blind_y`.
     pub z_y_blind: Scalar,
 }
 
-/// Hybrid proof output: arithmetic Bulletproof + Sigma glue.
 pub struct SigmaBulletProof {
     pub chain_proof: bp::EvalChainProof,
     pub glue: GlueProof,
 }
 
-/// Full round proof: arithmetic Bulletproof layer plus batched Schnorr
-/// relations for:
-/// 1. `t_poly_ct` evaluation glue,
-/// 2. partial decryption of the masked `t_poly_ct` evaluation,
-/// 3. `accum` evaluation glue under an independent non-zero mask,
-/// 4. partial decryption of the masked `accum` evaluation,
-/// 5. `next_accum = y · accum`,
-/// all sharing one Fiat-Shamir challenge and one `alpha_tag = y·G`.
 pub struct CombinedSigmaProof {
     pub chain_proof: bp::EvalChainProof,
     pub alpha_tag: CompressedRistretto,
@@ -81,11 +53,6 @@ pub struct CombinedSigmaProof {
     pub accum_mul_s_y: Scalar,
 }
 
-/// Accumulator-independent part of a full monitor-round proof.
-///
-/// This contains every commitment that can be built before the accumulator is
-/// available. The Fiat-Shamir challenge is deliberately deferred because it
-/// binds both these commitments and the accumulator-dependent relations.
 pub(crate) struct RoundProofPrecomputation {
     chain_proof: bp::EvalChainProof,
     e_asc: Vec<Scalar>,
@@ -464,8 +431,6 @@ fn combined_challenge(
     )
 }
 
-/// Recompute the shared Fiat-Shamir challenge and per-relation batching
-/// scalars for a full combined round proof from public inputs only.
 #[allow(clippy::too_many_arguments)]
 pub fn round_challenge_and_batch_scalars(
     pk: &PublicKey,
@@ -552,7 +517,6 @@ pub(crate) fn relation_scalars(
     (beta_y, beta_c1, beta_c2)
 }
 
-/// Build Bulletproof chain proof while retaining e-commitment blindings for glue.
 pub(crate) fn prove_chain_with_openings<R: CryptoRng + RngCore>(
     rng: &mut R,
     pc_gens: &PedersenGens,
@@ -596,7 +560,6 @@ pub(crate) fn prove_chain_with_openings<R: CryptoRng + RngCore>(
     ))
 }
 
-/// Prove the Sigma-Bullet glue statement for ciphertext relation consistency.
 pub fn prove(
     pc_gens: &PedersenGens,
     bp_gens: &BulletproofGens,
@@ -608,14 +571,12 @@ pub fn prove(
 ) -> Result<SigmaBulletProof, R1CSError> {
     assert!(!coeff_cts.is_empty(), "coeff_cts must not be empty");
 
-    // Build e_i chain in ascending order: e_0=r, e_{i+1}=e_i*alpha.
     let mut e_asc = Vec::with_capacity(coeff_cts.len());
     e_asc.push(r);
     for i in 1..coeff_cts.len() {
         e_asc.push(e_asc[i - 1] * alpha);
     }
 
-    // Bulletproof gadget expects [e_d..e_0] so its non-zero check is on e_0=r.
     let e_rev: Vec<Scalar> = e_asc.iter().cloned().rev().collect();
 
     let mut rng = thread_rng();
@@ -625,7 +586,6 @@ pub fn prove(
     let mut t = glue_transcript(&chain_proof, pk, coeff_cts, c_star);
     let (beta_y, beta_c1, beta_c2) = relation_scalars(&chain_proof, pk, coeff_cts, c_star);
 
-    // One nonce per witness e_i.
     let mut k_e = Vec::with_capacity(e_asc.len());
     for _ in 0..e_asc.len() {
         let ke = Scalar::random(&mut rng);
@@ -644,10 +604,14 @@ pub fn prove(
     scalars.push(beta_y * k_y_blind);
     points.push(pc_gens.B_blinding);
     for (idx, (ke, ct)) in k_e.iter().zip(coeff_cts.iter()).enumerate() {
-        let mut basis = beta_c1 * ct.c1 + beta_c2 * ct.c2;
-        if idx == 0 {
-            basis = basis + beta_c1 * G + beta_c2 * pk.0;
-        }
+        let basis = if idx == 0 {
+            RistrettoPoint::vartime_multiscalar_mul(
+                [beta_c1, beta_c2, beta_c1, beta_c2],
+                [ct.c1, ct.c2, G, pk.0],
+            )
+        } else {
+            RistrettoPoint::vartime_multiscalar_mul([beta_c1, beta_c2], [ct.c1, ct.c2])
+        };
         scalars.push(*ke);
         points.push(basis);
     }
@@ -677,8 +641,6 @@ pub fn prove(
     })
 }
 
-/// Prove the full monitor round with one shared Fiat-Shamir challenge across
-/// Sigma-Bullet glue, two partial-decrypt relations, and `accum` scalar multiplication.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
     rng: &mut R,
@@ -724,10 +686,14 @@ pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
     scalars.push(beta_y * k_y_blind);
     points.push(pc_gens.B_blinding);
     for (idx, (ke, ct)) in k_e.iter().zip(coeff_cts.iter()).enumerate() {
-        let mut basis = beta_c1 * ct.c1 + beta_c2 * ct.c2;
-        if idx == 0 {
-            basis = basis + beta_c1 * G + beta_c2 * pk.0;
-        }
+        let basis = if idx == 0 {
+            RistrettoPoint::vartime_multiscalar_mul(
+                [beta_c1, beta_c2, beta_c1, beta_c2],
+                [ct.c1, ct.c2, G, pk.0],
+            )
+        } else {
+            RistrettoPoint::vartime_multiscalar_mul([beta_c1, beta_c2], [ct.c1, ct.c2])
+        };
         scalars.push(*ke);
         points.push(basis);
     }
@@ -739,9 +705,9 @@ pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
     let k_sk2 = Scalar::random(rng);
     let k_r_prime = Scalar::random(rng);
     let beta_g = mul_g(&beta_pd);
-    let partial_a = (mul_g(&k_sk2) - k_sk2 * (gamma_pd * c_star.c1)
-        + k_r_prime * (gamma_pd * (pk1.0 + beta_g)))
-        .compress();
+    let gamma_c1 = RistrettoPoint::vartime_multiscalar_mul([gamma_pd], [c_star.c1]);
+    let gamma_rhs = RistrettoPoint::vartime_multiscalar_mul([gamma_pd], [pk1.0 + beta_g]);
+    let partial_a = (mul_g(&k_sk2) - k_sk2 * gamma_c1 + k_r_prime * gamma_rhs).compress();
     let transcript = combined_transcript_prefix(
         pk,
         coeff_cts,
@@ -781,10 +747,6 @@ pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
     })
 }
 
-/// Complete a monitor-round proof after the accumulator becomes available.
-///
-/// The shared random-oracle challenge is generated here, after all accumulator
-/// statements and nonce commitments have been added to the transcript.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_round_proof<R: CryptoRng + RngCore>(
     rng: &mut R,
@@ -845,10 +807,17 @@ pub(crate) fn finish_round_proof<R: CryptoRng + RngCore>(
     accum_glue_scalars.push(beta_accum_y * k_accum_y_blind);
     accum_glue_points.push(pc_gens.B_blinding);
     for (idx, (k, ct)) in k_accum_e.iter().zip(accum_in.0.iter()).enumerate() {
-        let mut basis = beta_accum_c1 * ct.c1 + beta_accum_c2 * ct.c2;
-        if idx == 0 {
-            basis += beta_accum_c1 * G + beta_accum_c2 * pk.0;
-        }
+        let basis = if idx == 0 {
+            RistrettoPoint::vartime_multiscalar_mul(
+                [beta_accum_c1, beta_accum_c2, beta_accum_c1, beta_accum_c2],
+                [ct.c1, ct.c2, G, pk.0],
+            )
+        } else {
+            RistrettoPoint::vartime_multiscalar_mul(
+                [beta_accum_c1, beta_accum_c2],
+                [ct.c1, ct.c2],
+            )
+        };
         accum_glue_scalars.push(*k);
         accum_glue_points.push(basis);
     }
@@ -863,12 +832,16 @@ pub(crate) fn finish_round_proof<R: CryptoRng + RngCore>(
     let k_accum_sk2 = Scalar::random(rng);
     let k_accum_r_prime = Scalar::random(rng);
     let accum_beta_g = mul_g(&beta_accum_pd);
-    let accum_partial_a = (mul_g(&k_accum_sk2) - k_accum_sk2 * (gamma_accum_pd * accum_c_star.c1)
-        + k_accum_r_prime * (gamma_accum_pd * (pk1.0 + accum_beta_g)))
+    let accum_gamma_c1 =
+        RistrettoPoint::vartime_multiscalar_mul([gamma_accum_pd], [accum_c_star.c1]);
+    let accum_gamma_rhs =
+        RistrettoPoint::vartime_multiscalar_mul([gamma_accum_pd], [pk1.0 + accum_beta_g]);
+    let accum_partial_a = (mul_g(&k_accum_sk2) - k_accum_sk2 * accum_gamma_c1
+        + k_accum_r_prime * accum_gamma_rhs)
         .compress();
 
-    let (accum_x_c1, accum_x_c2, _accum_y_c1, _accum_y_c2, _) =
-        sigma::poly_scalar_mul_relation_points(accum_in, accum_out, &alpha_tag_pt);
+    let (accum_x_c1, accum_x_c2) =
+        sigma::poly_scalar_mul_x_points(accum_in, accum_out, &alpha_tag_pt);
     let k_accum_mul_y = Scalar::random(rng);
     let accum_mul_a1 = (k_accum_mul_y * accum_x_c1).compress();
     let accum_mul_a2 = (k_accum_mul_y * accum_x_c2).compress();
@@ -884,8 +857,6 @@ pub(crate) fn finish_round_proof<R: CryptoRng + RngCore>(
         sigma::poly_scalar_mul_batch_scalars(&accum_mul_temp, accum_in, accum_out, &alpha_tag_pt)
             .map_err(|_| R1CSError::FormatError)?;
 
-    // The accumulator evaluation is bound to the same hidden `alpha` through
-    // the shared alpha tag and challenge.
     append_glue_section(
         &mut transcript,
         b"accum_sigma_bullet_glue",
@@ -955,11 +926,6 @@ pub(crate) fn finish_round_proof<R: CryptoRng + RngCore>(
     })
 }
 
-/// Prove a complete monitor round sequentially.
-///
-/// This compatibility wrapper preserves the original all-at-once behavior;
-/// callers that receive the accumulator later can invoke
-/// [`preprocess_round_proof`] and [`finish_round_proof`] separately.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_round<R: CryptoRng + RngCore>(
     rng: &mut R,
@@ -1014,7 +980,6 @@ pub fn prove_round<R: CryptoRng + RngCore>(
     )
 }
 
-/// Verify Sigma-Bullet glue proof.
 pub fn verify(
     pc_gens: &PedersenGens,
     bp_gens: &BulletproofGens,
@@ -1027,7 +992,6 @@ pub fn verify(
         return Err("coeff_cts must not be empty".to_string());
     }
 
-    // 1) Verify arithmetic chain/non-zero Bulletproof layer.
     bp::verify(pc_gens, bp_gens, &proof.chain_proof)
         .map_err(|e| format!("chain Bulletproof invalid: {e:?}"))?;
 
@@ -1093,7 +1057,6 @@ pub fn verify(
     Ok(())
 }
 
-/// Verify the full monitor round proof under one shared Fiat-Shamir challenge.
 #[allow(clippy::too_many_arguments)]
 pub fn verify_round(
     pc_gens: &PedersenGens,
@@ -1331,7 +1294,6 @@ pub fn verify_round(
     Ok(())
 }
 
-/// Helper for tests: deterministic Enc_pk(0; r).
 #[cfg(test)]
 fn enc_zero_with_r(pk: &PublicKey, r: Scalar) -> Ciphertext {
     Ciphertext {
@@ -1340,7 +1302,6 @@ fn enc_zero_with_r(pk: &PublicKey, r: Scalar) -> Ciphertext {
     }
 }
 
-/// Helper for tests/examples: homomorphic sum_i (e_i * C_i).
 #[cfg(test)]
 fn weighted_sum(coeff_cts: &[Ciphertext], e_asc: &[Scalar]) -> Ciphertext {
     let mut c1 = RistrettoPoint::identity();
@@ -1481,8 +1442,6 @@ mod tests {
             c1: correct_accum_scaled.c1 + G,
             c2: correct_accum_scaled.c2,
         };
-        // The partial-decryption statement remains valid for this arbitrary
-        // ciphertext; only the new accumulator-evaluation glue must reject it.
         let (false_accum_partial, accum_r_prime) =
             partial_decrypt_with_witness(&mut rng, &sk2, &pk1, &false_accum_scaled);
 

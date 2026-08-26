@@ -15,14 +15,12 @@ use serde::{Deserialize, Serialize};
 use crate::bf::bloom::{hash_params, scalar_positions, BloomFilterConfig};
 use crate::crypto::bulletproof as bp;
 use crate::crypto::elgamal::{
-    ct_add, ct_scalar_mul, Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare,
+    Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare,
 };
 use crate::crypto::sigma::{self, PolyScalarMulProof};
 use crate::crypto::sigma_bullet;
 
 pub(crate) struct AggregateEvalWitness {
-    /// One additional non-zero mask per encrypted evaluation term:
-    /// `term_masks[j] = H(y, j)`.
     pub term_masks: Vec<Scalar>,
     pub e_vals: Vec<Scalar>,
     pub scaled_eval: Ciphertext,
@@ -32,10 +30,7 @@ pub(crate) struct AggregateEvalWitness {
 struct EvalSumProof {
     proof: R1CSProof,
     e_comms: Vec<CompressedRistretto>,
-    /// Commitments to the per-term masks `μ_j = H(y, j)`.
     mask_comms: Vec<CompressedRistretto>,
-    /// Commitments to `μ_j⁻¹`; these make every term mask non-zero in the
-    /// R1CS statement.
     inv_mask_comms: Vec<CompressedRistretto>,
     y_comm: CompressedRistretto,
     r_comm: CompressedRistretto,
@@ -64,9 +59,6 @@ pub struct WireAccumEvalProof {
 struct CombinedSigmaProof {
     eval_proof: EvalSumProof,
     alpha_tag: CompressedRistretto,
-    /// Shared-challenge Sigma bridge for every Bulletproof mask commitment.
-    /// It proves that the committed mask is the scalar exponent of
-    /// `H(y, j)·G`, where `y·G = alpha_tag`.
     mask_a_tags: Vec<CompressedRistretto>,
     mask_a_comms: Vec<CompressedRistretto>,
     mask_z: Vec<Scalar>,
@@ -92,11 +84,6 @@ struct CombinedSigmaProof {
     accum_mul_s_y: Scalar,
 }
 
-/// Accumulator-independent part of a full Bloom-filter monitor proof.
-///
-/// The proof commitments are prepared here, while the shared Fiat-Shamir
-/// challenge and all responses remain deferred until the accumulator-bound
-/// statements are known.
 pub(crate) struct RoundProofPrecomputation {
     eval_proof: EvalSumProof,
     y_blind: Scalar,
@@ -232,10 +219,6 @@ fn eval_sum_relation_gadget<CS: ConstraintSystem>(
         });
     }
 
-    // L9(a): commit to every additional L6 mask and prove that it is the
-    // corresponding Bloom hash: μ_j = H(y, j).  The public hash family is
-    // affine here, so this is a linear R1CS constraint.  Each μ_j is also
-    // proved non-zero to preserve the zero-test semantics of every term.
     for (hash_index, (&mask_var, &inv_mask_var)) in
         mask_vars.iter().zip(inv_mask_vars.iter()).enumerate()
     {
@@ -250,10 +233,6 @@ fn eval_sum_relation_gadget<CS: ConstraintSystem>(
         cs.constrain(LinearCombination::from(mask_nonzero) - Scalar::one());
     }
 
-    // L9(b): link every per-term mask directly to the witness vector used by
-    // the Sigma-Bullet ciphertext bridge.  For each encrypted evaluation term
-    // j, its effective coefficient is r·μ_j·μ_j^d.  Summing those witnesses
-    // yields e_d, the coefficient of encrypted polynomial term C_d.
     let mut expected_e = vec![LinearCombination::default(); e_vars.len()];
     let witness_len = expected_e.len();
     for &mask_var in mask_vars {
@@ -345,8 +324,6 @@ fn prove_eval_sum_with_openings<R: CryptoRng + RngCore>(
         mask_vars.push(var);
         mask_blinds.push(blind);
     }
-    // Keep commitment order identical to the verifier: all μ_j commitments,
-    // then all μ_j⁻¹ commitments.
     for &mask in term_masks {
         let (inv_comm, inv_var) = prover.commit(mask.invert(), Scalar::random(rng));
         inv_mask_comms.push(inv_comm);
@@ -456,26 +433,6 @@ fn eval_witnesses_from_positions(
     sums.into_iter().map(|sum| r * sum).collect()
 }
 
-fn weighted_ciphertext_sum(
-    coeff_cts: &[Ciphertext],
-    weights: &[Scalar],
-) -> Result<Ciphertext, String> {
-    if coeff_cts.is_empty() {
-        return Err("coeff_cts must not be empty".to_string());
-    }
-    if coeff_cts.len() != weights.len() {
-        return Err("ciphertext/weight length mismatch".to_string());
-    }
-
-    let init = ct_scalar_mul(&coeff_cts[0], &weights[0]);
-    Ok(coeff_cts[1..]
-        .iter()
-        .zip(weights[1..].iter())
-        .fold(init, |acc, (ct, weight)| {
-            ct_add(&acc, &ct_scalar_mul(ct, weight))
-        }))
-}
-
 pub(crate) fn build_aggregate_eval_witness(
     poly: &EncryptedPoly,
     y: Scalar,
@@ -487,46 +444,30 @@ pub(crate) fn build_aggregate_eval_witness(
     if positions.is_empty() {
         return Err("position set must be non-empty".to_string());
     }
+    if poly.0.is_empty() {
+        return Err("coeff_cts must not be empty".to_string());
+    }
 
     if eval_mask == Scalar::zero() {
         return Err("outer evaluation mask must be non-zero".to_string());
     }
 
-    // L6: each encrypted evaluation term receives its own additional mask
-    // μ_j = H(y, j).  We retain the existing random outer blind r, so the
-    // effective non-zero term mask is r·μ_j.  The aggregate ciphertext below
-    // is exactly Σ_j (r·μ_j·Eval(T, μ_j) + Enc_pk(0; r·μ_j)).
     let term_masks = positions.clone();
     if term_masks.iter().any(|mask| *mask == Scalar::zero()) {
         return Err("Bloom hash produced a zero per-term mask".to_string());
     }
 
     let e_vals = eval_witnesses_from_positions(poly.0.len(), &positions, &term_masks, eval_mask);
-    let mut scaled_eval: Option<Ciphertext> = None;
-    for (&position, &term_mask) in positions.iter().zip(term_masks.iter()) {
-        let mut weights = Vec::with_capacity(poly.0.len());
-        let mut power = Scalar::one();
-        let effective_mask = eval_mask * term_mask;
-        for _ in 0..poly.0.len() {
-            weights.push(effective_mask * power);
-            power *= position;
-        }
-        let masked_term = ct_add(
-            &weighted_ciphertext_sum(&poly.0, &weights)?,
-            &Ciphertext {
-                c1: &effective_mask * &RISTRETTO_BASEPOINT_TABLE,
-                c2: effective_mask * pk.0,
-            },
-        );
-        scaled_eval = Some(match scaled_eval {
-            Some(acc) => ct_add(&acc, &masked_term),
-            None => masked_term,
-        });
-    }
+
+    let c1 = RistrettoPoint::multiscalar_mul(e_vals.iter().copied(), poly.0.iter().map(|ct| ct.c1))
+        + &e_vals[0] * &RISTRETTO_BASEPOINT_TABLE;
+    let c2 = RistrettoPoint::multiscalar_mul(e_vals.iter().copied(), poly.0.iter().map(|ct| ct.c2))
+        + e_vals[0] * pk.0;
+
     Ok(AggregateEvalWitness {
         term_masks,
         e_vals,
-        scaled_eval: scaled_eval.expect("non-empty position set checked above"),
+        scaled_eval: Ciphertext { c1, c2 },
     })
 }
 
@@ -611,10 +552,6 @@ fn append_glue_section(
     append_compressed(t, b"A_t", glue_a_t);
 }
 
-/// Append the Sigma side of the per-term-mask bridge.  `alpha_tag = y·G` is
-/// already part of the aggregate Sigma-Bullet statement.  For every mask
-/// commitment M_j this section binds its exponent to
-/// `H(y, j)·G = slope_j·alpha_tag + intercept_j·G` under the same challenge.
 fn append_mask_bridge_section(
     t: &mut Transcript,
     eval_proof: &EvalSumProof,
@@ -1234,10 +1171,6 @@ pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
     let alpha_tag_pt = mul_g(&y);
     let alpha_tag = alpha_tag_pt.compress();
 
-    // The Sigma part of L9 proves the exponent of every committed μ_j and
-    // uses the same challenge as the aggregate Sigma-Bullet bridge.  Together
-    // with the R1CS relation, this prevents substituting a mask after the
-    // ciphertext witness vector has been formed.
     let mut mask_k = Vec::with_capacity(term_masks.len());
     let mut mask_k_blind = Vec::with_capacity(term_masks.len());
     let mut mask_a_tags = Vec::with_capacity(term_masks.len());
@@ -1265,12 +1198,14 @@ pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
     points.push(pc_gens.B_blinding);
     for (idx, (k, ct)) in k_e.iter().zip(t_poly.0.iter()).enumerate() {
         scalars.push(*k);
-        let mut basis = beta_c1 * ct.c1 + beta_c2 * ct.c2;
-        if idx == 0 {
-            // Σ_j Enc(0; r·μ_j) = Enc(0; e_0), so the encrypted-zero
-            // correction is bound to the same e_0 witness.
-            basis += beta_c1 * G + beta_c2 * pk.0;
-        }
+        let basis = if idx == 0 {
+            RistrettoPoint::vartime_multiscalar_mul(
+                [beta_c1, beta_c2, beta_c1, beta_c2],
+                [ct.c1, ct.c2, G, pk.0],
+            )
+        } else {
+            RistrettoPoint::vartime_multiscalar_mul([beta_c1, beta_c2], [ct.c1, ct.c2])
+        };
         points.push(basis);
     }
     let glue_a_t =
@@ -1281,9 +1216,9 @@ pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
     let (beta_pd, gamma_pd) =
         sigma::partial_decrypt_relation_scalars(pk2, pk1, scaled_eval, m_poly_ct);
     let beta_g = mul_g(&beta_pd);
-    let partial_a = (mul_g(&k_sk2) - k_sk2 * (gamma_pd * scaled_eval.c1)
-        + k_r_prime * (gamma_pd * (pk1.0 + beta_g)))
-        .compress();
+    let gamma_c1 = RistrettoPoint::vartime_multiscalar_mul([gamma_pd], [scaled_eval.c1]);
+    let gamma_rhs = RistrettoPoint::vartime_multiscalar_mul([gamma_pd], [pk1.0 + beta_g]);
+    let partial_a = (mul_g(&k_sk2) - k_sk2 * gamma_c1 + k_r_prime * gamma_rhs).compress();
     let transcript = combined_transcript_prefix(
         pk,
         &t_poly.0,
@@ -1331,7 +1266,6 @@ pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
     })
 }
 
-/// Complete a preprocessed Bloom-filter proof once the accumulator arrives.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_round_proof<R: CryptoRng + RngCore>(
     rng: &mut R,
@@ -1399,10 +1333,17 @@ pub(crate) fn finish_round_proof<R: CryptoRng + RngCore>(
     accum_glue_scalars.push(beta_accum_y * k_accum_y_blind);
     accum_glue_points.push(pc_gens.B_blinding);
     for (idx, (k, ct)) in k_accum_e.iter().zip(accum_in.0.iter()).enumerate() {
-        let mut basis = beta_accum_c1 * ct.c1 + beta_accum_c2 * ct.c2;
-        if idx == 0 {
-            basis += beta_accum_c1 * G + beta_accum_c2 * pk.0;
-        }
+        let basis = if idx == 0 {
+            RistrettoPoint::vartime_multiscalar_mul(
+                [beta_accum_c1, beta_accum_c2, beta_accum_c1, beta_accum_c2],
+                [ct.c1, ct.c2, G, pk.0],
+            )
+        } else {
+            RistrettoPoint::vartime_multiscalar_mul(
+                [beta_accum_c1, beta_accum_c2],
+                [ct.c1, ct.c2],
+            )
+        };
         accum_glue_scalars.push(*k);
         accum_glue_points.push(basis);
     }
@@ -1417,13 +1358,16 @@ pub(crate) fn finish_round_proof<R: CryptoRng + RngCore>(
     let (beta_accum_pd, gamma_accum_pd) =
         sigma::partial_decrypt_relation_scalars(pk2, pk1, accum_scaled_eval, accum_m_poly_ct);
     let accum_beta_g = mul_g(&beta_accum_pd);
-    let accum_partial_a = (mul_g(&k_accum_sk2)
-        - k_accum_sk2 * (gamma_accum_pd * accum_scaled_eval.c1)
-        + k_accum_r_prime * (gamma_accum_pd * (pk1.0 + accum_beta_g)))
+    let accum_gamma_c1 =
+        RistrettoPoint::vartime_multiscalar_mul([gamma_accum_pd], [accum_scaled_eval.c1]);
+    let accum_gamma_rhs =
+        RistrettoPoint::vartime_multiscalar_mul([gamma_accum_pd], [pk1.0 + accum_beta_g]);
+    let accum_partial_a = (mul_g(&k_accum_sk2) - k_accum_sk2 * accum_gamma_c1
+        + k_accum_r_prime * accum_gamma_rhs)
         .compress();
 
-    let (accum_x_c1, accum_x_c2, _accum_y_c1, _accum_y_c2, _) =
-        sigma::poly_scalar_mul_relation_points(accum_in, next_accum, &alpha_tag_pt);
+    let (accum_x_c1, accum_x_c2) =
+        sigma::poly_scalar_mul_x_points(accum_in, next_accum, &alpha_tag_pt);
     let k_accum_mul_y = Scalar::random(rng);
     let accum_mul_a1 = (k_accum_mul_y * accum_x_c1).compress();
     let accum_mul_a2 = (k_accum_mul_y * accum_x_c2).compress();
@@ -1530,10 +1474,6 @@ pub(crate) fn finish_round_proof<R: CryptoRng + RngCore>(
     ))
 }
 
-/// Prove a complete Bloom-filter monitor round sequentially.
-///
-/// This retains the original all-at-once API while allowing the monitor to
-/// time or schedule the accumulator-independent prefix separately.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_round<R: CryptoRng + RngCore>(
     rng: &mut R,
@@ -1760,10 +1700,6 @@ pub fn verify_round(
     scalars.push(-batch.rho_glue * batch.challenge * batch.beta_c2);
     points.push(scaled_eval.c2);
 
-    // Sigma exponent and Pedersen-opening bridge for each L6 mask.  The
-    // expected tag is derived from the shared y tag, so every response is
-    // tied both to μ_j = H(y, j) and to the committed witness used by the
-    // Bulletproof/e-vector relation above.
     for (hash_index, (((&z, &z_blind), a_tag), (a_comm, mask_comm))) in proof
         .mask_z
         .iter()
@@ -1892,7 +1828,7 @@ pub fn verify_round(
 mod tests {
     use super::*;
     use crate::crypto::elgamal::{
-        combine_public_keys, encrypt_poly, eval_poly, generate_key_share,
+        combine_public_keys, ct_add, ct_scalar_mul, encrypt_poly, eval_poly, generate_key_share,
         partial_decrypt_with_witness, poly_scalar_mul,
     };
     use rand::rngs::OsRng;
