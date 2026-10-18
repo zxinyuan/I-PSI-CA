@@ -1,0 +1,12 @@
+{
+  "n": 95935,
+  "trials": 5,
+  "seed": 1,
+  "exit_code": 0,
+  "results": [
+    "mode=elgamal roots=95935 degree=95935 coeffs=95936 N=NA logN=NA ciphertexts=95936 latency_ms=17303.307 threshold_decrypt_ms=25261.486 ciphertext_kb=5996.000 verify=PASS",
+    "mode=rlwe roots=95935 degree=95935 coeffs=95936 N=131072 logN=17 ciphertexts=1 latency_ms=18.300 threshold_decrypt_ms=27.054 ciphertext_kb=2048.311 verify=PASS",
+    "mode=bfv roots=95935 degree=95935 coeffs=95936 N=131072 logN=17 ciphertexts=1 latency_ms=18.181 threshold_decrypt_ms=16.129 ciphertext_kb=2048.311 verify=PASS"
+  ],
+  "stderr": ""
+}

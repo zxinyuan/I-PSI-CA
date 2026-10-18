@@ -1,121 +1,232 @@
 # i-psi-ca
 
-A Rust implementation of an interactive private-set-intersection-cardinality (I-PSI-CA) protocol between two roles, **Scribe** and **Lookout**, built on threshold ElGamal encryption over Ristretto255 and Bulletproofs R1CS zero-knowledge proofs.
+A Rust research prototype for interactive private-set-intersection cardinality,
+using two-party threshold ElGamal over Ristretto255, Bulletproof R1CS, and Sigma
+proofs. The **Scribe / Target** holds the private set; the **Lookout / Monitor**
+holds a query. The target verifies the monitor's proof and tests for a match.
 
-The Scribe holds a private set and outsources an encrypted encoding of it to the Lookout. The Lookout holds a private query element, homomorphically evaluates it against the Scribe's encrypted set, and returns a partially-decrypted result together with a zero-knowledge proof that the evaluation was computed correctly. The Scribe verifies the proof and locally learns only whether the query matched — the Lookout never learns the Scribe's set, and the Scribe never learns the Lookout's query.
-
-Two matching variants are implemented, selected via the CLI:
-
-| Variant | Match rule | Set encoding |
+| Variant | Encoding and match rule | State update |
 |---|---|---|
-| `exact` | Query equals a set element | Roots of an encrypted polynomial over the set elements |
-| `bf` | Query hashes (via `k` hash functions) to positions that are all marked in a Bloom filter | Roots of an encrypted polynomial over *every* Bloom-filter position |
+| `exact` | Encrypted polynomial with set elements as roots; query equals a root | Remove one occurrence of a matching query by verified polynomial division |
+| `bf` | Encrypted polynomial over Bloom-filter positions; query hashes to marked positions | Existing accumulator protocol |
 
-Both variants share the same round structure: an accumulator polynomial is also evaluated and updated every round, letting the Scribe track a running match count across repeated rounds without the Lookout learning which round(s) matched.
-
-## Requirements
-
-- Rust and Cargo — this crate targets edition 2021 and was developed against `rustc 1.81.0`. Any reasonably recent stable toolchain should work; no nightly features are used.
-- No system dependencies beyond a standard Rust toolchain — all cryptography (curve arithmetic, Bulletproofs, ElGamal) is pure-Rust via crates.io (`curve25519-dalek-ng`, `bulletproofs`, `merlin`).
+**Exact does not construct, send, receive, or prove an accumulator.** Its optional
+`pok` mode adds an initial set-knowledge proof and subsequent CDS94 OR proofs.
+The monitor's joint evaluation/masking/partial-decryption/division proof is
+mandatory for exact interactions in both modes. See the
+[exact protocol guide](src/exact/README.md) for proof relations and assumptions.
 
 ## Build
 
+Requires Rust/Cargo (tested with Rust 1.81.0, edition 2021). Dependencies are Rust
+crates; no external cryptographic service or trusted setup ceremony is used.
+Run commands from the repository root:
+
 ```sh
-git clone <this-repo>
-cd i-psi-ca
 cargo build --release
 ```
 
-Always use `--release` when actually running a protocol round — the Bulletproofs R1CS proofs involved are computationally heavy, and a debug build is 10-50x slower.
+Use release builds for timing measurements. The binary starts both roles as
+threads in one process and connects them over TCP at `127.0.0.1:7878`. No separate
+server terminal is needed. Each invocation creates fresh inputs, key shares,
+proof randomness, and a session. Timings and costs are printed to stdout/stderr.
 
-## Run
+## Invoke exact with all parameters
 
-There is one binary. It spins up a Scribe (TCP server) and a Lookout (TCP client) as two threads in the same process, connected over `127.0.0.1:7878`, and drives one protocol round end to end, printing timing and network-traffic measurements to stdout/stderr.
+```text
+cargo run --release -- exact [degree] [in_set] --pok <true|false> --round1 <true|false>
+```
+
+The text in angle brackets denotes values to replace, not literal arguments.
+
+| Parameter | Accepted values | Default | Meaning |
+|---|---|---|---|
+| `degree` | Positive integer; use `1..4095` for proof/update flows | `1000` | Number of uniformly sampled private set elements; ciphertext length is `degree + 1` |
+| `in_set` | `true` or `false` | `true` | Select a query from the set, or sample an independent query expected not to match |
+| `--pok` | Explicit `true` or `false` | `false` | Enable the target's initial set PoK and subsequent OR proofs |
+| `--round1` | Explicit `true` or `false` | `true` | Select deployment-only measurement or a complete query/update interaction |
+
+Exact accepts only two positional values: `degree` and `in_set`. Put any supplied
+positionals before the flags. Both positionals may be omitted to use defaults;
+for example, `exact --pok true --round1 false` uses degree 1000 and `in_set=true`.
+There is no accumulator-size argument. The two named flags may appear in either
+order, and both require an explicit boolean value. Unknown flags, duplicate
+flags, and extra positional values are rejected.
+
+### Deployment: ciphertext plus initial PoK
 
 ```sh
-cargo run --release -- <protocol> [args...]
+cargo run --release -- exact 1000 true --pok true --round1 true
 ```
 
-`<protocol>` is one of `exact` or `bf`. If omitted, it defaults to `exact`. Each variant takes its own positional arguments, described below; any trailing argument can be omitted to fall back to its default.
+Computes and stores TPolyCtext and the initial proof, then uploads them for monitor
+verification. Reports:
 
-### `exact`
+- **Deployment Latency** in ms: polynomial construction, encryption, proof
+  generation, and local storage update. Networking and monitor verification are
+  excluded.
+- **Ciphertext Storage**, **Proof Storage**, and **Total Storage** in MB.
+- **Public Generator Cache** builds, setup time, and hits. Setup performed during
+  the measurement remains included in its latency.
 
-```
-cargo run --release -- exact [degree] [in_set] [accum_degree]
-```
+This phase performs no query or polynomial division. The final match count stays
+zero even if the executable's input summary prints `Expected = MATCH`.
 
-| Position | Meaning | Default |
-|---|---|---|
-| `degree` | Size of the Scribe's set `TSet` (count of uniformly random field elements) | `1000` |
-| `in_set` | `true`/`false` — whether the Lookout's query is drawn from `TSet` (match) or is an independent random element (no match) | `true` |
-| `accum_degree` | Degree of the accumulator polynomial carried across rounds | `5` |
-
-Examples:
+### Interaction: matching query and polynomial removal
 
 ```sh
-cargo run --release -- exact 1000 true      # degree 1000, expect a match
-cargo run --release -- exact 1000 false     # degree 1000, expect no match
-cargo run --release -- exact 1000 true 8    # accum_degree = 8
+cargo run --release -- exact 1000 true --pok true --round1 false
 ```
 
-### `bf` (Bloom filter)
+A fresh run prepares its initial ciphertext/PoK outside the interaction timer.
+The target sends that state, the monitor verifies it and returns the joint proof,
+and the target verifies the reply. The target then rerandomizes either the
+verified quotient on a match or the current polynomial on a nonmatch, generates
+the disjunction proof, and replaces its local ciphertext/proof storage. The final
+update is uploaded and verified by the monitor too.
 
+Reports:
+
+- **Interaction Latency** in ms, from target send through verification, update,
+  disjunction-proof generation, and local storage replacement.
+- **Monitor Send**, **Updated Ciphertext**, **Disjunction Proof**, and framed
+  **Target Update Send** sizes in MB.
+- **Monitor + Target Update Communication** for the recurring reply and update.
+- **Total Communication**, including the initial target upload on the first
+  interaction, plus generator-cache activity.
+
+The latency ends at the local storage update; the final update upload and the
+monitor's OR-proof verification occur afterward. `round1=false` does not load a
+previous process's state or bypass the initial proof.
+
+### Nonmatch and proof-disabled examples
+
+```sh
+# Independent random query, expected not to match
+cargo run --release -- exact 1000 false --pok true --round1 false
+
+# Same update flow, without the target initial/OR proofs
+cargo run --release -- exact 1000 true --pok false --round1 false
+
+# Deployment without a target PoK; reported proof storage is zero
+cargo run --release -- exact 1000 true --pok false --round1 true
+
+# All defaults: exact deployment, degree 1000, target PoK disabled
+cargo run --release -- exact
 ```
+
+With `pok=false`, monitor proofs are still generated and verified during
+interactions; target proof sizes are reported as zero. To run the built binary
+directly instead of through Cargo:
+
+```sh
+./target/release/i-psi-ca exact 1000 true --pok true --round1 false
+```
+
+All exact MB values are decimal: **1 MB = 1,000,000 bytes**. Exact byte counts are
+also printed. Storage counts canonical serialized ciphertext/proof payloads;
+communication also counts each message's 4-byte framing header. Session setup
+(108 bytes) is excluded from communication totals. Storage is in-memory protocol
+state, not a file on disk. See the [measurement details](src/exact/README.md#round1-and-measurement-boundaries)
+for exclusions and accounting across multiple interactions.
+
+The CLI runs one interaction when `round1=false`, or one deployment when true.
+There are no CLI options for a round count, address, port, key files, or JSON
+configuration. Library users can configure both roles with
+`ProtocolConfig { pok: true, round1: false }` and pass a round count to
+`run(addr, rounds)`. Repeated matches remove one occurrence at a time.
+
+## Bloom-filter variant
+
+```text
 cargo run --release -- bf [bloom_filter_size] [in_set] [accum_degree]
 ```
 
-| Position | Meaning | Default |
+| Parameter | Meaning | Default |
 |---|---|---|
-| `bloom_filter_size` (`n`) | Number of positions in the Bloom filter | `1000` |
-| `in_set` | `true`/`false` — whether the Lookout's query hashes to marked positions | `true` |
+| `bloom_filter_size` | Number of Bloom-filter positions | `1000` |
+| `in_set` | Whether the query hashes to marked positions | `true` |
 | `accum_degree` | Degree of the accumulator polynomial | `5` |
 
-The number of hash functions (`k = 20`) and the fraction of positions marked (`50%` of `bloom_filter_size`) are fixed internally, not CLI-configurable. Every position in the Bloom filter — marked or not — is encrypted into the Scribe's outsourced polynomial (`TPolyCtext`), so its size is always `bloom_filter_size + 1` ciphertexts regardless of how many positions are actually marked.
-
-Because the encrypted polynomial spans the entire filter, the underlying R1CS circuit has on the order of `k * (bloom_filter_size + 1)` multiplication gates — cost scales with `bloom_filter_size`, not with the marked-position count. Sizes above a few tens of thousands will take minutes per round; see the timing figures gathered in this repo's benchmarking notes for concrete numbers.
-
-Examples:
-
 ```sh
-cargo run --release -- bf 1000 true       # 1000 positions, expect a match
-cargo run --release -- bf 1000 false      # 1000 positions, expect no match
-cargo run --release -- bf 1000 true 8     # accum_degree = 8
+cargo run --release -- bf 1000 true 5
+cargo run --release -- bf 1000 false 5
 ```
 
-### Reading the output
+The number of hashes (`20`) and marked-position fraction (`50%`) are fixed by the
+executable. The polynomial spans every filter position, so it contains
+`bloom_filter_size + 1` ciphertexts. `pok` and `round1` are exact-only options.
+BF retains its existing timing/traffic output and accumulator behavior; the exact
+proof optimizations do not change BF or the shared legacy proof implementations.
 
-Each run prints, from both the Scribe's and Lookout's perspective:
-
-- **Deploy time** — Scribe's time to build and encrypt its outsourced polynomial (and the initial accumulator), up to the first send.
-- **Latency** — wall-clock time from the Scribe sending its round message to receiving the Lookout's full reply (network round trip + the Lookout's proof computation). This dominates total round time for larger inputs.
-- **Verification time** — Scribe's time to verify the Lookout's round proof.
-- **Network traffic** — bytes sent in each direction (Scribe→Lookout and Lookout→Scribe), reported in KB.
-- **match** — whether the Scribe's local zero-test on the (partially decrypted) result was zero, i.e., a genuine match.
-
-## Test
+## Tests and exact microbenchmarks
 
 ```sh
+cargo check
 cargo test --release
+cargo clippy --all-targets
+
+# Exact correctness tests only
+cargo test --release exact::
+
+# Opt-in release microbenchmark, 32 and 128 roots
+cargo test --release exact::benchmarks -- --ignored --nocapture --test-threads=1
+
+# Also measure 1000 roots
+EXACT_BENCH_LARGE=1 cargo test --release exact::benchmarks -- --ignored --nocapture --test-threads=1
 ```
 
-The release flag matters here too — several tests build real Bulletproofs and are painfully slow in debug mode. Both protocol variants have unit tests covering both the match and no-match cases, proof-rejection tests for tampered inputs, and standalone tests for the underlying primitives (`crypto/elgamal.rs`, `crypto/sigma.rs`, `crypto/sigma-bullet.rs`, `crypto/bulletproof.rs`).
+Tests include real proofs and loopback TCP sessions. The microbenchmark is
+ignored in ordinary test runs. It clears the public generator cache before each
+initial/monitor proof phase and identifies first-call setup versus warm repeats
+and verifiers. It measures proof operations, not end-to-end TCP latency. Library
+and runtime measurements also expose cache activity; cached objects contain only
+public generators, never secret witnesses, masks, or proof nonces.
+
+The optimized exact path uses a linear-size randomized initial R1CS circuit,
+constant-time prover multiscalar multiplication, public-scalar verifier MSM,
+shared public generators, compressed OR transcripts, and native ciphertext reuse.
+For 1000 roots, the OR proof is **64,148 bytes**, versus 192,292 bytes in the prior
+expanded representation; the framed ciphertext/OR update is **128,224 bytes**.
+Details and representative timings are in the [exact guide](src/exact/README.md#optimizations-and-representative-measurements).
+
+## Security and compatibility
+
+This is an unaudited research prototype using experimental Bulletproof R1CS
+support (`yoloproofs`). The exact proof/wire version is **v4**; peers reject
+mismatched versions, `pok`, or `round1` choices. Proofs bind the session, round,
+keys, statements, and commitments. Key provisioning is trusted by the application;
+the TCP transport does not authenticate peer identities.
+
+The initial proof establishes knowledge of a set underlying the deployment
+ciphertext, not equality to an externally registered set. The OR proof permits
+either authenticated candidate; it does not enforce the target's private
+match-dependent choice. The randomized initial identity check has an additional
+per-challenge error bound of `(degree - 1) / q` for degree at least 2, where `q`
+is the scalar-field order. The [exact guide](src/exact/README.md) describes these
+assumptions and the quotient-blinding requirement.
 
 ## Layout
 
-```
+```text
 src/
-  main.rs              CLI entry point; wires up Scribe + Lookout for a single demo round
-  lib.rs                crate root, re-exports the modules below
+  main.rs                  positional CLI and one-process demo runner
   crypto/
-    elgamal.rs          threshold ElGamal: key generation, encryption, homomorphic ops, partial decryption
-    bulletproof.rs       Bulletproofs-based polynomial evaluation-chain proof (used by the accumulator)
-    sigma.rs             Sigma-protocol proofs (partial decryption, poly-scalar-mul)
-    sigma-bullet.rs      the Sigma/Bulletproof "glue" proof binding a committed evaluation chain to a ciphertext
+    elgamal.rs             threshold ElGamal and polynomial operations
+    bulletproof.rs         shared legacy arithmetic gadgets
+    sigma.rs               shared legacy Sigma proofs
+    sigma-bullet.rs        shared legacy Sigma/Bulletproof composition
   exact/
-    target.rs, monitor.rs   exact-match variant
+    mod.rs                 pok/round1 configuration and v4 session negotiation
+    target.rs              target storage, interaction flow, serialization, timings
+    monitor.rs             target-proof verification and monitor interaction flow
+    proofs.rs              initial randomized R1CS PoK and compressed CDS94 OR proof
+    division.rs            joint monitor Sigma–Bulletproof
+    measurements.rs        serialized storage and communication accounting
+    performance.rs         public generator cache and fixed-base arithmetic
+    benchmarks.rs          ignored release microbenchmark
+    README.md              exact proof equations, measurements, and assumptions
   bf/
-    bloom.rs             Bloom-filter hashing and position sampling
-    target.rs, monitor.rs, proof.rs   Bloom-filter variant and its round proof
+    bloom.rs               hashing and position sampling
+    target.rs, monitor.rs, proof.rs
 ```
-
-Each variant's `target.rs` and `monitor.rs` implement the TCP framing and the two roles' round logic; `bf/proof.rs` holds the round's zero-knowledge proof construction and verification (the `exact` variant's proof logic lives inline in `exact/monitor.rs` / `exact/target.rs`).

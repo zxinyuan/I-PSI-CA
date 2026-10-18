@@ -38,7 +38,7 @@ struct RunConfig {
     protocol: ProtocolVersion,
     size: usize,
     in_set: bool,
-    accum_degree: usize,
+    bf_accum_degree: Option<usize>,
 }
 
 impl RunConfig {
@@ -47,39 +47,52 @@ impl RunConfig {
 
         match protocol {
             ProtocolVersion::Exact => {
-                let degree = match args.get(2) {
-                    Some(raw) => raw.parse::<usize>().map_err(|_| {
-                        "for exact, second arg must be a positive integer degree".to_string()
-                    })?,
+                let mut positional = Vec::with_capacity(2);
+                let mut flags = Vec::new();
+                let mut saw_flag = false;
+                let mut remaining = args.iter().skip(2);
+                while let Some(arg) = remaining.next() {
+                    if arg.starts_with("--") {
+                        saw_flag = true;
+                        if arg != "--pok" && arg != "--round1" {
+                            return Err(format!("unknown exact option '{arg}'"));
+                        }
+                        flags.push(arg.clone());
+                        flags.push(
+                            remaining
+                                .next()
+                                .ok_or_else(|| format!("{arg} requires true or false"))?
+                                .clone(),
+                        );
+                    } else {
+                        if saw_flag || positional.len() == 2 {
+                            return Err("exact accepts only [degree] [in_set] before --pok/--round1; there is no accumulator-size argument".into());
+                        }
+                        positional.push(arg.as_str());
+                    }
+                }
+                i_psi_ca::exact::ProtocolConfig::from_args(&flags)?;
+                let degree = match positional.first() {
+                    Some(raw) => raw
+                        .parse::<usize>()
+                        .map_err(|_| "for exact, degree must be a positive integer".to_string())?,
                     None => DEGREE,
                 };
                 if degree == 0 {
-                    return Err("degree must be greater than zero".to_string());
+                    return Err("degree must be greater than zero".into());
                 }
-
-                let in_set = match args.get(3) {
-                    Some(flag) => flag
+                let in_set = match positional.get(1) {
+                    Some(raw) => raw
                         .parse::<bool>()
-                        .map_err(|_| "for exact, third arg must be true/false".to_string())?,
+                        .map_err(|_| "for exact, in_set must be true/false".to_string())?,
                     None => true,
                 };
-
-                let accum_degree = match args.get(4) {
-                    Some(raw) => raw.parse::<usize>().map_err(|_| {
-                        "for exact, fourth arg must be a positive integer accum degree"
-                            .to_string()
-                    })?,
-                    None => ACCUM_DEGREE,
-                };
-                if accum_degree == 0 {
-                    return Err("accum degree must be greater than zero".to_string());
-                }
 
                 Ok(Self {
                     protocol,
                     size: degree,
                     in_set,
-                    accum_degree,
+                    bf_accum_degree: None,
                 })
             }
             ProtocolVersion::Bf => {
@@ -115,7 +128,7 @@ impl RunConfig {
                     protocol,
                     size: bloom_filter_size,
                     in_set,
-                    accum_degree,
+                    bf_accum_degree: Some(accum_degree),
                 })
             }
         }
@@ -125,7 +138,7 @@ impl RunConfig {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let config = RunConfig::parse(&args).expect(
-        "usage: exact [degree] [true|false] [accum_degree] or bf [bloom_filter_size] [true|false] [accum_degree]",
+        "usage: exact [degree] [true|false] [--pok true|false] [--round1 true|false] or bf [bloom_filter_size] [true|false] [accum_degree]",
     );
 
     let mut rng = OsRng;
@@ -169,7 +182,6 @@ fn main() {
                 pk1_for_monitor,
                 pk2,
                 config.size,
-                config.accum_degree,
             );
         }
         ProtocolVersion::Bf => {
@@ -222,7 +234,7 @@ fn main() {
                 sk2,
                 pk1_for_monitor,
                 pk2,
-                config.accum_degree,
+                config.bf_accum_degree.unwrap_or(ACCUM_DEGREE),
             );
         }
     }
@@ -238,11 +250,9 @@ fn run_exact(
     pk1_for_monitor: i_psi_ca::crypto::elgamal::PublicKeyShare,
     pk2: i_psi_ca::crypto::elgamal::PublicKeyShare,
     set_size: usize,
-    accum_degree: usize,
 ) {
     let target_handle = thread::spawn(move || {
-        let mut target =
-            i_psi_ca::exact::target::Target::new(t_set, accum_degree, sk1, pk1, pk2_for_target);
+        let mut target = i_psi_ca::exact::target::Target::new(t_set, sk1, pk1, pk2_for_target);
         target.run(ADDR, 1).expect("[Target] server error");
         println!("[Target] Final match count: {}", target.state);
     });
@@ -288,4 +298,68 @@ fn run_bf(
     monitor.run(ADDR, 1).expect("[Monitor] client error");
 
     target_handle.join().expect("Target thread panicked");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn parse(args: &[&str]) -> Result<RunConfig, String> {
+        RunConfig::parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+    #[test]
+    fn exact_flags_follow_only_degree_and_query_selection() {
+        for args in [
+            vec![
+                "app", "exact", "32", "false", "--pok", "true", "--round1", "false",
+            ],
+            vec![
+                "app", "exact", "32", "false", "--round1", "true", "--pok", "false",
+            ],
+        ] {
+            let config = parse(&args).unwrap();
+            assert!(matches!(config.protocol, ProtocolVersion::Exact));
+            assert_eq!(config.size, 32);
+            assert!(!config.in_set);
+            assert_eq!(config.bf_accum_degree, None);
+        }
+        assert_eq!(parse(&["app","exact","32","true","5"]).unwrap_err(),"exact accepts only [degree] [in_set] before --pok/--round1; there is no accumulator-size argument");
+    }
+    #[test]
+    fn exact_positionals_can_be_omitted_before_flags() {
+        let config = parse(&["app", "exact", "--pok", "true", "--round1", "false"]).unwrap();
+        assert_eq!(config.size, DEGREE);
+        assert!(config.in_set);
+        let config = parse(&["app", "exact", "12", "--round1", "true"]).unwrap();
+        assert_eq!(config.size, 12);
+        assert!(config.in_set);
+        assert!(parse(&["app"]).is_ok());
+    }
+    #[test]
+    fn exact_rejects_invalid_removed_and_misspelled_arguments() {
+        for args in [
+            vec!["app", "exact", "0"],
+            vec!["app", "exact", "12", "yes"],
+            vec!["app", "exact", "12", "true", "5", "--pok", "true"],
+            vec!["app", "exact", "--pok"],
+            vec!["app", "exact", "--round1", "yes"],
+            vec!["app", "exact", "--pok", "true", "--pok", "false"],
+            vec!["app", "exact", "--round1", "true", "--round1", "false"],
+            vec!["app", "exact", "--accum-degree", "5"],
+            vec!["app", "exact", "--pok", "true", "12"],
+        ] {
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
+    #[test]
+    fn bf_retains_its_accumulator_argument() {
+        let custom = parse(&["app", "bf", "1000", "false", "8"]).unwrap();
+        assert!(matches!(custom.protocol, ProtocolVersion::Bf));
+        assert_eq!(custom.bf_accum_degree, Some(8));
+        assert!(!custom.in_set);
+        assert_eq!(
+            parse(&["app", "bf"]).unwrap().bf_accum_degree,
+            Some(ACCUM_DEGREE)
+        );
+        assert!(parse(&["app", "bf", "1000", "true", "0"]).is_err());
+    }
 }

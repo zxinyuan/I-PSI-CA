@@ -1,0 +1,107 @@
+[
+  {
+    "n": 966,
+    "mode": "elgamal",
+    "exit_code": 0,
+    "stdout": "mode=elgamal roots=966 degree=966 coeffs=967 N=NA logN=NA ciphertexts=967 latency_ms=180.298 threshold_decrypt_ms=254.265 ciphertext_kb=60.438 verify=PASS",
+    "stderr": ""
+  },
+  {
+    "n": 966,
+    "mode": "rlwe",
+    "exit_code": 0,
+    "stdout": "mode=rlwe roots=966 degree=966 coeffs=967 N=2048 logN=11 ciphertexts=1 latency_ms=0.261 threshold_decrypt_ms=0.307 ciphertext_kb=32.311 verify=PASS",
+    "stderr": ""
+  },
+  {
+    "n": 966,
+    "mode": "bfv",
+    "exit_code": 0,
+    "stdout": "mode=bfv roots=966 degree=966 coeffs=967 N=2048 logN=11 ciphertexts=1 latency_ms=0.248 threshold_decrypt_ms=0.211 ciphertext_kb=32.311 verify=PASS",
+    "stderr": ""
+  },
+  {
+    "n": 4802,
+    "mode": "elgamal",
+    "exit_code": 0,
+    "stdout": "mode=elgamal roots=4802 degree=4802 coeffs=4803 N=NA logN=NA ciphertexts=4803 latency_ms=872.329 threshold_decrypt_ms=1254.052 ciphertext_kb=300.188 verify=PASS",
+    "stderr": ""
+  },
+  {
+    "n": 4802,
+    "mode": "rlwe",
+    "exit_code": 0,
+    "stdout": "mode=rlwe roots=4802 degree=4802 coeffs=4803 N=8192 logN=13 ciphertexts=1 latency_ms=1.022 threshold_decrypt_ms=1.344 ciphertext_kb=128.311 verify=PASS",
+    "stderr": ""
+  },
+  {
+    "n": 4802,
+    "mode": "bfv",
+    "exit_code": 0,
+    "stdout": "mode=bfv roots=4802 degree=4802 coeffs=4803 N=8192 logN=13 ciphertexts=1 latency_ms=1.045 threshold_decrypt_ms=0.913 ciphertext_kb=128.311 verify=PASS",
+    "stderr": ""
+  },
+  {
+    "n": 9597,
+    "mode": "elgamal",
+    "exit_code": 0,
+    "stdout": "mode=elgamal roots=9597 degree=9597 coeffs=9598 N=NA logN=NA ciphertexts=9598 latency_ms=1737.939 threshold_decrypt_ms=2509.649 ciphertext_kb=599.875 verify=PASS",
+    "stderr": ""
+  },
+  {
+    "n": 9597,
+    "mode": "rlwe",
+    "exit_code": 0,
+    "stdout": "mode=rlwe roots=9597 degree=9597 coeffs=9598 N=16384 logN=14 ciphertexts=1 latency_ms=2.137 threshold_decrypt_ms=3.076 ciphertext_kb=256.311 verify=PASS",
+    "stderr": ""
+  },
+  {
+    "n": 9597,
+    "mode": "bfv",
+    "exit_code": 0,
+    "stdout": "mode=bfv roots=9597 degree=9597 coeffs=9598 N=16384 logN=14 ciphertexts=1 latency_ms=2.143 threshold_decrypt_ms=2.810 ciphertext_kb=256.311 verify=PASS",
+    "stderr": ""
+  },
+  {
+    "n": 47971,
+    "mode": "elgamal",
+    "exit_code": 0,
+    "stdout": "mode=elgamal roots=47971 degree=47971 coeffs=47972 N=NA logN=NA ciphertexts=47972 latency_ms=8666.960 threshold_decrypt_ms=12572.540 ciphertext_kb=2998.250 verify=PASS",
+    "stderr": ""
+  },
+  {
+    "n": 47971,
+    "mode": "rlwe",
+    "exit_code": 0,
+    "stdout": "mode=rlwe roots=47971 degree=47971 coeffs=47972 N=65536 logN=16 ciphertexts=1 latency_ms=8.979 threshold_decrypt_ms=11.421 ciphertext_kb=1024.311 verify=PASS",
+    "stderr": ""
+  },
+  {
+    "n": 47971,
+    "mode": "bfv",
+    "exit_code": 0,
+    "stdout": "mode=bfv roots=47971 degree=47971 coeffs=47972 N=65536 logN=16 ciphertexts=1 latency_ms=8.858 threshold_decrypt_ms=8.303 ciphertext_kb=1024.311 verify=PASS",
+    "stderr": ""
+  },
+  {
+    "n": 95935,
+    "mode": "elgamal",
+    "exit_code": 0,
+    "stdout": "mode=elgamal roots=95935 degree=95935 coeffs=95936 N=NA logN=NA ciphertexts=95936 latency_ms=17303.307 threshold_decrypt_ms=25261.486 ciphertext_kb=5996.000 verify=PASS",
+    "stderr": ""
+  },
+  {
+    "n": 95935,
+    "mode": "rlwe",
+    "exit_code": 0,
+    "stdout": "mode=rlwe roots=95935 degree=95935 coeffs=95936 N=131072 logN=17 ciphertexts=1 latency_ms=18.300 threshold_decrypt_ms=27.054 ciphertext_kb=2048.311 verify=PASS",
+    "stderr": ""
+  },
+  {
+    "n": 95935,
+    "mode": "bfv",
+    "exit_code": 0,
+    "stdout": "mode=bfv roots=95935 degree=95935 coeffs=95936 N=131072 logN=17 ciphertexts=1 latency_ms=18.181 threshold_decrypt_ms=16.129 ciphertext_kb=2048.311 verify=PASS",
+    "stderr": ""
+  }
+]
