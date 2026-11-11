@@ -4,7 +4,7 @@ use curve25519_dalek_ng::scalar::Scalar;
 use rand::rngs::OsRng;
 use rand::Rng;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BloomFilterConfig {
     pub bloom_filter_size: usize,
     pub hash_count: usize,
@@ -26,6 +26,9 @@ impl BloomFilterConfig {
             return Err(
                 "target marked-position count must be at most the bloom filter size".to_string(),
             );
+        }
+        if usable_input_span(self) == 0 {
+            return Err("Bloom hash parameters leave no supported input".into());
         }
         Ok(self)
     }
@@ -54,6 +57,32 @@ pub fn scalar_positions(input: Scalar, config: BloomFilterConfig) -> Vec<Scalar>
     (0..config.hash_count)
         .map(|hash_index| hash_position(input, hash_index, config))
         .collect()
+}
+
+/// Fallible boundary for protocol input: checking just the low 64 scalar bits
+/// would permit noncanonical integer-domain values to bypass the Bloom bounds.
+pub fn scalar_positions_checked(
+    input: Scalar,
+    config: BloomFilterConfig,
+) -> Result<Vec<Scalar>, String> {
+    config.validate()?;
+    let value = scalar_to_usize(input);
+    if value == 0 || value > usable_input_span(config) || Scalar::from(value as u64) != input {
+        return Err("input scalar is outside the supported Bloom domain".into());
+    }
+    Ok(scalar_positions(input, config))
+}
+
+/// Canonical monitor Bloom vector: bucket 1 is the low bit of byte 0, and
+/// unused high bits in the final byte are zero. Shared by packing and proofs.
+pub fn scalar_bloom_bits(input: Scalar, config: BloomFilterConfig) -> Result<Vec<u8>, String> {
+    let positions = scalar_positions_checked(input, config)?;
+    let mut bytes = vec![0u8; config.bloom_filter_size.div_ceil(8)];
+    for position in positions {
+        let index = scalar_to_usize(position) - 1;
+        bytes[index / 8] |= 1 << (index % 8);
+    }
+    Ok(bytes)
 }
 
 pub fn sample_marked_positions(
@@ -219,5 +248,28 @@ mod tests {
         assert_eq!(recommended_hash_count(0.25), 2);
         assert_eq!(recommended_hash_count(1.0), 1);
         assert_eq!(recommended_hash_count(0.0), 1);
+    }
+
+    #[test]
+    fn checked_inputs_reject_truncated_scalars_and_empty_domains() {
+        let config = BloomFilterConfig {
+            bloom_filter_size: 100_000,
+            hash_count: 1,
+            target_marked_count: 50_000,
+        };
+        assert!(scalar_positions_checked(Scalar::from(100_000u64), config).is_ok());
+        assert!(scalar_positions_checked(Scalar::from(100_001u64), config).is_err());
+        assert!(scalar_positions_checked(Scalar::zero(), config).is_err());
+        let mut bytes = [0u8; 32];
+        bytes[0] = 1;
+        bytes[16] = 1;
+        assert!(scalar_positions_checked(Scalar::from_bytes_mod_order(bytes), config).is_err());
+        assert!(BloomFilterConfig {
+            bloom_filter_size: 32,
+            hash_count: 32,
+            target_marked_count: 16
+        }
+        .validate()
+        .is_err());
     }
 }

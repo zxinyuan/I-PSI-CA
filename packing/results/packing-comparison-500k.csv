@@ -1,0 +1,2 @@
+items,bloom_fpr,bloom_degree,rlwe_N,exact_ms,bloom_ms,exact_bytes,bloom_bytes,trials,seed,coefficients,bloom_elgamal_ms,bloom_elgamal_bytes,rlwe_plan,rlwe_ciphertexts
+500000,0.01,4792530,1048576,88978.092276,721.643745,32000064,76712432,3,1,synthetic-monic,852408.355511,306721984,1048576:1048576:1048576:1048576:524288:65536:8192:2048,8

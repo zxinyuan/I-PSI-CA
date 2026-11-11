@@ -1,10 +1,12 @@
 //! Public, deterministic generator reuse. No witnesses or proof nonces are cached.
 use bulletproofs::BulletproofGens;
 use curve25519_dalek_ng::{
-    constants::RISTRETTO_BASEPOINT_TABLE, ristretto::RistrettoPoint, scalar::Scalar,
+    constants::RISTRETTO_BASEPOINT_TABLE,
+    ristretto::{RistrettoBasepointTable, RistrettoPoint},
+    scalar::Scalar,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, OnceLock,
@@ -31,7 +33,7 @@ impl GeneratorActivity {
         }
     }
     pub(crate) fn report(self) {
-        eprintln!("[Target] Public Generator Cache: builds={} setup={:.3} ms hits={} (setup included in measured latency)",self.builds,self.setup_ns as f64/1_000_000.0,self.hits);
+        eprintln!("[Target] Public Generator Cache: builds={} setup={} s hits={} (setup included in measured latency)", self.builds, super::measurements::significant(self.setup_ns as f64 / 1_000_000_000.0), self.hits);
     }
 }
 pub fn generator_activity() -> GeneratorActivity {
@@ -42,10 +44,10 @@ pub fn generator_activity() -> GeneratorActivity {
     }
 }
 pub(crate) fn generators(multipliers: usize) -> Arc<BulletproofGens> {
-    // Every caller validates its dimensions to <=4096 before requesting setup.
-    // Only capacities 64,128,...,4096 are retained, bounding cache memory.
+    // Callers validate dimensions against MAX_COEFFICIENTS before setup.
+    // Only power-of-two capacities from 64 to that limit are cached.
     assert!(
-        multipliers <= 4096,
+        multipliers <= super::MAX_COEFFICIENTS,
         "exact circuit capacity exceeds protocol limit"
     );
     let capacity = multipliers.next_power_of_two().max(64);
@@ -67,10 +69,34 @@ pub(crate) fn generators(multipliers: usize) -> Arc<BulletproofGens> {
 pub(crate) fn mul_g(s: &Scalar) -> RistrettoPoint {
     s * &RISTRETTO_BASEPOINT_TABLE
 }
+type Tables = Mutex<HashMap<[u8; 32], Arc<RistrettoBasepointTable>>>;
+static TABLES: OnceLock<Tables> = OnceLock::new();
+/// Fixed-base table for a public point (G, an encryption key, a Pedersen base).
+/// A table costs about 20 variable-base multiplications to build and makes each
+/// later multiplication about 3.5x faster. Bounded: the cache resets past 64 points.
+pub(crate) fn table(point: &RistrettoPoint) -> Arc<RistrettoBasepointTable> {
+    let key = point.compress().to_bytes();
+    let cache = TABLES.get_or_init(Default::default);
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(table) = cache.get(&key) {
+        return Arc::clone(table);
+    }
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    let table = Arc::new(RistrettoBasepointTable::create(point));
+    cache.insert(key, Arc::clone(&table));
+    table
+}
 /// Only the opt-in, serial benchmark uses this; ordinary tests never reset setup.
 #[cfg(test)]
 pub(crate) fn reset_for_benchmark() {
     if let Some(cache) = GENERATORS.get() {
+        cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+    if let Some(cache) = TABLES.get() {
         cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }
     BUILDS.store(0, Ordering::Relaxed);
@@ -88,5 +114,15 @@ mod tests {
         assert_eq!(a.gens_capacity, 128);
         assert_eq!(generators(0).gens_capacity, 64);
         assert_eq!(generators(1000).gens_capacity, 1024);
+    }
+    #[test]
+    fn fixed_base_tables_match_variable_base_multiplication() {
+        let mut rng = rand::thread_rng();
+        let p = RistrettoPoint::random(&mut rng);
+        let s = Scalar::random(&mut rng);
+        assert!(Arc::ptr_eq(&table(&p), &table(&p)));
+        assert_eq!(&s * &*table(&p), s * p);
+        let g = curve25519_dalek_ng::constants::RISTRETTO_BASEPOINT_POINT;
+        assert_eq!(&s * &*table(&g), mul_g(&s));
     }
 }

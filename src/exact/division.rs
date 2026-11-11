@@ -2,7 +2,8 @@
 use super::{
     performance::{generators, mul_g},
     proofs::ProofContext,
-    target::{WireCiphertext, WireEncryptedPoly},
+    sigma::Base,
+    target::{EncodedPoly, WireCiphertext, WireEncryptedPoly},
 };
 use crate::crypto::elgamal::{
     self, Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare, SecretKeyShare,
@@ -15,7 +16,7 @@ use curve25519_dalek_ng::{
     constants::RISTRETTO_BASEPOINT_POINT as G,
     ristretto::{CompressedRistretto, RistrettoPoint},
     scalar::Scalar,
-    traits::{Identity, MultiscalarMul, VartimeMultiscalarMul},
+    traits::{Identity, MultiscalarMul},
 };
 use merlin::Transcript;
 use rand::{CryptoRng, RngCore};
@@ -26,28 +27,19 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize)]
 pub(crate) struct DivisionReply {
     pub next: WireEncryptedPoly,
+    // Interaction start: target payload received, before decoding/proof verification.
+    pub computation_started_unix_ns: u128,
     scaled: WireCiphertext,
     partial: WireCiphertext,
     // e[0..n], m, inverse_mask, each committed as value*G + blind*H.
     wires: Vec<[u8; 32]>,
     circuit: Vec<u8>,
-    opening_commitments: Vec<[u8; 32]>,
-    evaluation_commitments: [[u8; 32]; 2],
-    division_commitments: Vec<[[u8; 32]; 2]>,
-    quotient_zero_commitments: [[u8; 32]; 2],
-    quotient_responses: Vec<[u8; 32]>,
-    partial_commitments: [[u8; 32]; 3],
-    wire_responses: Vec<[[u8; 32]; 2]>,
-    // Independent encryption rerandomization, decryption share, decryption rerandomization.
-    extra_responses: [[u8; 32]; 3],
+    sigma: super::sigma::Proof,
 }
 fn decode(b: [u8; 32]) -> Result<RistrettoPoint, String> {
     CompressedRistretto(b)
         .decompress()
         .ok_or_else(|| "invalid monitor proof point".into())
-}
-fn scalar(b: [u8; 32]) -> Result<Scalar, String> {
-    Scalar::from_canonical_bytes(b).ok_or_else(|| "noncanonical monitor proof scalar".into())
 }
 fn validate(
     pk: &PublicKey,
@@ -56,7 +48,7 @@ fn validate(
     n: usize,
     ctx: &ProofContext,
 ) -> Result<(), String> {
-    if n == 0 || n > 4096 || ctx.round == 0 {
+    if n == 0 || n > super::MAX_COEFFICIENTS || ctx.round == 0 {
         return Err("invalid monitor statement dimensions/round".into());
     }
     if pk.0 == RistrettoPoint::identity()
@@ -68,23 +60,24 @@ fn validate(
     }
     Ok(())
 }
-fn append_ct(t: &mut Transcript, label: &'static [u8], ct: &Ciphertext) {
-    t.append_message(label, ct.c1.compress().as_bytes());
-    t.append_message(label, ct.c2.compress().as_bytes());
+fn append_ct(t: &mut Transcript, label: &'static [u8], ct: &WireCiphertext) {
+    t.append_message(label, &ct.c1);
+    t.append_message(label, &ct.c2);
 }
+/// Binds canonical encodings, which each endpoint already holds as wire data.
 #[allow(clippy::too_many_arguments)]
 fn statement(
     pk: &PublicKey,
     pk1: &PublicKeyShare,
     pk2: &PublicKeyShare,
-    current: &EncryptedPoly,
-    next: &EncryptedPoly,
-    scaled: &Ciphertext,
-    partial: &Ciphertext,
+    current: &WireEncryptedPoly,
+    next: &WireEncryptedPoly,
+    scaled: &WireCiphertext,
+    partial: &WireCiphertext,
     ctx: &ProofContext,
 ) -> Transcript {
     let mut t = Transcript::new(b"exact::monitor-sigma-bullet-v2");
-    t.append_message(b"version", b"exact-pok-v4");
+    t.append_message(b"version", b"exact-pok-v7");
     t.append_message(b"session", &ctx.session);
     t.append_u64(b"round", ctx.round);
     for p in [pk.0, pk1.0, pk2.0] {
@@ -101,34 +94,90 @@ fn statement(
     append_ct(&mut t, b"partial", partial);
     t
 }
-fn challenge(t: &mut Transcript, msg: &DivisionReply) -> Result<Scalar, String> {
-    t.append_message(b"section", b"shared-witness-sigma");
-    // Explicit lengths and canonical fixed-width encodings, including the R1CS proof.
+#[allow(clippy::too_many_arguments)]
+fn sigma_statement(
+    pk: &PublicKey,
+    pk1: &PublicKeyShare,
+    pk2: &PublicKeyShare,
+    current: &EncryptedPoly,
+    msg: &DivisionReply,
+    encoded_next: &EncodedPoly,
+    scaled: &Ciphertext,
+    partial: &Ciphertext,
+    base: &Transcript,
+) -> Result<super::sigma::Statement, String> {
+    let next = encoded_next.native();
+    let n = current.0.len();
+    let width = n + 2;
+    let extra = 2 * width;
+    let quotient = extra + 3;
+    let mut t = base.clone();
+    t.append_message(b"section", b"sigma-fun-shared-witness-v1");
     t.append_u64(b"wires", msg.wires.len() as u64);
     for c in &msg.wires {
         t.append_message(b"wire", c);
     }
     t.append_message(b"circuit", &msg.circuit);
-    for c in &msg.opening_commitments {
-        t.append_message(b"opening-A", c);
+    t.append_message(
+        b"monitor-computation-start",
+        &msg.computation_started_unix_ns.to_le_bytes(),
+    );
+    let mut relation = super::sigma::Statement::new(super::sigma::context(t));
+    let pc = PedersenGens::default();
+    let (g, h, blinding) = (
+        relation.fixed(G),
+        relation.fixed(pk.0),
+        relation.fixed(pc.B_blinding),
+    );
+    for i in 0..width {
+        relation.add_encoded(
+            decode(msg.wires[i])?,
+            msg.wires[i],
+            [(i, g), (width + i, blinding)],
+        );
     }
-    for c in &msg.evaluation_commitments {
-        t.append_message(b"evaluation-A", c);
+    relation.add(
+        scaled.c1,
+        (0..n)
+            .map(|i| (i, Base::Point(current.0[i].c1)))
+            .chain([(extra, g)]),
+    );
+    relation.add(
+        scaled.c2,
+        (0..n)
+            .map(|i| (i, Base::Point(current.0[i].c2)))
+            .chain([(extra, h)]),
+    );
+    relation.add(pk2.0, [(extra + 1, g)]);
+    relation.add(partial.c1 - scaled.c1, [(extra + 2, g)]);
+    relation.add(
+        partial.c2 - scaled.c2,
+        [
+            (extra + 1, Base::Point(-scaled.c1)),
+            (extra + 2, Base::Point(pk1.0)),
+        ],
+    );
+    for i in 1..n {
+        relation.add(
+            next.0[i - 1].c1 - current.0[i].c1,
+            [(n, Base::Point(next.0[i].c1)), (quotient + i - 1, g)],
+        );
+        relation.add(
+            next.0[i - 1].c2 - current.0[i].c2,
+            [(n, Base::Point(next.0[i].c2)), (quotient + i - 1, h)],
+        );
     }
-    for pair in &msg.division_commitments {
-        for c in pair {
-            t.append_message(b"division-A", c);
-        }
-    }
-    for c in &msg.quotient_zero_commitments {
-        t.append_message(b"quotient-zero-A", c);
-    }
-    for c in &msg.partial_commitments {
-        t.append_message(b"partial-A", c);
-    }
-    let mut bytes = [0; 64];
-    t.challenge_bytes(b"challenge", &mut bytes);
-    Ok(Scalar::from_bytes_mod_order_wide(&bytes))
+    relation.add_encoded(
+        next.0[n - 1].c1,
+        encoded_next.wire().0[n - 1].c1,
+        [(quotient + n - 1, g)],
+    );
+    relation.add_encoded(
+        next.0[n - 1].c2,
+        encoded_next.wire().0[n - 1].c2,
+        [(quotient + n - 1, h)],
+    );
+    Ok(relation)
 }
 fn evaluation_gadget<CS: ConstraintSystem>(cs: &mut CS, wires: &[Variable], n: usize) {
     // e_i = mask * m^i. Checking e_0 * inverse_mask = 1 excludes a zero mask.
@@ -158,13 +207,15 @@ fn eval_linear(
         ),
     }
 }
-// This is restricted to verifier responses, all of which are public.
+// Reference used to check the library adapter in tests.
+#[cfg(test)]
 fn eval_linear_public(
     current: &EncryptedPoly,
     weights: &[Scalar],
     eta: Scalar,
     pk: &PublicKey,
 ) -> Ciphertext {
+    use curve25519_dalek_ng::traits::VartimeMultiscalarMul;
     use std::iter::once;
     Ciphertext {
         c1: RistrettoPoint::vartime_multiscalar_mul(
@@ -190,25 +241,56 @@ pub(crate) fn prove<R: RngCore + CryptoRng>(
     m: Scalar,
     ctx: &ProofContext,
 ) -> Result<DivisionReply, String> {
-    prove_with_candidate(rng, pk, pk1, pk2, sk2, current, m, ctx).map(|(reply, _)| reply)
+    let current = EncodedPoly::from_native(current.clone());
+    prove_with_candidate(rng, pk, pk1, pk2, sk2, &current, m, ctx).map(|(reply, _)| reply)
 }
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn prove_with_candidate<R: RngCore + CryptoRng>(
     rng: &mut R,
     pk: &PublicKey,
     pk1: &PublicKeyShare,
     pk2: &PublicKeyShare,
     sk2: &SecretKeyShare,
-    current: &EncryptedPoly,
+    current: &EncodedPoly,
     m: Scalar,
     ctx: &ProofContext,
-) -> Result<(DivisionReply, EncryptedPoly), String> {
+) -> Result<(DivisionReply, EncodedPoly), String> {
+    let computation_started_unix_ns = super::measurements::unix_ns().map_err(|e| e.to_string())?;
+    prove_with_candidate_started_at(
+        rng, pk, pk1, pk2, sk2, current, m, ctx, computation_started_unix_ns,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_with_candidate_started_at<R: RngCore + CryptoRng>(
+    rng: &mut R,
+    pk: &PublicKey,
+    pk1: &PublicKeyShare,
+    pk2: &PublicKeyShare,
+    sk2: &SecretKeyShare,
+    current: &EncodedPoly,
+    m: Scalar,
+    ctx: &ProofContext,
+    computation_started_unix_ns: u128,
+) -> Result<(DivisionReply, EncodedPoly), String> {
     let mut mask = Scalar::random(rng);
     while mask == Scalar::zero() {
         mask = Scalar::random(rng);
     }
     let eta = Scalar::random(rng);
-    prove_inner(rng, pk, pk1, pk2, sk2, current, m, mask, eta, ctx)
+    prove_inner(
+        rng,
+        pk,
+        pk1,
+        pk2,
+        sk2,
+        current,
+        m,
+        mask,
+        eta,
+        computation_started_unix_ns,
+        ctx,
+    )
 }
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
@@ -224,7 +306,21 @@ fn prove_with_mask<R: RngCore + CryptoRng>(
     eta: Scalar,
     ctx: &ProofContext,
 ) -> Result<DivisionReply, String> {
-    prove_inner(rng, pk, pk1, pk2, sk2, current, m, mask, eta, ctx).map(|(reply, _)| reply)
+    let computation_started_unix_ns = super::measurements::unix_ns().map_err(|e| e.to_string())?;
+    prove_inner(
+        rng,
+        pk,
+        pk1,
+        pk2,
+        sk2,
+        &EncodedPoly::from_native(current.clone()),
+        m,
+        mask,
+        eta,
+        computation_started_unix_ns,
+        ctx,
+    )
+    .map(|(reply, _)| reply)
 }
 #[allow(clippy::too_many_arguments)]
 fn prove_inner<R: RngCore + CryptoRng>(
@@ -233,12 +329,14 @@ fn prove_inner<R: RngCore + CryptoRng>(
     pk1: &PublicKeyShare,
     pk2: &PublicKeyShare,
     sk2: &SecretKeyShare,
-    current: &EncryptedPoly,
+    encoded: &EncodedPoly,
     m: Scalar,
     mask: Scalar,
     eta: Scalar,
+    computation_started_unix_ns: u128,
     ctx: &ProofContext,
-) -> Result<(DivisionReply, EncryptedPoly), String> {
+) -> Result<(DivisionReply, EncodedPoly), String> {
+    let current = encoded.native();
     let n = current.0.len();
     validate(pk, pk1, pk2, n, ctx)?;
     if mask == Scalar::zero() || mul_g(sk2.as_scalar()) != pk2.0 {
@@ -255,11 +353,12 @@ fn prove_inner<R: RngCore + CryptoRng>(
     });
     // Sending the deterministic quotient leaks a query-testing handle to a target
     // that knows the coefficient encryption randomness. Hide it with fresh zeros.
-    let (next, quotient_randomness) = elgamal::rerandomize_poly_with_witness(rng, pk, &next);
+    let (next, quotient_randomness) =
+        super::encryption::rerandomize_poly_with_witness(rng, pk, &next);
     // These witnesses express Q'[i-1] - C[i] = m Q'[i] + Enc(0; lambda[i]).
-    let mut quotient_witness: Vec<_> = (1..n)
-        .map(|i| quotient_randomness[i - 1] - m * quotient_randomness[i])
-        .collect();
+    let mut quotient_witness = Vec::with_capacity(n);
+    quotient_witness
+        .extend((1..n).map(|i| quotient_randomness[i - 1] - m * quotient_randomness[i]));
     quotient_witness.push(quotient_randomness[n - 1]);
     let mut values = Vec::with_capacity(n + 2);
     values.push(mask);
@@ -270,7 +369,20 @@ fn prove_inner<R: RngCore + CryptoRng>(
     values.extend([m, mask.invert()]);
     let (partial, r) = elgamal::partial_decrypt_with_witness(rng, sk2, pk1, &scaled);
     let pc = PedersenGens::default();
-    let base = statement(pk, pk1, pk2, current, &next, &scaled, &partial, ctx);
+    // Compress the reply's points once, for both the transcript and the wire.
+    let next = EncodedPoly::from_native(next);
+    let scaled_wire = WireCiphertext::from_native(&scaled);
+    let partial_wire = WireCiphertext::from_native(&partial);
+    let base = statement(
+        pk,
+        pk1,
+        pk2,
+        encoded.wire(),
+        next.wire(),
+        &scaled_wire,
+        &partial_wire,
+        ctx,
+    );
     let mut t = base.clone();
     let mut prover = Prover::new(&pc, &mut t);
     let blinds: Vec<_> = values.iter().map(|_| Scalar::random(rng)).collect();
@@ -287,19 +399,16 @@ fn prove_inner<R: RngCore + CryptoRng>(
         .map_err(|e| format!("monitor circuit: {e}"))?
         .to_bytes();
     let mut msg = DivisionReply {
-        next: WireEncryptedPoly::from_native(&next),
-        scaled: WireCiphertext::from_native(&scaled),
-        partial: WireCiphertext::from_native(&partial),
+        next: next.wire().clone(),
+        computation_started_unix_ns,
+        scaled: scaled_wire,
+        partial: partial_wire,
         wires,
         circuit,
-        opening_commitments: vec![],
-        evaluation_commitments: [[0; 32]; 2],
-        division_commitments: vec![],
-        quotient_zero_commitments: [[0; 32]; 2],
-        quotient_responses: vec![],
-        partial_commitments: [[0; 32]; 3],
-        wire_responses: vec![],
-        extra_responses: [[0; 32]; 3],
+        sigma: super::sigma::Proof {
+            challenge: Default::default(),
+            response: vec![],
+        },
     };
     complete_sigma_native(
         rng,
@@ -345,10 +454,19 @@ fn complete_sigma<R: RngCore + CryptoRng>(
     witness: &MonitorWitness,
     ctx: &ProofContext,
 ) -> Result<(), String> {
-    let next = msg.next.to_native()?;
+    let next = EncodedPoly::from_wire(msg.next.clone())?;
     let scaled = msg.scaled.to_native()?;
     let partial = msg.partial.to_native()?;
-    let base = statement(pk, pk1, pk2, current, &next, &scaled, &partial, ctx);
+    let base = statement(
+        pk,
+        pk1,
+        pk2,
+        &WireEncryptedPoly::from_native(current),
+        next.wire(),
+        &msg.scaled,
+        &msg.partial,
+        ctx,
+    );
     complete_sigma_native(
         rng, pk, pk1, pk2, current, msg, witness, &next, &scaled, &partial, &base,
     )
@@ -358,94 +476,32 @@ fn complete_sigma_native<R: RngCore + CryptoRng>(
     rng: &mut R,
     pk: &PublicKey,
     pk1: &PublicKeyShare,
-    _pk2: &PublicKeyShare,
+    pk2: &PublicKeyShare,
     current: &EncryptedPoly,
     msg: &mut DivisionReply,
     witness: &MonitorWitness,
-    next: &EncryptedPoly,
+    next: &EncodedPoly,
     scaled: &Ciphertext,
-    _partial: &Ciphertext,
+    partial: &Ciphertext,
     base: &Transcript,
 ) -> Result<(), String> {
     let n = current.0.len();
-    let MonitorWitness {
-        values,
-        blinds,
-        eta,
-        sk2,
-        r,
-        quotient: quotient_witness,
-    } = witness;
-    let pc = PedersenGens::default();
-    let quotient_nonces: Vec<_> = (0..n).map(|_| Scalar::random(rng)).collect();
-    let kv: Vec<_> = values.iter().map(|_| Scalar::random(rng)).collect();
-    let kb: Vec<_> = values.iter().map(|_| Scalar::random(rng)).collect();
-    let extras = [*eta, *sk2, *r];
-    let k = [
-        Scalar::random(rng),
-        Scalar::random(rng),
-        Scalar::random(rng),
-    ];
-    let opening_commitments = kv
-        .iter()
-        .zip(&kb)
-        .map(|(v, b)| {
-            RistrettoPoint::multiscalar_mul([*v, *b], [G, pc.B_blinding])
-                .compress()
-                .to_bytes()
-        })
-        .collect();
-    let a = eval_linear(current, &kv[..n], k[0], pk);
-    let evaluation_commitments = [a.c1.compress().to_bytes(), a.c2.compress().to_bytes()];
-    let division_commitments = next
-        .0
-        .iter()
-        .skip(1)
-        .enumerate()
-        .map(|(j, ct)| {
-            [
-                RistrettoPoint::multiscalar_mul([kv[n], quotient_nonces[j]], [ct.c1, G])
-                    .compress()
-                    .to_bytes(),
-                RistrettoPoint::multiscalar_mul([kv[n], quotient_nonces[j]], [ct.c2, pk.0])
-                    .compress()
-                    .to_bytes(),
-            ]
-        })
-        .collect();
-    let quotient_zero_commitments = [
-        mul_g(&quotient_nonces[n - 1]).compress().to_bytes(),
-        (quotient_nonces[n - 1] * pk.0).compress().to_bytes(),
-    ];
-    let partial_commitments = [
-        mul_g(&k[1]).compress().to_bytes(),
-        mul_g(&k[2]).compress().to_bytes(),
-        RistrettoPoint::multiscalar_mul([-k[1], k[2]], [scaled.c1, pk1.0])
-            .compress()
-            .to_bytes(),
-    ];
-
-    msg.opening_commitments = opening_commitments;
-    msg.evaluation_commitments = evaluation_commitments;
-    msg.division_commitments = division_commitments;
-    msg.quotient_zero_commitments = quotient_zero_commitments;
-    msg.partial_commitments = partial_commitments;
-    let e = challenge(&mut base.clone(), msg)?;
-    msg.wire_responses = (0..values.len())
-        .map(|i| {
-            [
-                (kv[i] + e * values[i]).to_bytes(),
-                (kb[i] + e * blinds[i]).to_bytes(),
-            ]
-        })
-        .collect();
-    msg.quotient_responses = (0..n)
-        .map(|i| (quotient_nonces[i] + e * quotient_witness[i]).to_bytes())
-        .collect();
-    msg.extra_responses = std::array::from_fn(|i| (k[i] + e * extras[i]).to_bytes());
+    let witness = zeroize::Zeroizing::new(
+        witness
+            .values
+            .iter()
+            .chain(&witness.blinds)
+            .copied()
+            .chain([witness.eta, witness.sk2, witness.r])
+            .chain(witness.quotient.iter().copied())
+            .collect::<Vec<_>>(),
+    );
+    let relation = sigma_statement(pk, pk1, pk2, current, msg, next, scaled, partial, base)?;
+    msg.sigma = super::sigma::prover(3 * n + 7).prove(&witness, &relation, Some(rng));
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn verify(
     pk: &PublicKey,
     pk1: &PublicKeyShare,
@@ -454,87 +510,47 @@ pub(crate) fn verify(
     msg: &DivisionReply,
     ctx: &ProofContext,
 ) -> Result<(EncryptedPoly, Ciphertext), String> {
+    let current = EncodedPoly::from_native(current.clone());
+    verify_encoded(pk, pk1, pk2, &current, msg, ctx)
+        .map(|(next, partial)| (next.into_native(), partial))
+}
+pub(crate) fn verify_encoded(
+    pk: &PublicKey,
+    pk1: &PublicKeyShare,
+    pk2: &PublicKeyShare,
+    encoded: &EncodedPoly,
+    msg: &DivisionReply,
+    ctx: &ProofContext,
+) -> Result<(EncodedPoly, Ciphertext), String> {
+    let current = encoded.native();
     let n = current.0.len();
     validate(pk, pk1, pk2, n, ctx)?;
     if msg.next.0.len() != n
         || msg.wires.len() != n + 2
-        || msg.wire_responses.len() != n + 2
-        || msg.opening_commitments.len() != n + 2
-        || msg.division_commitments.len() != n - 1
-        || msg.quotient_responses.len() != n
+        || msg.sigma.response.len() != 3 * n + 7
         || msg.circuit.len() > 65536
     {
         return Err("invalid monitor proof dimensions".into());
     }
-    let next = msg.next.to_native()?;
+    let next = EncodedPoly::from_wire(msg.next.clone())?;
     let scaled = msg.scaled.to_native()?;
     let partial = msg.partial.to_native()?;
     let pc = PedersenGens::default();
-    let base = statement(pk, pk1, pk2, current, &next, &scaled, &partial, ctx);
-    let e = challenge(&mut base.clone(), msg)?;
-    let mut z = Vec::with_capacity(n + 2);
-    for i in 0..n + 2 {
-        let v = scalar(msg.wire_responses[i][0])?;
-        let b = scalar(msg.wire_responses[i][1])?;
-        if RistrettoPoint::vartime_multiscalar_mul(
-            [v, b, -e, -Scalar::one()],
-            [
-                G,
-                pc.B_blinding,
-                decode(msg.wires[i])?,
-                decode(msg.opening_commitments[i])?,
-            ],
-        ) != RistrettoPoint::identity()
-        {
-            return Err("monitor circuit/Sigma witness mismatch".into());
-        }
-        z.push(v);
-    }
-    let [zeta, zsk, zr] = msg.extra_responses.map(scalar);
-    let (zeta, zsk, zr) = (zeta?, zsk?, zr?);
-    let eval = eval_linear_public(current, &z[..n], zeta, pk);
-    if eval.c1 != decode(msg.evaluation_commitments[0])? + e * scaled.c1
-        || eval.c2 != decode(msg.evaluation_commitments[1])? + e * scaled.c2
-    {
-        return Err("incorrect masked/rerandomized evaluation".into());
-    }
-    if zsk * G != decode(msg.partial_commitments[0])? + e * pk2.0
-        || zr * G != decode(msg.partial_commitments[1])? + e * (partial.c1 - scaled.c1)
-        || -zsk * scaled.c1 + zr * pk1.0
-            != decode(msg.partial_commitments[2])? + e * (partial.c2 - scaled.c2)
-    {
-        return Err("incorrect rerandomized partial decryption".into());
-    }
-    let ztop = scalar(msg.quotient_responses[n - 1])?;
-    if ztop * G != decode(msg.quotient_zero_commitments[0])? + e * next.0[n - 1].c1
-        || ztop * pk.0 != decode(msg.quotient_zero_commitments[1])? + e * next.0[n - 1].c2
-    {
-        return Err("quotient leading coefficient is not an encryption of zero".into());
-    }
-    for i in 1..n {
-        let a = msg.division_commitments[i - 1];
-        let zlambda = scalar(msg.quotient_responses[i - 1])?;
-        if RistrettoPoint::vartime_multiscalar_mul(
-            [z[n], zlambda, -e, -Scalar::one()],
-            [
-                next.0[i].c1,
-                G,
-                next.0[i - 1].c1 - current.0[i].c1,
-                decode(a[0])?,
-            ],
-        ) != RistrettoPoint::identity()
-            || RistrettoPoint::vartime_multiscalar_mul(
-                [z[n], zlambda, -e, -Scalar::one()],
-                [
-                    next.0[i].c2,
-                    pk.0,
-                    next.0[i - 1].c2 - current.0[i].c2,
-                    decode(a[1])?,
-                ],
-            ) != RistrettoPoint::identity()
-        {
-            return Err("division query mismatch or incorrect quotient".into());
-        }
+    let base = statement(
+        pk,
+        pk1,
+        pk2,
+        encoded.wire(),
+        next.wire(),
+        &msg.scaled,
+        &msg.partial,
+        ctx,
+    );
+    let relation = sigma_statement(pk, pk1, pk2, current, msg, &next, &scaled, &partial, &base)?;
+    if !super::sigma::prover(3 * n + 7).verify(&relation, &msg.sigma) {
+        return Err(
+            "monitor Sigma witness mismatch or division query/evaluation/decryption invalid".into(),
+        );
     }
     let mut t = base;
     let mut verifier = Verifier::new(&mut t);
@@ -586,20 +602,21 @@ mod tests {
             assert_eq!(private.c2, expected.c2);
             assert_eq!(public.c1, expected.c1);
             assert_eq!(public.c2, expected.c2);
+            let encoded = EncodedPoly::from_native(ct.clone());
             let (reply, native) = prove_with_candidate(
                 &mut rng,
                 &pk,
                 &pk1,
                 &pk2,
                 &sk2,
-                &ct,
+                &encoded,
                 Scalar::from(7u64),
                 &ctx,
             )
             .unwrap();
             assert_eq!(
                 bincode::serialize(&reply.next).unwrap(),
-                bincode::serialize(&WireEncryptedPoly::from_native(&native)).unwrap()
+                bincode::serialize(&WireEncryptedPoly::from_native(native.native())).unwrap()
             );
             verify(&pk, &pk1, &pk2, &ct, &reply, &ctx).unwrap();
         }
@@ -643,7 +660,16 @@ mod tests {
             partial.c2 += G;
         }
         let pc = PedersenGens::default();
-        let mut t = statement(pk, pk1, pk2, current, &next, &scaled, &partial, ctx);
+        let mut t = statement(
+            pk,
+            pk1,
+            pk2,
+            &WireEncryptedPoly::from_native(current),
+            &WireEncryptedPoly::from_native(&next),
+            &WireCiphertext::from_native(&scaled),
+            &WireCiphertext::from_native(&partial),
+            ctx,
+        );
         let mut prover = Prover::new(&pc, &mut t);
         let blinds: Vec<_> = circuit_values.iter().map(|_| Scalar::random(rng)).collect();
         let mut wires = vec![];
@@ -659,19 +685,16 @@ mod tests {
             .map_err(|e| e.to_string())?
             .to_bytes();
         let mut msg = DivisionReply {
+            computation_started_unix_ns: crate::exact::measurements::unix_ns().unwrap(),
             next: WireEncryptedPoly::from_native(&next),
             scaled: WireCiphertext::from_native(&scaled),
             partial: WireCiphertext::from_native(&partial),
             wires,
             circuit,
-            opening_commitments: vec![],
-            evaluation_commitments: [[0; 32]; 2],
-            division_commitments: vec![],
-            quotient_zero_commitments: [[0; 32]; 2],
-            quotient_responses: vec![],
-            partial_commitments: [[0; 32]; 3],
-            wire_responses: vec![],
-            extra_responses: [[0; 32]; 3],
+            sigma: crate::exact::sigma::Proof {
+                challenge: Default::default(),
+                response: vec![],
+            },
         };
         complete_sigma(
             rng,
@@ -889,6 +912,9 @@ mod tests {
                 assert_eq!(next.0.len(), current.0.len());
                 let bytes = bincode::serialize(&msg).unwrap();
                 assert!(bincode::deserialize::<DivisionReply>(&bytes[..bytes.len() - 1]).is_err());
+                let mut wrong_time: DivisionReply = bincode::deserialize(&bytes).unwrap();
+                wrong_time.computation_started_unix_ns += 1;
+                assert!(verify(&pk, &pk1, &pk2, &current, &wrong_time, &ctx).is_err());
                 let mut wrong_ctx = ctx.clone();
                 wrong_ctx.round += 1;
                 assert!(verify(&pk, &pk1, &pk2, &current, &msg, &wrong_ctx).is_err());
@@ -904,7 +930,7 @@ mod tests {
                     .to_bytes();
                 assert!(verify(&pk, &pk1, &pk2, &current, &wrong, &ctx).is_err());
                 let mut wrong: DivisionReply = bincode::deserialize(&bytes).unwrap();
-                wrong.extra_responses[0] = [255; 32];
+                wrong.sigma.response[2 * (current.0.len() + 2)] += Scalar::one();
                 assert!(verify(&pk, &pk1, &pk2, &current, &wrong, &ctx).is_err());
             }
         }

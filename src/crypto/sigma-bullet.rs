@@ -595,25 +595,22 @@ pub fn prove(
     let alpha_tag = mul_g(&alpha).compress();
     let k_alpha = Scalar::random(&mut rng);
     let k_y_blind = Scalar::random(&mut rng);
-    let mut scalars = Vec::with_capacity(3 + k_e.len());
-    let mut points = Vec::with_capacity(3 + k_e.len());
+    let mut scalars = Vec::with_capacity(5 + 2 * k_e.len());
+    let mut points = Vec::with_capacity(5 + 2 * k_e.len());
     scalars.push(k_alpha);
     points.push(G);
     scalars.push(beta_y * k_alpha);
     points.push(pc_gens.B);
     scalars.push(beta_y * k_y_blind);
     points.push(pc_gens.B_blinding);
+    // Fold each basis beta_c1*U + beta_c2*V into the MSM rather than computing it.
     for (idx, (ke, ct)) in k_e.iter().zip(coeff_cts.iter()).enumerate() {
-        let basis = if idx == 0 {
-            RistrettoPoint::vartime_multiscalar_mul(
-                [beta_c1, beta_c2, beta_c1, beta_c2],
-                [ct.c1, ct.c2, G, pk.0],
-            )
-        } else {
-            RistrettoPoint::vartime_multiscalar_mul([beta_c1, beta_c2], [ct.c1, ct.c2])
-        };
-        scalars.push(*ke);
-        points.push(basis);
+        scalars.extend([ke * beta_c1, ke * beta_c2]);
+        points.extend([ct.c1, ct.c2]);
+        if idx == 0 {
+            scalars.extend([ke * beta_c1, ke * beta_c2]);
+            points.extend([G, pk.0]);
+        }
     }
     let a_t = RistrettoPoint::multiscalar_mul(scalars.iter().copied(), points.iter().copied());
 
@@ -677,25 +674,22 @@ pub(crate) fn preprocess_round_proof<R: CryptoRng + RngCore>(
     let alpha_tag = alpha_tag_pt.compress();
     let k_alpha = Scalar::random(rng);
     let k_y_blind = Scalar::random(rng);
-    let mut scalars = Vec::with_capacity(3 + k_e.len());
-    let mut points = Vec::with_capacity(3 + k_e.len());
+    let mut scalars = Vec::with_capacity(5 + 2 * k_e.len());
+    let mut points = Vec::with_capacity(5 + 2 * k_e.len());
     scalars.push(k_alpha);
     points.push(G);
     scalars.push(beta_y * k_alpha);
     points.push(pc_gens.B);
     scalars.push(beta_y * k_y_blind);
     points.push(pc_gens.B_blinding);
+    // Fold each basis beta_c1*U + beta_c2*V into the MSM rather than computing it.
     for (idx, (ke, ct)) in k_e.iter().zip(coeff_cts.iter()).enumerate() {
-        let basis = if idx == 0 {
-            RistrettoPoint::vartime_multiscalar_mul(
-                [beta_c1, beta_c2, beta_c1, beta_c2],
-                [ct.c1, ct.c2, G, pk.0],
-            )
-        } else {
-            RistrettoPoint::vartime_multiscalar_mul([beta_c1, beta_c2], [ct.c1, ct.c2])
-        };
-        scalars.push(*ke);
-        points.push(basis);
+        scalars.extend([ke * beta_c1, ke * beta_c2]);
+        points.extend([ct.c1, ct.c2]);
+        if idx == 0 {
+            scalars.extend([ke * beta_c1, ke * beta_c2]);
+            points.extend([G, pk.0]);
+        }
     }
     let glue_a_t =
         RistrettoPoint::multiscalar_mul(scalars.iter().copied(), points.iter().copied()).compress();
@@ -798,8 +792,8 @@ pub(crate) fn finish_round_proof<R: CryptoRng + RngCore>(
     }
     let k_accum_alpha = Scalar::random(rng);
     let k_accum_y_blind = Scalar::random(rng);
-    let mut accum_glue_scalars = Vec::with_capacity(3 + k_accum_e.len());
-    let mut accum_glue_points = Vec::with_capacity(3 + k_accum_e.len());
+    let mut accum_glue_scalars = Vec::with_capacity(5 + 2 * k_accum_e.len());
+    let mut accum_glue_points = Vec::with_capacity(5 + 2 * k_accum_e.len());
     accum_glue_scalars.push(k_accum_alpha);
     accum_glue_points.push(G);
     accum_glue_scalars.push(beta_accum_y * k_accum_alpha);
@@ -807,19 +801,12 @@ pub(crate) fn finish_round_proof<R: CryptoRng + RngCore>(
     accum_glue_scalars.push(beta_accum_y * k_accum_y_blind);
     accum_glue_points.push(pc_gens.B_blinding);
     for (idx, (k, ct)) in k_accum_e.iter().zip(accum_in.0.iter()).enumerate() {
-        let basis = if idx == 0 {
-            RistrettoPoint::vartime_multiscalar_mul(
-                [beta_accum_c1, beta_accum_c2, beta_accum_c1, beta_accum_c2],
-                [ct.c1, ct.c2, G, pk.0],
-            )
-        } else {
-            RistrettoPoint::vartime_multiscalar_mul(
-                [beta_accum_c1, beta_accum_c2],
-                [ct.c1, ct.c2],
-            )
-        };
-        accum_glue_scalars.push(*k);
-        accum_glue_points.push(basis);
+        accum_glue_scalars.extend([k * beta_accum_c1, k * beta_accum_c2]);
+        accum_glue_points.extend([ct.c1, ct.c2]);
+        if idx == 0 {
+            accum_glue_scalars.extend([k * beta_accum_c1, k * beta_accum_c2]);
+            accum_glue_points.extend([G, pk.0]);
+        }
     }
     let accum_glue_a_t = RistrettoPoint::multiscalar_mul(
         accum_glue_scalars.iter().copied(),
@@ -1028,21 +1015,22 @@ pub fn verify(
         .y_comm
         .decompress()
         .ok_or_else(|| "invalid y commitment point".to_string())?;
-    let mut lhs_scalars = Vec::with_capacity(3 + proof.glue.z_e.len());
-    let mut lhs_points = Vec::with_capacity(3 + proof.glue.z_e.len());
+    let mut lhs_scalars = Vec::with_capacity(5 + 2 * proof.glue.z_e.len());
+    let mut lhs_points = Vec::with_capacity(5 + 2 * proof.glue.z_e.len());
     lhs_scalars.push(proof.glue.z_alpha);
     lhs_points.push(G);
     lhs_scalars.push(beta_y * proof.glue.z_alpha);
     lhs_points.push(pc_gens.B);
     lhs_scalars.push(beta_y * proof.glue.z_y_blind);
     lhs_points.push(pc_gens.B_blinding);
+    // Fold each basis beta_c1*U + beta_c2*V into the MSM rather than computing it.
     for (idx, (z, ct)) in proof.glue.z_e.iter().zip(coeff_cts.iter()).enumerate() {
-        let mut basis = beta_c1 * ct.c1 + beta_c2 * ct.c2;
+        lhs_scalars.extend([z * beta_c1, z * beta_c2]);
+        lhs_points.extend([ct.c1, ct.c2]);
         if idx == 0 {
-            basis = basis + beta_c1 * G + beta_c2 * pk.0;
+            lhs_scalars.extend([z * beta_c1, z * beta_c2]);
+            lhs_points.extend([G, pk.0]);
         }
-        lhs_scalars.push(*z);
-        lhs_points.push(basis);
     }
     let lhs = RistrettoPoint::vartime_multiscalar_mul(
         lhs_scalars.iter().copied(),
@@ -1185,12 +1173,13 @@ pub fn verify_round(
     scalars.push(rho_glue * beta_y * proof.glue_z_y_blind);
     points.push(pc_gens.B_blinding);
     for (idx, (z, ct)) in proof.glue_z_e.iter().zip(coeff_cts.iter()).enumerate() {
-        let mut basis = beta_c1 * ct.c1 + beta_c2 * ct.c2;
+        let s = rho_glue * z;
+        scalars.extend([s * beta_c1, s * beta_c2]);
+        points.extend([ct.c1, ct.c2]);
         if idx == 0 {
-            basis = basis + beta_c1 * G + beta_c2 * pk.0;
+            scalars.extend([s * beta_c1, s * beta_c2]);
+            points.extend([G, pk.0]);
         }
-        scalars.push(rho_glue * *z);
-        points.push(basis);
     }
     scalars.push(-rho_glue);
     points.push(glue_a_t);
@@ -1230,12 +1219,13 @@ pub fn verify_round(
         .zip(accum_in.0.iter())
         .enumerate()
     {
-        let mut basis = beta_accum_c1 * ct.c1 + beta_accum_c2 * ct.c2;
+        let s = rho_accum_glue * z;
+        scalars.extend([s * beta_accum_c1, s * beta_accum_c2]);
+        points.extend([ct.c1, ct.c2]);
         if idx == 0 {
-            basis += beta_accum_c1 * G + beta_accum_c2 * pk.0;
+            scalars.extend([s * beta_accum_c1, s * beta_accum_c2]);
+            points.extend([G, pk.0]);
         }
-        scalars.push(rho_accum_glue * *z);
-        points.push(basis);
     }
     scalars.push(-rho_accum_glue);
     points.push(accum_glue_a_t);

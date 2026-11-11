@@ -1,0 +1,56 @@
+Packing comparison (encryption only)
+Measured 16 set sizes, 1..500000 items; 3 trials, median, GOMAXPROCS=1.
+Bloom m=ceil(-n ln(0.01)/ln(2)^2); degree m, m+1 coefficients.
+Synthetic monic coefficient vectors; no Bloom construction or polynomial construction timed.
+Setup, encoding, serialization, verification, threshold decryption and network excluded from latency.
+Bytes are actual serialized ciphertext payloads; no keys or protocol traffic.
+Latency plot: RLWE squares are measured whole-vector encryption times.
+The solid guide sums measured single-ring median times for the required blocks; mixed-plan guide values are estimates.
+Repository parameters: Ed25519 ElGamal; RLWE Q approximately 50 bits, N=2048..1048576.
+These are repository computation/storage parameters, not a matched-security comparison.
+Exact (ElGamal): degree n, n+1 ciphertexts; BF (ElGamal): degree m, m+1 ciphertexts.
+BF (RLWE): degree m, m+1 coefficients; one ciphertext below capacity, then byte-minimal mixed-size packing.
+Mixed sizes use separate key contexts. Key generation, key bytes and protocol headers are excluded.
+RLWE serializes approximately 16N bytes, vs Exact ElGamal 64(n+1) or BF ElGamal 64(m+1).
+Since m ~ 9.585n, the large-n BF RLWE / Exact ElGamal byte ratio is at least ~2.40 before padding.
+The field is Z_65537: degrees above 65537 cannot have all distinct item or position roots here.
+The sizing formula uses optimal real-valued hash count; an actual integer-hash Bloom implementation
+may need slightly more bits to guarantee FPR <= 0.01. No membership protocol is implemented.
+
+Median encryption latency (ms) — BF (RLWE) versus Exact (ElGamal), measured sample transitions:
+  At n=1: BF (RLWE) wins.
+  BF (RLWE) wins at every sampled size; no loss of advantage observed.
+  No extrapolation beyond the measured range; latency transitions are noisy brackets.
+
+Median encryption latency (ms) — BF (RLWE) versus BF (ElGamal), measured sample transitions:
+  At n=1: BF (RLWE) wins.
+  BF (RLWE) wins at every sampled size; no loss of advantage observed.
+  No extrapolation beyond the measured range; latency transitions are noisy brackets.
+
+Serialized ciphertext size (KiB) — BF (RLWE) versus Exact (ElGamal), measured sample transitions:
+  At n=1: BF (RLWE) does not win.
+  BF (RLWE) never wins at the sampled sizes.
+  No extrapolation beyond the measured range; latency transitions are noisy brackets.
+
+Serialized ciphertext size (KiB) — BF (RLWE) versus BF (ElGamal), measured sample transitions:
+  At n=1: BF (RLWE) does not win.
+  Between sampled n=10 and n=100: BF (RLWE) starts winning.
+  No extrapolation beyond the measured range; latency transitions are noisy brackets.
+
+RLWE latency measurements grouped by N (range of per-item-count trial medians, ms):
+  N=2048: 0.256084..0.271490; median=0.256352
+  N=4096: 0.510760..0.510760; median=0.510760
+  N=8192: 1.053173..1.053173; median=1.053173
+  N=16384: 2.057419..2.303014; median=2.180217
+  N=32768: 4.491600..4.491600; median=4.491600
+  N=65536: 8.746044..8.974885; median=8.860464
+  N=131072: 18.196221..18.235813; median=18.216017
+  N=262144: 36.679008..36.679008; median=36.679008
+  N=524288: 76.305003..76.305003; median=76.305003
+  N=1048576: 162.817379..162.817379; median=162.817379
+
+Communication advantage intervals: BF (RLWE) versus Exact (ElGamal)
+  n=1..500000: Exact (ElGamal) smaller
+Communication advantage intervals: BF (RLWE) versus BF (ElGamal)
+  n=1..53: BF (ElGamal) smaller
+  n=54..500000: BF (RLWE) smaller

@@ -1,0 +1,16 @@
+[package]
+name = "sunscreen_math_macros"
+version = "0.8.1"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/Sunscreen-tech/Sunscreen"
+
+[lib]
+proc-macro = true
+[dependencies]
+bytemuck = "1"
+num = "0.4"
+darling = "0.20"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

@@ -32,8 +32,13 @@ func polynomialFromRoots(roots []uint64) []uint64 {
 	return p
 }
 func ringDimension(n int) (N, logN int, err error) {
-	if n < 1 || n > maxRoots {
-		return 0, 0, fmt.Errorf("roots must be in [1, %d] (supported logN: 11..%d)", maxRoots, maxSupportedLogN)
+	return ringDimensionWithLimit(n, maxSupportedLogN)
+}
+
+func ringDimensionWithLimit(n, maxLogN int) (N, logN int, err error) {
+	limit := (1 << maxLogN) - 1
+	if n < 1 || n > limit {
+		return 0, 0, fmt.Errorf("roots must be in [1, %d] (supported logN: 11..%d)", limit, maxLogN)
 	}
 	N, logN = 2048, 11
 	for N < n+1 {

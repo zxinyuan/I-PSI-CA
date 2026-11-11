@@ -1,0 +1,24 @@
+[package]
+name = "logproof"
+version = "0.8.1"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/Sunscreen-tech/Sunscreen"
+
+[dependencies]
+curve25519-dalek = { package = "curve25519-dalek-ng", version = "4", features = ["serde"] }
+rand = "0.8"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+bitvec = "1"
+crypto-bigint = { version = "0.5", features = ["serde"] }
+log = "0.4"
+merlin = "3"
+sha3 = "0.10"
+digest = "0.10"
+thiserror = "1"
+sunscreen_math = { path = "../sunscreen_math" }
+
+[dev-dependencies]
+bincode = "1"
+once_cell = "1"

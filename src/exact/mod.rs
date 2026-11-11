@@ -1,13 +1,19 @@
 #[cfg(test)]
 mod benchmarks;
 mod division;
+mod encryption;
 pub mod measurements;
 pub mod monitor;
 pub mod performance;
 pub mod proofs;
+pub mod session;
+mod sigma;
 pub mod target;
 
-/// Exact-only options. Both modes use division; `pok` enables the target initial/OR proofs.
+/// Maximum ciphertext length accepted by exact proofs and updates.
+pub const MAX_COEFFICIENTS: usize = 16_384;
+
+/// Exact-only measurement options. Target proofs are enabled by default; `pok` permits opting out.
 #[derive(Clone, Copy, Debug)]
 pub struct ProtocolConfig {
     pub pok: bool,
@@ -17,7 +23,7 @@ pub struct ProtocolConfig {
 impl Default for ProtocolConfig {
     fn default() -> Self {
         Self {
-            pok: false,
+            pok: true,
             round1: true,
         }
     }
@@ -49,9 +55,16 @@ impl ProtocolConfig {
     }
     pub(crate) fn resolve(self) -> Result<Self, String> {
         let args: Vec<_> = std::env::args().collect();
-        let cli = Self::from_args(&args)?;
+        self.resolve_from_args(&args)
+    }
+    fn resolve_from_args(self, args: &[String]) -> Result<Self, String> {
+        let cli = Self::from_args(args)?;
         Ok(Self {
-            pok: self.pok || cli.pok,
+            pok: if args.iter().any(|s| s == "--pok") {
+                cli.pok
+            } else {
+                self.pok
+            },
             round1: if args.iter().any(|s| s == "--round1") {
                 cli.round1
             } else {
@@ -82,14 +95,14 @@ impl SessionHello {
         let mut nonce = [0; 32];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
         Self {
-            magic: *b"exact-pok-v4!!!!",
+            magic: *b"exact-pok-v7!!!!",
             nonce,
             pok: config.pok,
             round1: config.round1,
         }
     }
     pub(crate) fn session(&self, peer: &Self) -> std::io::Result<[u8; 32]> {
-        if self.magic != *b"exact-pok-v4!!!!"
+        if self.magic != *b"exact-pok-v7!!!!"
             || self.magic != peer.magic
             || self.pok != peer.pok
             || self.round1 != peer.round1
@@ -98,7 +111,7 @@ impl SessionHello {
                 "exact protocol version, pok, or round1 mismatch",
             ));
         }
-        let mut t = merlin::Transcript::new(b"exact-pok-session-v4");
+        let mut t = merlin::Transcript::new(b"exact-pok-session-v7");
         t.append_message(b"version", &self.magic);
         t.append_u64(b"pok", u64::from(self.pok));
         t.append_u64(b"round1", u64::from(self.round1));
@@ -149,7 +162,7 @@ mod config_tests {
         let parse = |args: &[&str]| {
             ProtocolConfig::from_args(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
         };
-        assert!(!parse(&[]).unwrap().pok);
+        assert!(parse(&[]).unwrap().pok);
         assert!(parse(&[]).unwrap().round1);
         assert!(!parse(&["--round1", "false"]).unwrap().round1);
         assert!(parse(&["--round1", "true"]).unwrap().round1);
@@ -164,5 +177,21 @@ mod config_tests {
         assert!(parse(&["--pok"]).is_err());
         assert!(parse(&["--pok", "yes"]).is_err());
         assert!(parse(&["--pok", "true", "--pok", "false"]).is_err());
+    }
+    #[test]
+    fn explicit_proof_opt_out_overrides_default_and_local_configuration_is_retained() {
+        let default = ProtocolConfig::default();
+        let args = vec!["--pok".to_string(), "false".to_string()];
+        assert!(!default.resolve_from_args(&args).unwrap().pok);
+        assert!(default.resolve_from_args(&[]).unwrap().pok);
+        assert!(
+            !ProtocolConfig {
+                pok: false,
+                round1: false
+            }
+            .resolve_from_args(&[])
+            .unwrap()
+            .pok
+        );
     }
 }

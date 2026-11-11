@@ -1,3 +1,4 @@
+use super::encryption::{encrypt_poly, rerandomize_poly_with_witness};
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
@@ -7,9 +8,10 @@ use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::elgamal::{
-    combine_public_keys, encrypt_poly, rerandomize_poly_with_witness, test_zero, Ciphertext,
-    EncryptedPoly, PublicKey, PublicKeyShare, SecretKeyShare,
+    combine_public_keys, test_zero, Ciphertext, EncryptedPoly, PublicKey, PublicKeyShare,
+    SecretKeyShare,
 };
+pub use crate::crypto::poly::poly_from_roots;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireCiphertext {
@@ -37,6 +39,39 @@ impl WireCiphertext {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct WireEncryptedPoly(pub Vec<WireCiphertext>);
+
+/// A ciphertext vector with its canonical wire encoding. Proof transcripts bind
+/// the encoding while the proof equations use the native points, so the two must
+/// agree. The fields are private, and the only constructors compress a native vector
+/// or decode wire bytes (decoding accepts only canonical encodings), so they always
+/// do. Each point is thus compressed or decompressed once per party.
+#[derive(Clone, Debug)]
+pub(crate) struct EncodedPoly {
+    native: EncryptedPoly,
+    wire: WireEncryptedPoly,
+}
+impl EncodedPoly {
+    pub fn from_native(native: EncryptedPoly) -> Self {
+        let wire = WireEncryptedPoly::from_native(&native);
+        Self { native, wire }
+    }
+    pub fn from_wire(wire: WireEncryptedPoly) -> Result<Self, String> {
+        Ok(Self {
+            native: wire.to_native()?,
+            wire,
+        })
+    }
+    pub fn native(&self) -> &EncryptedPoly {
+        &self.native
+    }
+    pub fn wire(&self) -> &WireEncryptedPoly {
+        &self.wire
+    }
+    #[cfg(test)]
+    pub fn into_native(self) -> EncryptedPoly {
+        self.native
+    }
+}
 
 impl WireEncryptedPoly {
     pub fn from_native(p: &EncryptedPoly) -> Self {
@@ -90,21 +125,6 @@ pub fn recv_msg<T: for<'de> Deserialize<'de>>(stream: &mut TcpStream) -> io::Res
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-pub fn poly_from_roots(roots: &[Scalar]) -> Vec<Scalar> {
-    let mut coeffs = Vec::with_capacity(roots.len() + 1);
-    coeffs.push(Scalar::one());
-    for root in roots {
-        let n = coeffs.len();
-        let leading = *coeffs.last().unwrap();
-        coeffs.push(leading);
-        for d in (1..n).rev() {
-            coeffs[d] = coeffs[d - 1] - root * coeffs[d];
-        }
-        coeffs[0] *= -root;
-    }
-    coeffs
-}
-
 /// Accepted local ciphertext and its proof. Proof context is retained alongside it.
 pub struct StoredPolynomial {
     pub ciphertext: WireEncryptedPoly,
@@ -130,13 +150,16 @@ impl StoredPolynomial {
 }
 #[derive(Clone, Copy, Debug)]
 pub struct DeploymentMeasurement {
-    pub latency_ms: f64,
+    pub latency_s: f64,
     pub storage: super::measurements::StorageCosts,
     pub generator_setup: super::performance::GeneratorActivity,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct InteractionMeasurement {
-    pub latency_ms: f64,
+    pub latency_s: f64,
+    pub target_time_s: f64,
+    pub monitor_started_unix_ns: u128,
+    pub target_stored_unix_ns: u128,
     pub communication: super::measurements::InteractionCosts,
     pub generator_setup: super::performance::GeneratorActivity,
 }
@@ -181,12 +204,13 @@ impl Target {
         self
     }
 
-    fn build_poly_ctext(&self, rng: &mut OsRng) -> EncryptedPoly {
+    fn build_poly_ctext(&self, rng: &mut OsRng) -> Result<EncryptedPoly, String> {
         let coeffs = poly_from_roots(&self.t_set);
         encrypt_poly(rng, &self.pk, &coeffs)
     }
 
     pub fn run(&mut self, addr: &str, rounds: usize) -> io::Result<()> {
+        self.config.resolve().map_err(io::Error::other)?;
         let listener = TcpListener::bind(addr)?;
         eprintln!("[Target] Listening on {addr}");
         let (stream, peer) = listener.accept()?;
@@ -221,6 +245,7 @@ impl Target {
         // The deployment clock excludes key generation, socket setup, and negotiation.
         let deployment_setup_start = super::performance::generator_activity();
         let deployment_start = Instant::now();
+        // Each ciphertext is compressed once; storage keeps a copy of those bytes.
         let (mut current, initial_proof) = if config.pok {
             let (ct, proof) = super::proofs::encrypt_and_prove_initial(
                 &mut rng,
@@ -231,15 +256,16 @@ impl Target {
             .map_err(io::Error::other)?;
             (ct, Some(super::TPolyProof::Initial(proof)))
         } else {
-            (self.build_poly_ctext(&mut rng), None)
+            let ct = self.build_poly_ctext(&mut rng).map_err(io::Error::other)?;
+            (EncodedPoly::from_native(ct), None)
         };
         self.stored = Some(StoredPolynomial {
-            ciphertext: WireEncryptedPoly::from_native(&current),
+            ciphertext: current.wire().clone(),
             proof: initial_proof,
             session,
             round: 1,
         });
-        let deployment_ms = deployment_start.elapsed().as_secs_f64() * 1000.0;
+        let deployment_s = deployment_start.elapsed().as_secs_f64();
         let deployment_setup =
             super::performance::generator_activity().since(deployment_setup_start);
         let initial = self
@@ -248,12 +274,12 @@ impl Target {
             .ok_or_else(|| io::Error::other("missing deployment storage"))?;
         let initial_costs = initial.costs()?;
         self.deployment = Some(DeploymentMeasurement {
-            latency_ms: deployment_ms,
+            latency_s: deployment_s,
             storage: initial_costs,
             generator_setup: deployment_setup,
         });
         if config.round1 {
-            eprintln!("[Target] Deployment Latency: {deployment_ms:.3} ms (TPolyCtext + initial proof generation; excludes networking)");
+            eprintln!("[Target] Deployment Latency: {} s (ciphertext + initial proof generation and storage)", super::measurements::significant(deployment_s));
             initial_costs.report();
             deployment_setup.report();
             // The monitor still verifies the deployment proof before finishing.
@@ -262,11 +288,11 @@ impl Target {
         }
         eprintln!("[Target] Initial ciphertext/proof prepared outside interaction timer");
         let mut interaction_setup_start = super::performance::generator_activity();
-        let mut interaction_start = Instant::now();
         initial.send(&mut s)?;
         for round in 1..=rounds {
             let reply: super::division::DivisionReply = recv_msg(&mut s)?;
-            let (next, partial) = super::division::verify(
+            let target_start = Instant::now();
+            let (next, partial) = super::division::verify_encoded(
                 &self.pk,
                 &self.pk1,
                 &self.pk2,
@@ -281,10 +307,12 @@ impl Target {
             let matched = test_zero(&self.sk1, &partial);
             let branch = usize::from(matched);
             let source = if matched { &next } else { &current };
-            let (updated, witness) = rerandomize_poly_with_witness(&mut rng, &self.pk, source);
+            let (updated, witness) =
+                rerandomize_poly_with_witness(&mut rng, &self.pk, source.native());
+            let updated = EncodedPoly::from_native(updated);
             let proof = if config.pok {
                 Some(super::TPolyProof::RerandomizationOr(
-                    super::proofs::prove_rerandomization_or(
+                    super::proofs::prove_rerandomization_or_encoded(
                         &mut rng,
                         &self.pk,
                         &current,
@@ -305,14 +333,19 @@ impl Target {
             // Commit ciphertext, proof, and round together, only after monitor verification
             // and successful local proof generation. The latency ends at this storage update.
             self.stored = Some(StoredPolynomial {
-                ciphertext: WireEncryptedPoly::from_native(&updated),
+                ciphertext: updated.wire().clone(),
                 proof,
                 session,
                 round: round as u64 + 1,
             });
+            let target_time_s = target_start.elapsed().as_secs_f64();
+            let target_stored_unix_ns = super::measurements::unix_ns()?;
             current = updated;
             self.state += u64::from(matched);
-            let latency_ms = interaction_start.elapsed().as_secs_f64() * 1000.0;
+            let latency_s = super::measurements::elapsed_seconds(
+                reply.computation_started_unix_ns,
+                target_stored_unix_ns,
+            )?;
             let generator_setup =
                 super::performance::generator_activity().since(interaction_setup_start);
             let stored = self
@@ -329,18 +362,21 @@ impl Target {
                 target_storage: stored.costs()?,
             };
             self.interactions.push(InteractionMeasurement {
-                latency_ms,
+                latency_s,
+                target_time_s,
+                monitor_started_unix_ns: reply.computation_started_unix_ns,
+                target_stored_unix_ns,
                 communication,
                 generator_setup,
             });
-            eprintln!("[Target] Interaction {round} Latency: {latency_ms:.3} ms (send -> verified reply -> updated ciphertext and proof stored)");
+            eprintln!("[Target] Interaction {round} Latency: {} s (monitor target-payload receipt (before verification) -> updated ciphertext and disjunction proof stored)", super::measurements::significant(latency_s));
+            eprintln!("[Target] Interaction {round} Target Time: {} s (verify monitor proof, decrypt/test match, rerandomize, generate disjunction proof and store)", super::measurements::significant(target_time_s));
             communication.report();
             generator_setup.report();
             eprintln!("[Target] match={matched} state={}", self.state);
             // Upload even the final update: the monitor verifies it before finishing.
             // Logging and size accounting above are outside the next latency interval.
             interaction_setup_start = super::performance::generator_activity();
-            interaction_start = Instant::now();
             stored.send(&mut s)?;
         }
         Ok(())
@@ -426,7 +462,7 @@ mod pok_integration_tests {
                 assert_eq!(target.state, expected);
                 let stored = target.stored_polynomial().unwrap();
                 let deployment = target.deployment_measurement().unwrap();
-                assert!(deployment.latency_ms >= 0.0);
+                assert!(deployment.latency_s >= 0.0);
                 assert_eq!(
                     deployment.storage.ciphertext_bytes,
                     8 + 64 * (roots_len as u64 + 1)
@@ -448,7 +484,20 @@ mod pok_integration_tests {
                     assert_eq!(stored.costs().unwrap().message_bytes(), actual);
                 }
                 for (i, m) in target.interaction_measurements().iter().enumerate() {
-                    assert!(m.latency_ms >= 0.0);
+                    assert!(m.latency_s >= 0.0);
+                    assert_eq!(
+                        m.latency_s,
+                        super::super::measurements::elapsed_seconds(
+                            m.monitor_started_unix_ns,
+                            m.target_stored_unix_ns
+                        )
+                        .unwrap()
+                    );
+                    assert_eq!(
+                        m.communication.recurring_bytes(),
+                        m.communication.monitor_send_bytes
+                            + m.communication.target_storage.total_bytes()
+                    );
                     assert!(m.communication.monitor_send_bytes > 0);
                     assert_eq!(
                         m.communication.initial_target_send_bytes,
@@ -475,7 +524,7 @@ mod pok_integration_tests {
         }
     }
     #[test]
-    fn both_modes_use_removal_over_three_rounds() {
+    fn proofs_are_present_during_removal_over_three_rounds() {
         for pok in [false, true] {
             let (target, monitor) = session(pok, pok, 3, &[7, 42], 7);
             target.unwrap();
@@ -553,7 +602,7 @@ mod rejection_tests {
                     let p = super::super::proofs::generate_initial_pok(
                         &mut OsRng,
                         &pk,
-                        &set,
+                        &poly_from_roots(&set),
                         &randomness,
                         &ct,
                         &super::super::proofs::ProofContext { session, round: 1 },

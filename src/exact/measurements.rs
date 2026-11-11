@@ -1,11 +1,44 @@
 //! Serialized costs, using decimal MB. Storage excludes transport framing;
-//! communication includes each transmitted message's four-byte frame header.
+//! monitor send includes framing; requested update communication adds next target payload.
+//! `total_bytes` also counts target framing and the initial upload for full wire accounting.
 use serde::Serialize;
-use std::io;
+use std::{
+    io,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 pub const BYTES_PER_MB: f64 = 1_000_000.0;
 pub fn mb(bytes: u64) -> f64 {
     bytes as f64 / BYTES_PER_MB
+}
+/// Four significant digits, including trailing zeros; avoid rounding small values to zero.
+pub fn significant(value: f64) -> String {
+    let scientific = format!("{value:.3e}");
+    if let Some((_, exponent)) = scientific.split_once('e') {
+        if let Ok(exponent) = exponent.parse::<i32>() {
+            if (-4..4).contains(&exponent) {
+                return format!("{:.*}", (3 - exponent) as usize, value);
+            }
+        }
+    }
+    scientific
+}
+/// Both endpoints use the same wall clock in the demo. Separate hosts need synchronized clocks.
+pub(crate) fn unix_ns() -> io::Result<u128> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .map_err(io::Error::other)
+}
+pub(crate) fn elapsed_seconds(started: u128, stored: u128) -> io::Result<f64> {
+    stored
+        .checked_sub(started)
+        .map(|ns| ns as f64 / 1_000_000_000.0)
+        .ok_or_else(|| {
+            io::Error::other(
+                "monitor start is after target storage time; synchronize endpoint clocks",
+            )
+        })
 }
 pub(crate) fn size<T: Serialize>(value: &T) -> io::Result<u64> {
     bincode::serialized_size(value).map_err(io::Error::other)
@@ -25,19 +58,16 @@ impl StorageCosts {
     }
     pub(crate) fn report(self) {
         eprintln!(
-            "[Target] Ciphertext Storage: {:.9} MB ({} bytes)",
-            mb(self.ciphertext_bytes),
-            self.ciphertext_bytes
+            "[Target] Ciphertext Storage: {} MB",
+            significant(mb(self.ciphertext_bytes))
         );
         eprintln!(
-            "[Target] Proof Storage: {:.9} MB ({} bytes)",
-            mb(self.proof_bytes),
-            self.proof_bytes
+            "[Target] Proof Storage: {} MB",
+            significant(mb(self.proof_bytes))
         );
         eprintln!(
-            "[Target] Total Storage: {:.9} MB ({} bytes)",
-            mb(self.total_bytes()),
-            self.total_bytes()
+            "[Target] Total Storage: {} MB",
+            significant(mb(self.total_bytes()))
         );
     }
 }
@@ -49,8 +79,9 @@ pub struct InteractionCosts {
     pub target_storage: StorageCosts,
 }
 impl InteractionCosts {
+    /// Requested update communication: monitor frame plus next target ciphertext/proof payload.
     pub fn recurring_bytes(self) -> u64 {
-        self.monitor_send_bytes + self.target_storage.message_bytes()
+        self.monitor_send_bytes + self.target_storage.total_bytes()
     }
     pub fn total_bytes(self) -> u64 {
         self.initial_target_send_bytes
@@ -59,39 +90,16 @@ impl InteractionCosts {
     }
     pub(crate) fn report(self) {
         eprintln!(
-            "[Target] Initial Target Send: {:.9} MB ({} bytes)",
-            mb(self.initial_target_send_bytes),
-            self.initial_target_send_bytes
+            "[Target] Monitor Send: {} MB",
+            significant(mb(self.monitor_send_bytes))
         );
         eprintln!(
-            "[Target] Monitor Send: {:.9} MB ({} bytes)",
-            mb(self.monitor_send_bytes),
-            self.monitor_send_bytes
+            "[Target] New Storage (ciphertext + disjunction proof): {} MB",
+            significant(mb(self.target_storage.total_bytes()))
         );
         eprintln!(
-            "[Target] Updated Ciphertext: {:.9} MB ({} bytes)",
-            mb(self.target_storage.ciphertext_bytes),
-            self.target_storage.ciphertext_bytes
-        );
-        eprintln!(
-            "[Target] Disjunction Proof: {:.9} MB ({} bytes)",
-            mb(self.target_storage.proof_bytes),
-            self.target_storage.proof_bytes
-        );
-        eprintln!(
-            "[Target] Target Update Send: {:.9} MB ({} bytes)",
-            mb(self.target_storage.message_bytes()),
-            self.target_storage.message_bytes()
-        );
-        eprintln!(
-            "[Target] Monitor + Target Update Communication: {:.9} MB ({} bytes)",
-            mb(self.recurring_bytes()),
-            self.recurring_bytes()
-        );
-        eprintln!(
-            "[Target] Total Communication: {:.9} MB ({} bytes)",
-            mb(self.total_bytes()),
-            self.total_bytes()
+            "[Target] Communication (monitor send + next target payload): {} MB",
+            significant(mb(self.recurring_bytes()))
         );
     }
 }
@@ -113,10 +121,36 @@ mod tests {
             target_storage: storage,
         };
         assert_eq!(first.total_bytes(), 2012);
+        assert_eq!(first.recurring_bytes(), 1304);
         let later = InteractionCosts {
             initial_target_send_bytes: 0,
             ..first
         };
         assert_eq!(later.total_bytes(), 1308);
+    }
+    #[test]
+    fn output_uses_four_significant_digits_across_scales_and_rounding_carry() {
+        for (value, expected) in [
+            (0.0, "0.000"),
+            (1.0, "1.000"),
+            (12.3456, "12.35"),
+            (0.00123456, "0.001235"),
+            (0.000123456, "0.0001235"),
+            (0.0000123456, "1.235e-5"),
+            (0.00099996, "0.001000"),
+            (9999.6, "1.000e4"),
+            (123456.0, "1.235e5"),
+        ] {
+            assert_eq!(significant(value), expected);
+        }
+    }
+    #[test]
+    fn latency_uses_monitor_start_and_target_storage_end_in_seconds() {
+        let start = 1_800_000_000_000_000_000u128;
+        assert_eq!(
+            elapsed_seconds(start, start + 1_234_000_000).unwrap(),
+            1.234
+        );
+        assert!(elapsed_seconds(start, start - 1).is_err());
     }
 }

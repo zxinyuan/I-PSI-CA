@@ -1,0 +1,17 @@
+[package]
+name = "sunscreen_math"
+version = "0.8.1"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/Sunscreen-tech/Sunscreen"
+
+[dependencies]
+curve25519-dalek = { package = "curve25519-dalek-ng", version = "4", features = ["serde"] }
+rand = "0.8"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+num = "0.4"
+crypto-bigint = { version = "0.5", features = ["serde"] }
+thiserror = "1"
+subtle = "2"
+sunscreen_math_macros = { path = "../sunscreen_math_macros" }

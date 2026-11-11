@@ -12,9 +12,32 @@ func run() error {
 	mode := flag.String("mode", "", "elgamal | rlwe | bfv | all")
 	trials := flag.Int("trials", 5, "encryption timing trials")
 	seed := flag.Int64("seed", 1, "deterministic root seed")
+	compare := flag.Bool("compare", false, "compare Exact (ElGamal), BF (ElGamal), BF (RLWE); write CSV to --out")
+	packingStudy := flag.Bool("packing-study", false, "measure RLWE packing plans for --n items; write JSON to --out")
+	out := flag.String("out", "results/packing-comparison-three.csv", "comparison CSV path")
+	sizes := flag.String("sizes", "", "optional comma-separated item counts for --compare")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		return fmt.Errorf("unexpected positional arguments")
+	}
+	if *packingStudy {
+		if *compare || *mode != "" || *sizes != "" {
+			return fmt.Errorf("--packing-study cannot be combined with --compare, --mode or --sizes")
+		}
+		path := *out
+		if path == "results/packing-comparison-three.csv" {
+			path = "results/packing-study.json"
+		}
+		return runPackingStudy(*n, *trials, *seed, path)
+	}
+	if *sizes != "" && !*compare {
+		return fmt.Errorf("--sizes requires --compare")
+	}
+	if *compare {
+		if *n != 0 || *mode != "" {
+			return fmt.Errorf("--compare cannot be combined with --n or --mode")
+		}
+		return comparePacking(*out, *trials, *seed, *sizes)
 	}
 	if _, _, err := ringDimension(*n); err != nil {
 		return err

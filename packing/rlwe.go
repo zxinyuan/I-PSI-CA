@@ -73,7 +73,11 @@ func decodeRaw(p rlwe.Parameters, pt *rlwe.Plaintext) []uint64 {
 	return out
 }
 func benchLattice(mode string, coeffs []uint64, trials int) (result, error) {
-	N, logN, err := ringDimension(len(coeffs) - 1)
+	return benchLatticeWithLimit(mode, coeffs, trials, maxSupportedLogN)
+}
+
+func benchLatticeWithLimit(mode string, coeffs []uint64, trials, maxLogN int) (result, error) {
+	N, logN, err := ringDimensionWithLimit(len(coeffs)-1, maxLogN)
 	if err != nil {
 		return result{}, err
 	}
